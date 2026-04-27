@@ -1,0 +1,42 @@
+# Dependencies
+node_modules/
+frontend/node_modules/
+
+# React
+frontend/coverage
+frontend/build
+frontend/dist
+frontend/out
+
+# Build artifacts
+frontend/build/
+backend/.aws-sam/
+
+# Environment / secrets — never commit these
+backend/local-env.json
+.env.local
+.env.production
+.env*.local
+
+# Go
+*.test
+*.out
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+backend/go.work
+backend.go.work.sum
+
+# AWS
+samconfig.toml
+
+# Logs
+*.log*
+
+# OS
+.DS_Store
+
+# IDE
+.vscode/

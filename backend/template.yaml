@@ -1,0 +1,635 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Personal Finance App - Backend
+
+Globals:
+  Function:
+    Runtime: provided.al2023
+    Architectures:
+      - arm64
+    Timeout: 30
+    MemorySize: 128
+    Environment:
+      Variables:
+        DYNAMODB_TABLE: !Ref MainTable
+        PLAID_CLIENT_ID: !Sub "{{resolve:ssm:/finance-app/${Stage}/plaid-client-id}}"
+        PLAID_SECRET: !Sub "{{resolve:ssm:/finance-app/${Stage}/plaid-secret}}"
+        PLAID_ENV: !Ref PlaidEnv
+        STAGE: !Ref Stage
+        AUTH_DISABLED: !Ref AuthDisabled
+  Api:
+    Cors:
+      AllowMethods: "'GET,POST,OPTIONS'"
+      AllowHeaders: "'Content-Type,Authorization'"
+      AllowOrigin: "'*'"
+
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, prod]
+  PlaidEnv:
+    Type: String
+    Default: sandbox
+    AllowedValues: [sandbox, development, production]
+  AuthDisabled:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Set to true only for local development to bypass JWT verification
+
+Resources:
+
+  # ── Cognito ────────────────────────────────────────────────────────────────
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "finance-app-${Stage}-user-pool"
+      # No self-registration — users must be created by an admin
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub "finance-app-${Stage}-client"
+      UserPoolId: !Ref UserPool
+      # No client secret — SPA cannot keep secrets
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      AccessTokenValidity: 60        # minutes
+      IdTokenValidity: 60
+      RefreshTokenValidity: 30       # days
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+      PreventUserExistenceErrors: ENABLED
+
+  # ── API Gateway ────────────────────────────────────────────────────────────
+
+  FinanceApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref Stage
+      CorsConfiguration:
+        AllowMethods:
+          - GET
+          - POST
+          - PATCH
+          - PUT
+          - DELETE
+          - OPTIONS
+        AllowHeaders:
+          - Content-Type
+          - Authorization
+        AllowOrigins:
+          - "*"
+      Auth:
+        Authorizers:
+          CognitoAuthorizer:
+            IdentitySource: "$request.header.Authorization"
+            JwtConfiguration:
+              issuer: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}"
+              audience:
+                - !Ref UserPoolClient
+        DefaultAuthorizer: CognitoAuthorizer
+
+  # ── Lambda Functions ───────────────────────────────────────────────────────
+
+  CreateLinkTokenFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: go1.x
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-create-link-token"
+      CodeUri: functions/create-link-token/
+      Handler: bootstrap
+      Description: Creates a Plaid Link token to initialize the Link flow
+      Policies:
+        - SSMParameterReadPolicy:
+            ParameterName: !Sub "finance-app/${Stage}/*"
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /plaid/link-token
+            Method: POST
+
+  ExchangeTokenFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: go1.x
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-exchange-token"
+      CodeUri: functions/exchange-token/
+      Handler: bootstrap
+      Description: Exchanges a Plaid public token for an access token and stores it
+      Policies:
+        - SSMParameterReadPolicy:
+            ParameterName: !Sub "finance-app/${Stage}/*"
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /plaid/exchange-token
+            Method: POST
+
+  GetAccountsFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: go1.x
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-get-accounts"
+      CodeUri: functions/get-accounts/
+      Handler: bootstrap
+      Description: Returns connected accounts from DynamoDB
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /accounts
+            Method: GET
+
+  GetTransactionsFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: go1.x
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-get-transactions"
+      CodeUri: functions/get-transactions/
+      Handler: bootstrap
+      Description: Returns transactions from DynamoDB with optional date/account filters
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /transactions
+            Method: GET
+
+  SyncTransactionsFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: go1.x
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-sync-transactions"
+      CodeUri: functions/sync-transactions/
+      Handler: bootstrap
+      Description: Pulls latest transactions from Plaid and upserts into DynamoDB
+      Timeout: 120
+      Policies:
+        - SSMParameterReadPolicy:
+            ParameterName: !Sub "finance-app/${Stage}/*"
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MainTable
+      Events:
+        DailySchedule:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: "cron(0 6 * * ? *)"
+            Description: Daily transaction sync
+            State: ENABLED
+
+  GetCategoriesFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: go1.x
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-get-categories"
+      CodeUri: functions/get-categories/
+      Handler: bootstrap
+      Description: Returns all user-defined spending categories and budgets
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /categories
+            Method: GET
+
+  PutCategoryFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: go1.x
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-put-category"
+      CodeUri: functions/put-category/
+      Handler: bootstrap
+      Description: Creates or updates a spending category and its monthly budget
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /categories
+            Method: POST
+
+  DeleteCategoryFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: go1.x
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-delete-category"
+      CodeUri: functions/delete-category/
+      Handler: bootstrap
+      Description: Deletes a spending category
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /categories/{categoryId}
+            Method: DELETE
+
+  UpdateTransactionCategoryFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: go1.x
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-update-transaction-category"
+      CodeUri: functions/update-transaction-category/
+      Handler: bootstrap
+      Description: Assigns a custom category to a transaction
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /transactions/{accountId}/{dateTransactionId}/category
+            Method: PATCH
+
+  UpdateTransactionReferenceFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: go1.x
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-update-transaction-reference"
+      CodeUri: functions/update-transaction-reference/
+      Handler: bootstrap
+      Description: Saves a manual reference URL and note on a transaction
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /transactions/{accountId}/{dateTransactionId}/reference
+            Method: PATCH
+
+  ImportAmazonCsvFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: go1.x
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-import-amazon-csv"
+      CodeUri: functions/import-amazon-csv/
+      Handler: bootstrap
+      Description: Parses an Amazon Order History CSV and returns a match report (read-only)
+      Timeout: 60
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /import/amazon-csv
+            Method: POST
+
+  ConfirmAmazonImportFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: go1.x
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-confirm-amazon-import"
+      CodeUri: functions/confirm-amazon-import/
+      Handler: bootstrap
+      Description: Persists confirmed order→transaction reference links
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /import/amazon-csv/confirm
+            Method: POST
+
+  GetRulesFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: go1.x
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-get-rules"
+      CodeUri: functions/get-rules/
+      Handler: bootstrap
+      Description: Returns all auto-assignment rules for the user
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /rules
+            Method: GET
+
+  PutRuleFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: go1.x
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-put-rule"
+      CodeUri: functions/put-rule/
+      Handler: bootstrap
+      Description: Creates or updates an auto-assignment rule
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /rules
+            Method: POST
+
+  DeleteRuleFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: go1.x
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-delete-rule"
+      CodeUri: functions/delete-rule/
+      Handler: bootstrap
+      Description: Deletes an auto-assignment rule
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /rules/{ruleId}
+            Method: DELETE
+
+  ApplyRulesFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: go1.x
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-apply-rules"
+      CodeUri: functions/apply-rules/
+      Handler: bootstrap
+      Description: Re-applies all rules to transactions for the current month
+      Timeout: 60
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /rules/apply
+            Method: POST
+
+  GetBudgetsFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: go1.x
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-get-budgets"
+      CodeUri: functions/get-budgets/
+      Handler: bootstrap
+      Description: Returns all budgets for the user
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /budgets
+            Method: GET
+
+  PutBudgetFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: go1.x
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-put-budget"
+      CodeUri: functions/put-budget/
+      Handler: bootstrap
+      Description: Creates or updates a budget
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /budgets
+            Method: POST
+
+  DeleteBudgetFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: go1.x
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-delete-budget"
+      CodeUri: functions/delete-budget/
+      Handler: bootstrap
+      Description: Deletes a budget
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /budgets/{budgetId}
+            Method: DELETE
+
+  GetBudgetPeriodFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: go1.x
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-get-budget-period"
+      CodeUri: functions/get-budget-period/
+      Handler: bootstrap
+      Description: Returns periods for a budget, optionally opening/creating the current period
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /budgets/{budgetId}/periods
+            Method: GET
+
+  CloseBudgetPeriodFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: go1.x
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-close-budget-period"
+      CodeUri: functions/close-budget-period/
+      Handler: bootstrap
+      Description: Closes a budget period, handling rollover or transfer
+      Timeout: 60
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /budgets/{budgetId}/periods/{startDate}/close
+            Method: POST
+
+  PutSplitsFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: go1.x
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-put-splits"
+      CodeUri: functions/put-splits/
+      Handler: bootstrap
+      Description: Saves (or clears) the splits for a transaction
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /transactions/{accountId}/{dateTransactionId}/splits
+            Method: PUT
+
+  DeleteSplitsFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: go1.x
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-delete-splits"
+      CodeUri: functions/delete-splits/
+      Handler: bootstrap
+      Description: Removes all splits from a transaction
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /transactions/{accountId}/{dateTransactionId}/splits
+            Method: DELETE
+
+  # ── DynamoDB Single Table ──────────────────────────────────────────────────
+  #
+  # Key schema:
+  #   PK                    SK                          Entity
+  #   USER#<userId>         ACCOUNT#<accountId>         Account
+  #   USER#<userId>         CATEGORY#<categoryId>       Category
+  #   USER#<userId>         BUDGET#<budgetId>           Budget
+  #   BUDGET#<budgetId>     PERIOD#<startDate>          BudgetPeriod
+  #   ACCOUNT#<accountId>   TXN#<date>#<txnId>          Transaction
+  #
+  MainTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "finance-app-${Stage}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+
+Outputs:
+  ApiEndpoint:
+    Description: HTTP API endpoint URL
+    Value: !Sub "https://${FinanceApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}"
+    Export:
+      Name: !Sub "finance-app-${Stage}-api-endpoint"
+
+  MainTableName:
+    Value: !Ref MainTable
+    Export:
+      Name: !Sub "finance-app-${Stage}-table"
+
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub "finance-app-${Stage}-user-pool-id"
+
+  UserPoolClientId:
+    Description: Cognito User Pool App Client ID
+    Value: !Ref UserPoolClient
+    Export:
+      Name: !Sub "finance-app-${Stage}-user-pool-client-id"
