@@ -1,19 +1,15 @@
 import axios from 'axios';
-import { CognitoUserPool } from 'amazon-cognito-identity-js';
-
-const userPool = new CognitoUserPool({
-  UserPoolId: process.env.REACT_APP_COGNITO_USER_POOL_ID ?? '',
-  ClientId: process.env.REACT_APP_COGNITO_CLIENT_ID ?? '',
-});
+import { AUTH_DISABLED, userPool } from '../auth/cognitoPool';
 
 const api = axios.create({
-  baseURL: process.env.REACT_APP_API_URL,
+  baseURL: process.env.REACT_APP_API_URL || undefined,
 });
 
 // Attach the current Cognito ID token to every request.
 // If no session exists (local dev with AUTH_DISABLED, or not logged in),
 // the header is simply omitted — the request goes through without it.
 api.interceptors.request.use((config) => {
+  if (AUTH_DISABLED || !userPool) return config;
   const cognitoUser = userPool.getCurrentUser();
   if (!cognitoUser) return config;
   return new Promise((resolve) => {
@@ -45,10 +41,19 @@ export interface Transaction {
   amount: number;
   category: string;
   customCategory: string;
+  budgetId: string;
+  manualBudget: boolean;
   pending: boolean;
   merchantName: string;
   referenceUrl: string;
   referenceNote: string;
+  // Plaid enrichment fields
+  originalDescription?: string;
+  authorizedDate?: string;
+  paymentChannel?: string;
+  personalFinancePrimary?: string;
+  personalFinanceDetailed?: string;
+  logoUrl?: string;
   splits?: TransactionSplit[];
 }
 
@@ -74,6 +79,11 @@ export const createLinkToken = async (): Promise<string> => {
   return data.linkToken;
 };
 
+export const syncTransactions = async (): Promise<{ added: number; modified: number; removed: number; errors: number }> => {
+  const { data } = await api.post('/plaid/sync');
+  return data;
+};
+
 export const exchangeToken = async (
   publicToken: string,
   institutionName: string
@@ -87,6 +97,10 @@ export const getAccounts = async (): Promise<Account[]> => {
   return data.accounts ?? [];
 };
 
+export const deleteAccount = async (accountId: string): Promise<void> => {
+  await api.delete(`/accounts/${encodeURIComponent(accountId)}`);
+};
+
 export const getTransactions = async (params?: {
   accountId?: string;
   startDate?: string;
@@ -94,6 +108,26 @@ export const getTransactions = async (params?: {
 }): Promise<Transaction[]> => {
   const { data } = await api.get<{ transactions: Transaction[] }>('/transactions', { params });
   return data.transactions ?? [];
+};
+
+export const putTransaction = async (txn: {
+  accountId: string;
+  date: string;
+  name: string;
+  amount: number;
+  customCategory?: string;
+  budgetId?: string;
+  transactionId?: string;
+}): Promise<Transaction> => {
+  const { data } = await api.put<Transaction>('/transactions', txn);
+  return data;
+};
+
+export const deleteTransaction = async (
+  accountId: string,
+  dateTransactionId: string
+): Promise<void> => {
+  await api.delete(`/transactions/${encodeURIComponent(accountId)}/${encodeURIComponent(dateTransactionId)}`);
 };
 
 export const updateTransactionCategory = async (
@@ -104,6 +138,17 @@ export const updateTransactionCategory = async (
   await api.patch(
     `/transactions/${encodeURIComponent(accountId)}/${encodeURIComponent(dateTransactionId)}/category`,
     { customCategory }
+  );
+};
+
+export const updateTransactionBudget = async (
+  accountId: string,
+  dateTransactionId: string,
+  budgetId: string
+): Promise<void> => {
+  await api.patch(
+    `/transactions/${encodeURIComponent(accountId)}/${encodeURIComponent(dateTransactionId)}/budget`,
+    { budgetId }
   );
 };
 
@@ -128,7 +173,12 @@ export interface Rule {
   ruleId: string;
   pattern: string;
   categoryId: string;
+  budgetId: string;
   priority: number;
+  amountMatch?: number;
+  amountTolerance?: number;
+  dayOfMonth?: number;
+  dayTolerance?: number;
 }
 
 export const getRules = async (): Promise<Rule[]> => {
@@ -161,13 +211,21 @@ export interface Budget {
   budgetType: 'goal' | 'checkbook';
   period: 'daily' | 'weekly' | 'biweekly' | 'monthly' | 'quarterly' | 'annually';
   periodFormat: string;
-  categoryIds: string[];
   goalAmount: number;
   goalDirection: 'limit' | 'target';
   surplusHandling: 'ignore' | 'rollover' | 'transfer';
   transferBudgetId: string;
   transferAmount: number;
   openingBalance: number;
+}
+
+export interface BudgetTxn {
+  date: string;
+  name: string;
+  amount: number; // positive = debit, negative = credit
+  accountId: string;
+  dateTransactionId: string;
+  isSplit?: boolean;
 }
 
 export interface BudgetPeriod {
@@ -179,11 +237,14 @@ export interface BudgetPeriod {
   rolledOverAmount: number;
   transferredOut: number;
   closed: boolean;
-  // computed by server
+  staleWarning?: boolean;
+  // computed by server (always live from transactions)
   debitTotal: number;
   creditTotal: number;
   effectiveGoal: number;
   balance: number;
+  liveDelta: number;
+  transactions: BudgetTxn[];
 }
 
 export const getBudgets = async (): Promise<Budget[]> => {
@@ -212,9 +273,13 @@ export const getBudgetPeriods = async (budgetId: string): Promise<BudgetPeriodRe
 
 export const closeBudgetPeriod = async (
   budgetId: string,
-  startDate: string
+  startDate: string,
+  force = false
 ): Promise<{ closed: boolean; delta: number; debits: number; credits: number }> => {
-  const { data } = await api.post(`/budgets/${budgetId}/periods/${startDate}/close`);
+  const url = force
+    ? `/budgets/${budgetId}/periods/${startDate}/close?force=true`
+    : `/budgets/${budgetId}/periods/${startDate}/close`;
+  const { data } = await api.post(url);
   return data;
 };
 
@@ -301,4 +366,79 @@ export const deleteSplits = async (
   await api.delete(
     `/transactions/${encodeURIComponent(accountId)}/${encodeURIComponent(dateTransactionId)}/splits`
   );
+};
+
+// --- Income Sources ---------------------------------------------------
+
+export interface NetPayResult {
+  grossAmount: number;
+  section125Deductions: number;
+  retirementDeductions: number;
+  ficaTaxableWages: number;
+  incomeTaxableWages: number;
+  deductionUsed: number;
+  deductionWarning?: string;
+  step4aOtherIncome?: number;
+  step4bDeductions?: number;
+  step3Credits?: number;
+  withholdings: Record<string, number>;
+  totalWithheld: number;
+  additionalWithholding: number;
+  netPay: number;
+}
+
+export interface DeductionItem {
+  name: string;
+  amount: number;
+}
+
+export interface IncomeSource {
+  userId: string;
+  incomeSourceId: string;
+  name: string;
+  frequency: 'weekly' | 'biweekly' | 'semimonthly' | 'monthly';
+  grossAmount: number;
+  filingStatus: 'single' | 'married_jointly' | 'married_separately' | 'head_of_household';
+  workState: string;
+  section125Deductions: number;
+  section125Items?: DeductionItem[];
+  retirementDeductions: number;
+  retirementItems?: DeductionItem[];
+  preTaxDeductions: number; // legacy
+  additionalWithholding: number;
+  deductionType: 'standard' | 'itemized';
+  itemizedDeductions: number;
+  itemizedDeductionItems?: DeductionItem[];
+  step3Credits: number;
+  step4aOtherIncome: number;
+  step4aItems?: DeductionItem[];
+  step4bDeductions: number;
+  step4bItems?: DeductionItem[];
+  isActive: boolean;
+  lastNetPay?: NetPayResult;
+}
+
+export const getIncomeSources = async (): Promise<IncomeSource[]> => {
+  const { data } = await api.get<IncomeSource[]>('/income-sources');
+  return data ?? [];
+};
+
+export const putIncomeSource = async (
+  source: Omit<IncomeSource, 'userId'>
+): Promise<IncomeSource> => {
+  const { data } = await api.post<IncomeSource>('/income-sources', source);
+  return data;
+};
+
+export const deleteIncomeSource = async (incomeSourceId: string): Promise<void> => {
+  await api.delete(`/income-sources/${incomeSourceId}`);
+};
+
+export const getNetPay = async (
+  incomeSourceId: string,
+  ytdWages?: number
+): Promise<NetPayResult> => {
+  const params = ytdWages !== undefined ? `?ytdWages=${ytdWages}` : '';
+  const { data } = await api.get<NetPayResult>(`/income-sources/${incomeSourceId}/net-pay${params}`);
+  return data;
 };

@@ -17,8 +17,11 @@ A self-hosted personal finance tracker backed by Plaid, AWS Lambda (Go), API Gat
 
 ```
 finance-app/
+├── start-local.sh    # One-command local dev startup (see below)
+├── Makefile          # Build, deploy, and utility targets
 ├── backend/          # Go Lambda functions + SAM template
 │   ├── template.yaml
+│   ├── samconfig.toml
 │   ├── go.mod
 │   ├── local-env.json
 │   └── functions/
@@ -81,34 +84,68 @@ The app uses Plaid's free **Trial** tier (up to 10 connected Items at no cost).
 
 Local development uses:
 
-- **LocalStack** to emulate DynamoDB (free Community tier is sufficient — only DynamoDB is needed)
-- **SAM CLI (`sam local start-api`)** to run the Lambda functions and API Gateway locally
+- **LocalStack** to emulate DynamoDB (requires a free LocalStack account for the auth token)
+- **SAM CLI (`sam local start-api`)** to run Lambda functions and API Gateway locally
 - **`npm start`** for the React dev server with hot reload
 
-### 1. Install frontend dependencies
+The React dev server proxies all API calls to SAM on port 3001, so there are no CORS issues.
+
+### LocalStack auth token
+
+LocalStack requires an auth token even for free usage. To get yours:
+
+1. Sign in or create a free account at [https://app.localstack.cloud](https://app.localstack.cloud)
+2. Go to **Getting Started** at [https://app.localstack.cloud/getting-started](https://app.localstack.cloud/getting-started) to find your **Personal Auth Token**
+3. Copy your token and export it in your shell (add this to your `~/.bashrc` or `~/.zshrc` to persist it):
 
 ```bash
-cd frontend
-npm install
+export LOCALSTACK_AUTH_TOKEN=<your-token>
 ```
 
-### 2. Start LocalStack
+`start-local.sh` will exit with an error if this variable is not set.
+
+### Quick start
 
 ```bash
-localstack start -d   # -d runs it as a background daemon
+export LOCALSTACK_AUTH_TOKEN=<your-token>   # if not already in your shell
+./start-local.sh
 ```
 
-Wait a few seconds, then verify DynamoDB is available:
+That's it. The script handles everything:
+
+1. Verifies `LOCALSTACK_AUTH_TOKEN` is set
+2. Sets dummy AWS credentials (`AWS_ACCESS_KEY_ID=test` etc.) so the SDK doesn't complain
+3. Creates a Docker network (`finance-local`) shared by LocalStack and the Lambda containers
+4. Starts LocalStack on that network and waits until DynamoDB is ready
+5. Creates the `finance-app-dev` table in LocalStack (idempotent — skips if it already exists)
+6. Builds all Lambda functions with `sam build`
+7. Starts `sam local start-api` on port 3001, attached to the shared Docker network
+8. Starts the React dev server on port 3000
+
+Press **Ctrl+C** to stop everything cleanly.
+
+> **Prerequisites:** Docker must be running, and `localstack` must be installed (`pip install localstack` or `brew install localstack/tap/localstack-cli`).
+
+### Architecture note
+
+The SAM template uses `x86_64`. This works for both local dev and production deploys. If you want to switch to Graviton2 (`arm64`) for lower Lambda costs, you would need an ARM machine or cross-compilation toolchain to build and test locally.
+
+### Manual steps (if not using start-local.sh)
 
 ```bash
-awslocal dynamodb list-tables
-# Expected: { "TableNames": [] }
-```
+# 1. Set dummy credentials
+export AWS_ACCESS_KEY_ID=test
+export AWS_SECRET_ACCESS_KEY=test
+export AWS_DEFAULT_REGION=us-east-1
 
-### 3. Create the DynamoDB table in LocalStack
+# 2. Create a shared Docker network
+docker network create finance-local
 
-```bash
-awslocal dynamodb create-table \
+# 3. Start LocalStack on the shared network
+localstack start -d --network finance-local
+
+# 4. Create the DynamoDB table
+aws dynamodb create-table \
   --table-name finance-app-dev \
   --billing-mode PAY_PER_REQUEST \
   --attribute-definitions \
@@ -116,112 +153,37 @@ awslocal dynamodb create-table \
     AttributeName=sk,AttributeType=S \
   --key-schema \
     AttributeName=pk,KeyType=HASH \
-    AttributeName=sk,KeyType=RANGE
-```
+    AttributeName=sk,KeyType=RANGE \
+  --endpoint-url http://localhost:4566
 
-### 4. Configure local-env.json
+# 5. Update DYNAMODB_ENDPOINT in local-env.json to use the container hostname
+#    (Lambda containers reach LocalStack via the shared network, not localhost)
+#    Set every function's DYNAMODB_ENDPOINT to: http://localstack-main:4566
 
-Edit `backend/local-env.json` and fill in your Plaid sandbox credentials:
-
-```json
-{
-  "CreateLinkTokenFunction": {
-    "PLAID_CLIENT_ID": "<your-plaid-client-id>",
-    "PLAID_SECRET":    "<your-plaid-sandbox-secret>",
-    "PLAID_ENV":       "sandbox",
-    "USER_ID":         "default-user",
-    "DYNAMODB_TABLE":  "finance-app-dev",
-    "STAGE":           "dev"
-  },
-  ...
-}
-```
-
-The `PLAID_CLIENT_ID` and `PLAID_SECRET` entries only matter for the functions that call Plaid (`CreateLinkTokenFunction`, `ExchangeTokenFunction`, `SyncTransactionsFunction`). All other functions only need `DYNAMODB_TABLE`.
-
-### 5. Build the Lambda functions
-
-```bash
+# 6. Build and start the backend
 cd backend
 sam build
-```
+sam local start-api --port 3001 --env-vars local-env.json --docker-network finance-local
 
-SAM compiles each Go function into a `bootstrap` binary inside `.aws-sam/build/`.
-
-### 6. Start the local API
-
-```bash
-cd backend
-sam local start-api \
-  --env-vars local-env.json \
-  --docker-network host \
-  --port 3001
-```
-
-- `--docker-network host` lets the Lambda containers reach LocalStack on `localhost:4566`.
-- The API will be available at `http://localhost:3001`.
-
-> **Note on DynamoDB endpoint:** By default the Go SDK resolves DynamoDB to the real AWS endpoint. The `local-env.json` sets `DYNAMODB_TABLE` but does not automatically redirect to LocalStack. You need to ensure the backend code uses a custom endpoint when running locally. See the [backend configuration note](#backend-dynamodb-endpoint-for-local-development) below.
-
-#### Backend DynamoDB endpoint for local development
-
-The `internal/db/db.go` client needs to point at `http://localhost:4566` when running locally. The recommended way is to check for an env var:
-
-If `AWS_ENDPOINT_URL` is set, the AWS SDK v2 automatically uses it as the endpoint for all services (this is the [standard environment-based endpoint override](https://docs.aws.amazon.com/sdkref/latest/guide/feature-ss-endpoints.html) added in SDK v2). Add it to every function entry in `local-env.json`:
-
-```json
-"GetTransactionsFunction": {
-  "AWS_ENDPOINT_URL": "http://localhost:4566",
-  "USER_ID":          "default-user",
-  "DYNAMODB_TABLE":   "finance-app-dev",
-  "STAGE":            "dev"
-}
-```
-
-You can do this in bulk by adding `"AWS_ENDPOINT_URL": "http://localhost:4566"` to each block in `local-env.json`.
-
-Also set dummy AWS credentials so the SDK does not complain (LocalStack does not validate them):
-
-```bash
-export AWS_ACCESS_KEY_ID=test
-export AWS_SECRET_ACCESS_KEY=test
-export AWS_DEFAULT_REGION=us-east-1
-```
-
-Or add them to your `~/.aws/credentials` under a `[localstack]` profile and pass `--profile localstack` to SAM.
-
-### 7. Configure the frontend to hit the local API
-
-Create `frontend/.env.local`:
-
-```
-REACT_APP_API_BASE_URL=http://localhost:3001/dev
-```
-
-The `client.ts` axios instance should read this variable as its `baseURL`. If it is currently hardcoded, update `frontend/src/api/client.ts`:
-
-```ts
-const api = axios.create({
-  baseURL: process.env.REACT_APP_API_BASE_URL ?? 'http://localhost:3001/dev',
-});
-```
-
-### 8. Start the frontend dev server
-
-```bash
+# 7. Start the frontend (separate terminal)
 cd frontend
+npm install   # first time only
 npm start
 ```
 
-The app opens at [http://localhost:3000](http://localhost:3000). API calls proxy to `http://localhost:3001/dev`.
+> **Note:** `local-env.json` already has `DYNAMODB_ENDPOINT` set to `http://localstack-main:4566`. This is the hostname Lambda containers use to reach LocalStack over the shared Docker network.
 
-### Local development summary
+### Frontend environment for local dev
+
+`frontend/.env.local` is already configured correctly:
 
 ```
-Terminal 1:  localstack start
-Terminal 2:  cd backend && sam build && sam local start-api --env-vars local-env.json --docker-network host --port 3001
-Terminal 3:  cd frontend && npm start
+REACT_APP_API_URL=        # empty — axios uses page origin, proxied to SAM on :3001
+REACT_APP_COGNITO_USER_POOL_ID=   # empty — auth bypassed (AUTH_DISABLED=true on backend)
+REACT_APP_COGNITO_CLIENT_ID=      # empty — auth bypassed
 ```
+
+When both Cognito env vars are absent the frontend skips constructing the Cognito user pool entirely and treats the session as always-authenticated. The backend's `AUTH_DISABLED=true` ignores the `Authorization` header on every request.
 
 ---
 
@@ -234,7 +196,9 @@ cd backend
 sam build
 ```
 
-This compiles all Go functions for `linux/arm64` (Graviton2) inside Docker and writes artifacts to `.aws-sam/build/`.
+This compiles all Go functions natively using the `makefile` build method, which runs `go build` from the backend root where `go.mod` lives. Artifacts go to `.aws-sam/build/`.
+
+> Docker is no longer required for `sam build` — only for `sam local start-api`.
 
 To verify the Go code compiles independently of SAM:
 
@@ -292,11 +256,18 @@ aws s3 mb s3://your-finance-app-sam-artifacts-<your-account-id>
 
 ### Deploy the backend
 
+The easiest way is via the Makefile:
+
+```bash
+make deploy                          # deploys to dev (sandbox Plaid)
+make deploy STAGE=prod PLAID_ENV=production
+```
+
+Or manually:
+
 ```bash
 cd backend
-
-sam build
-
+sam build --use-container
 sam deploy \
   --stack-name finance-app-dev \
   --s3-bucket your-finance-app-sam-artifacts-<your-account-id> \
@@ -347,7 +318,7 @@ aws s3 website s3://your-finance-app-frontend \
 
 # Build with your API endpoint
 cd frontend
-REACT_APP_API_BASE_URL=https://<api-id>.execute-api.us-east-1.amazonaws.com/dev \
+REACT_APP_API_URL=https://<api-id>.execute-api.us-east-1.amazonaws.com/dev \
   npm run build
 
 # Upload
@@ -378,18 +349,9 @@ This is within the AWS free tier for low personal use (1 TB egress/month free fo
 ### Updating after code changes
 
 ```bash
-cd backend
-sam build && sam deploy \
-  --stack-name finance-app-dev \
-  --s3-bucket your-finance-app-sam-artifacts-<your-account-id> \
-  --capabilities CAPABILITY_IAM \
-  --parameter-overrides Stage=dev PlaidEnv=sandbox \
-  --no-confirm-changeset
+make deploy   # or make deploy STAGE=prod
 
-cd frontend
-REACT_APP_API_BASE_URL=https://<api-id>.execute-api.us-east-1.amazonaws.com/dev \
-  npm run build
-aws s3 sync build/ s3://your-finance-app-frontend --delete
+make frontend-deploy   # builds frontend and syncs to S3 + CloudFront invalidation
 ```
 
 ---
@@ -404,7 +366,7 @@ The app uses **AWS Cognito** for authentication. All API routes require a valid 
 - API Gateway uses a **JWT authorizer** that validates every request against the User Pool before invoking any Lambda.
 - The frontend uses `amazon-cognito-identity-js` to authenticate and stores the session in `localStorage`. The ID token is attached to every API call via an axios request interceptor.
 - Token refresh is handled automatically by the Cognito SDK (refresh tokens are valid for 30 days).
-- **Local development**: `AUTH_DISABLED=true` in `local-env.json` bypasses the auth check inside Lambda functions. `sam local start-api` does not enforce the JWT authorizer, so no Cognito credentials are needed locally.
+- **Local development**: `AUTH_DISABLED=true` in `local-env.json` bypasses the auth check inside Lambda functions. `sam local start-api` does not enforce the JWT authorizer. When `REACT_APP_COGNITO_USER_POOL_ID` and `REACT_APP_COGNITO_CLIENT_ID` are both empty in `.env.local`, the frontend skips Cognito entirely and treats the session as always-authenticated — no login screen appears locally.
 
 ### Creating your user account (after first deploy)
 
@@ -515,15 +477,15 @@ Rebuild and redeploy the frontend after updating these values.
 | `USER_ID` | Single-user identifier (default: `default-user`) |
 | `STAGE` | `dev` or `prod` |
 | `AUTH_DISABLED` | Set to `"true"` locally only — bypasses JWT check inside Lambda |
-| `AWS_ENDPOINT_URL` | Local only — set to `http://localhost:4566` to use LocalStack |
+| `DYNAMODB_ENDPOINT` | Local only — set to `http://localstack-main:4566` to route DynamoDB calls to LocalStack |
 
 ### Frontend
 
 | Variable | Description |
 |----------|-------------|
-| `REACT_APP_API_URL` | Full base URL of the deployed API Gateway stage |
-| `REACT_APP_COGNITO_USER_POOL_ID` | Cognito User Pool ID (from SAM outputs) |
-| `REACT_APP_COGNITO_CLIENT_ID` | Cognito App Client ID (from SAM outputs) |
+| `REACT_APP_API_URL` | Full base URL of the deployed API Gateway stage. Leave empty locally — the React dev server proxies to SAM on :3001. |
+| `REACT_APP_COGNITO_USER_POOL_ID` | Cognito User Pool ID (from SAM outputs). Leave empty locally to bypass auth. |
+| `REACT_APP_COGNITO_CLIENT_ID` | Cognito App Client ID (from SAM outputs). Leave empty locally to bypass auth. |
 
 ---
 

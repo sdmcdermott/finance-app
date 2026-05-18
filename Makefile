@@ -46,7 +46,7 @@ setup:
 # ── Backend ────────────────────────────────────────────────────────────────────
 .PHONY: build
 build:
-	cd backend && sam build --use-container
+	cd backend && sam build
 
 .PHONY: deploy
 deploy: build
@@ -62,7 +62,8 @@ deploy: build
 dev:
 	cd backend && sam local start-api \
 		--port 3001 \
-		--env-vars local-env.json
+		--env-vars local-env.json \
+		--docker-network host
 
 # ── Frontend ───────────────────────────────────────────────────────────────────
 .PHONY: frontend-dev

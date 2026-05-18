@@ -18,8 +18,14 @@ type response = events.APIGatewayV2HTTPResponse
 type ruleRequest struct {
 	RuleID     string `json:"ruleId"`     // omit to create; include to update
 	Pattern    string `json:"pattern"`    // required: substring to match merchant name
-	CategoryID string `json:"categoryId"` // required: category to assign on match
+	CategoryID string `json:"categoryId"` // category to assign on match (optional)
+	BudgetID   string `json:"budgetId"`   // budget to assign on match (optional)
 	Priority   int    `json:"priority"`   // lower = applied first
+
+	AmountMatch     float64 `json:"amountMatch,omitempty"`
+	AmountTolerance float64 `json:"amountTolerance,omitempty"`
+	DayOfMonth      int     `json:"dayOfMonth,omitempty"`
+	DayTolerance    int     `json:"dayTolerance,omitempty"`
 }
 
 func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response, error) {
@@ -28,8 +34,11 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response,
 	if err := json.Unmarshal([]byte(req.Body), &body); err != nil {
 		return errorResponse(http.StatusBadRequest, "invalid request body"), nil
 	}
-	if body.Pattern == "" || body.CategoryID == "" {
-		return errorResponse(http.StatusBadRequest, "pattern and categoryId are required"), nil
+	if body.Pattern == "" {
+		return errorResponse(http.StatusBadRequest, "pattern is required"), nil
+	}
+	if body.CategoryID == "" && body.BudgetID == "" {
+		return errorResponse(http.StatusBadRequest, "at least one of categoryId or budgetId is required"), nil
 	}
 
 	if body.RuleID == "" {
@@ -42,11 +51,16 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response,
 	}
 
 	rule := dbpkg.Rule{
-		UserID:     plaidclient.UserID(),
-		RuleID:     body.RuleID,
-		Pattern:    body.Pattern,
-		CategoryID: body.CategoryID,
-		Priority:   body.Priority,
+		UserID:          plaidclient.UserID(),
+		RuleID:          body.RuleID,
+		Pattern:         body.Pattern,
+		CategoryID:      body.CategoryID,
+		BudgetID:        body.BudgetID,
+		Priority:        body.Priority,
+		AmountMatch:     body.AmountMatch,
+		AmountTolerance: body.AmountTolerance,
+		DayOfMonth:      body.DayOfMonth,
+		DayTolerance:    body.DayTolerance,
 	}
 
 	if err := dbClient.PutRule(ctx, rule); err != nil {

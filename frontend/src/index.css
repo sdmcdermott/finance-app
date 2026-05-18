@@ -5,8 +5,21 @@ body {
   margin: 0;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
   -webkit-font-smoothing: antialiased;
-  background: #fff;
+  background: #e8f5f0;
   color: #2d3748;
+}
+
+/* ── Global select styling ────────────────────────────────────────────────── */
+select {
+  background: transparent;
+  color: #0d7a6b;
+  border: 1px solid #0d7a6b;
+  border-radius: 6px;
+  padding: 0.4rem 0.6rem;
+  font-size: 0.875rem;
+  font-family: inherit;
+  cursor: pointer;
+  appearance: auto;
 }
 
 /* ── Layout shell ─────────────────────────────────────────────────────────── */
@@ -51,7 +64,8 @@ body {
   padding: 0.25rem 0;
 }
 
-.nav-link:hover { color: #4f46e5; }
+.nav-link:hover { color: #0d7a6b; }
+.nav-link-active { color: #0d7a6b; font-weight: 700; }
 
 .nav-actions {
   display: flex;
@@ -109,6 +123,13 @@ body {
   margin-bottom: 1rem;
   flex-wrap: wrap;
   gap: 0.5rem;
+}
+
+.filter-left {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
 }
 
 .filter-right {
@@ -317,8 +338,8 @@ body {
   display: inline-flex;
   align-items: center;
   gap: 0.25rem;
-  background: #ebf4ff;
-  color: #2b6cb0;
+  background: #fef9e7;
+  color: #856a00;
   border-radius: 10px;
   padding: 0.1rem 0.5rem;
   font-size: 0.72rem;
@@ -328,11 +349,11 @@ body {
   border: none;
 }
 
-.split-badge:hover { background: #bee3f8; }
+.split-badge:hover { background: #fde68a; }
 
 /* ── Split editor panel ───────────────────────────────────────────────────────  */
 .split-editor {
-  border: 1px solid #bee3f8;
+  border: 1px solid #fde68a;
   border-radius: 10px;
   background: #f0f8ff;
   padding: 1rem 1.25rem;
@@ -417,11 +438,6 @@ body {
 .split-cat {
   flex: 1;
   min-width: 120px;
-  border: 1px solid #cbd5e0;
-  border-radius: 6px;
-  padding: 0.35rem 0.5rem;
-  font-size: 0.85rem;
-  background: #fff;
 }
 
 .split-note {
@@ -489,7 +505,7 @@ body {
 }
 
 .split-save-btn {
-  background: #4f46e5;
+  background: #0d7a6b;
   color: #fff;
   border: none;
   border-radius: 6px;
@@ -557,7 +573,8 @@ body {
 
   /* Filters stack vertically */
   .filters { flex-direction: column; align-items: stretch; }
-  .filter-right { justify-content: space-between; }
+  .filter-left { justify-content: space-between; }
+  .filter-right { justify-content: flex-end; }
 
   /* Transaction table → cards */
   .txn-table { display: none; }
@@ -580,4 +597,11 @@ body {
 
   /* Budget period close button full width on mobile */
   .close-btn-mobile { width: 100%; margin-top: 0.5rem; }
+
+  /* Accounts table → cards */
+  .accounts-table { display: none; }
+  .accounts-cards { display: block; }
 }
+
+/* Accounts cards hidden on desktop */
+.accounts-cards { display: none; }

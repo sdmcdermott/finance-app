@@ -7,6 +7,8 @@ import {
   ConfirmedMatch,
   Transaction,
 } from '../api/client';
+import { fmtDate } from '../utils/dates';
+import { fmtCurrency } from '../utils/dates';
 
 const ImportPage: React.FC = () => {
   const fileRef = useRef<HTMLInputElement>(null);
@@ -174,7 +176,7 @@ const ImportPage: React.FC = () => {
                     )}
                   </td>
                   <td style={styles.td}>{statusBadge(m.status)}</td>
-                  <td style={styles.td}>{m.order.orderDate}</td>
+                  <td style={styles.td}>{fmtDate(m.order.orderDate)}</td>
                   <td style={styles.td}>
                     <a href={m.order.orderUrl} target="_blank" rel="noreferrer" style={styles.orderLink}>
                       {m.order.orderId}
@@ -183,14 +185,14 @@ const ImportPage: React.FC = () => {
                   <td style={styles.td}>
                     <span style={styles.titleText}>{m.order.titles.slice(0, 2).join('; ')}</span>
                   </td>
-                  <td style={{ ...styles.td, textAlign: 'right' }}>
-                    ${m.order.amount.toFixed(2)}
-                  </td>
+                   <td style={{ ...styles.td, textAlign: 'right' }}>
+                     {fmtCurrency(m.order.amount)}
+                   </td>
                   <td style={styles.td}>
                     {m.status === 'confident' && m.candidates.length === 1 && (
                       <span style={styles.txnInfo}>
-                        {m.candidates[0].date} &mdash; {m.candidates[0].merchantName || m.candidates[0].name}
-                        &nbsp;(${Math.abs(m.candidates[0].amount).toFixed(2)})
+                        {fmtDate(m.candidates[0].date)} &mdash; {m.candidates[0].merchantName || m.candidates[0].name}
+                        &nbsp;({fmtCurrency(m.candidates[0].amount)})
                       </span>
                     )}
                     {m.status === 'ambiguous' && (
@@ -204,7 +206,7 @@ const ImportPage: React.FC = () => {
                         <option value="">— choose transaction —</option>
                         {m.candidates.map((c) => (
                           <option key={c.dateTransactionId} value={c.dateTransactionId}>
-                            {c.date} &mdash; {c.merchantName || c.name} (${Math.abs(c.amount).toFixed(2)})
+                            {fmtDate(c.date)} &mdash; {c.merchantName || c.name} ({fmtCurrency(c.amount)})
                           </option>
                         ))}
                       </select>
@@ -245,18 +247,18 @@ const styles: Record<string, React.CSSProperties> = {
   heading: { fontSize: '1.25rem', fontWeight: 700, color: '#1a202c', marginBottom: '0.25rem' },
   subtext: { color: '#718096', fontSize: '0.875rem', marginBottom: '1.25rem' },
   uploadRow: { display: 'flex', alignItems: 'center', gap: '1rem', marginBottom: '1.25rem', flexWrap: 'wrap' },
-  uploadBtn: { background: '#4f46e5', color: '#fff', border: 'none', borderRadius: 6, padding: '0.5rem 1.25rem', cursor: 'pointer', fontSize: '0.875rem' },
+  uploadBtn: { background: '#0d7a6b', color: '#fff', border: 'none', borderRadius: 6, padding: '0.5rem 1.25rem', cursor: 'pointer', fontSize: '0.875rem' },
   summary: { color: '#4a5568', fontSize: '0.85rem' },
   table: { width: '100%', borderCollapse: 'collapse', fontSize: '0.875rem' },
   th: { textAlign: 'left', padding: '0.6rem 0.75rem', background: '#f7fafc', borderBottom: '2px solid #e2e8f0', fontWeight: 600, color: '#4a5568' },
   tr: { borderBottom: '1px solid #e2e8f0' },
   td: { padding: '0.55rem 0.75rem', color: '#2d3748', verticalAlign: 'middle' },
   badge: { color: '#fff', borderRadius: 12, padding: '0.15rem 0.6rem', fontSize: '0.75rem', whiteSpace: 'nowrap' },
-  orderLink: { color: '#4f46e5', fontSize: '0.8rem' },
+  orderLink: { color: '#0d7a6b', fontSize: '0.8rem' },
   titleText: { fontSize: '0.8rem', color: '#4a5568' },
   txnInfo: { fontSize: '0.8rem', color: '#4a5568' },
   unmatchedText: { fontSize: '0.8rem', color: '#a0aec0', fontStyle: 'italic' },
-  select: { border: '1px solid #cbd5e0', borderRadius: 4, padding: '0.2rem 0.4rem', fontSize: '0.8rem', maxWidth: 300 },
+  select: { maxWidth: 300 },
   confirmRow: { marginTop: '1rem', display: 'flex', justifyContent: 'flex-end' },
   confirmBtn: { background: '#38a169', color: '#fff', border: 'none', borderRadius: 6, padding: '0.5rem 1.5rem', cursor: 'pointer', fontSize: '0.875rem' },
   empty: { textAlign: 'center', color: '#718096', marginTop: '3rem' },

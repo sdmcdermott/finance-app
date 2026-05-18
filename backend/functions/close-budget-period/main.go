@@ -31,6 +31,7 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response,
 	}
 	budgetID := req.PathParameters["budgetId"]
 	startDate := req.PathParameters["startDate"]
+	force := req.QueryStringParameters["force"] == "true"
 	if budgetID == "" || startDate == "" {
 		return errorResponse(http.StatusBadRequest, "budgetId and startDate path parameters are required"), nil
 	}
@@ -56,7 +57,7 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response,
 	if period == nil {
 		return errorResponse(http.StatusNotFound, "period not found"), nil
 	}
-	if period.Closed {
+	if period.Closed && !force {
 		return errorResponse(http.StatusConflict, "period is already closed"), nil
 	}
 
@@ -65,22 +66,18 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response,
 		return errorResponse(http.StatusInternalServerError, err.Error()), nil
 	}
 
-	catSet := make(map[string]bool, len(budget.CategoryIDs))
-	for _, id := range budget.CategoryIDs {
-		catSet[id] = true
-	}
+	debits, credits := computeTotals(ctx, dbClient, accounts, budget, period.StartDate, period.EndDate)
 
-	debits, credits := computeTotals(ctx, dbClient, accounts, budget, catSet, period.StartDate, period.EndDate)
-
+	// delta is computed from live totals at close time and used to seed the next
+	// period's carry-in. It is NOT stored on the closed period — get-budget-period
+	// recomputes it live so late-arriving transactions are always reflected.
 	var delta float64 // positive = surplus, negative = shortfall
 	switch budget.BudgetType {
 	case "goal":
 		effectiveGoal := budget.GoalAmount + period.RolledOverAmount
 		if budget.GoalDirection == "limit" {
-			// surplus = money not spent
 			delta = effectiveGoal - debits
 		} else {
-			// target: surplus = exceeded the target
 			delta = debits - effectiveGoal
 		}
 	case "checkbook":
@@ -91,29 +88,33 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response,
 
 	switch budget.SurplusHandling {
 	case "rollover":
-		period.RolledOverAmount += delta
-		// The next period will inherit this via the RolledOverAmount on the new period.
-		// We store a marker on the current period so the UI can display it.
+		// Mark the period closed (RolledOverAmount on this period = carry-in, unchanged).
 		if err := dbClient.PutBudgetPeriod(ctx, *period); err != nil {
 			return errorResponse(http.StatusInternalServerError, err.Error()), nil
 		}
-		// Open the next period with the rolled-over amount
+		// Open (or update) the next period with the live delta as its carry-in.
 		nextStart, nextEnd := dbpkg.PeriodDates(budget.Period, nextPeriodRef(budget.Period, period.EndDate))
 		nextLabel := dbpkg.FormatPeriodLabel(budget.Name, budget.PeriodFormat, nextStart)
-		nextPeriod := dbpkg.BudgetPeriod{
-			PeriodID:         uuid.NewString(),
-			BudgetID:         budgetID,
-			StartDate:        nextStart,
-			EndDate:          nextEnd,
-			Label:            nextLabel,
-			RolledOverAmount: delta,
+		nextPeriod, err := dbClient.GetBudgetPeriod(ctx, budgetID, nextStart)
+		if err != nil {
+			return errorResponse(http.StatusInternalServerError, err.Error()), nil
 		}
-		if err := dbClient.PutBudgetPeriod(ctx, nextPeriod); err != nil {
+		if nextPeriod == nil {
+			nextPeriod = &dbpkg.BudgetPeriod{
+				PeriodID:  uuid.NewString(),
+				BudgetID:  budgetID,
+				StartDate: nextStart,
+				EndDate:   nextEnd,
+				Label:     nextLabel,
+			}
+		}
+		nextPeriod.RolledOverAmount = delta
+		if err := dbClient.PutBudgetPeriod(ctx, *nextPeriod); err != nil {
 			return errorResponse(http.StatusInternalServerError, err.Error()), nil
 		}
 
 	case "transfer":
-		// Transfer to destination checkbook budget's current period
+		// Transfer to destination checkbook budget's current period.
 		amount := budget.TransferAmount
 		if amount == 0 {
 			amount = math.Abs(delta)
@@ -166,7 +167,6 @@ func computeTotals(
 	dbClient *dbpkg.Client,
 	accounts []dbpkg.Account,
 	budget *dbpkg.Budget,
-	catSet map[string]bool,
 	startDate, endDate string,
 ) (debits, credits float64) {
 	for _, acct := range accounts {
@@ -185,13 +185,7 @@ func computeTotals(
 			splits := splitMap[t.DateTransactionID]
 			if len(splits) > 0 {
 				for _, sp := range splits {
-					inBudget := false
-					if sp.BudgetID != "" {
-						inBudget = sp.BudgetID == budget.BudgetID
-					} else if sp.CustomCategory != "" {
-						inBudget = catSet[sp.CustomCategory]
-					}
-					if !inBudget {
+					if sp.BudgetID != budget.BudgetID {
 						continue
 					}
 					if sp.Amount > 0 {
@@ -201,13 +195,7 @@ func computeTotals(
 					}
 				}
 			} else {
-				effectiveBudget := ""
-				if t.ManualBudget {
-					effectiveBudget = t.BudgetID
-				} else if t.CustomCategory != "" && catSet[t.CustomCategory] {
-					effectiveBudget = budget.BudgetID
-				}
-				if effectiveBudget != budget.BudgetID {
+				if t.BudgetID != budget.BudgetID {
 					continue
 				}
 				if t.Amount > 0 {
@@ -222,27 +210,14 @@ func computeTotals(
 }
 
 // nextPeriodRef returns a time that falls inside the period following endDate.
-func nextPeriodRef(period, endDate string) time.Time {
+// We always add one day — this safely lands in the next period regardless of
+// month length (avoids the 2026-03-31 + 1 month = 2026-05-01 overflow).
+func nextPeriodRef(_, endDate string) time.Time {
 	t, err := time.Parse("2006-01-02", endDate)
 	if err != nil {
 		return time.Now().AddDate(0, 1, 0)
 	}
-	switch period {
-	case "daily":
-		return t.AddDate(0, 0, 1)
-	case "weekly":
-		return t.AddDate(0, 0, 1)
-	case "biweekly":
-		return t.AddDate(0, 0, 1)
-	case "monthly":
-		return t.AddDate(0, 1, 0)
-	case "quarterly":
-		return t.AddDate(0, 3, 0)
-	case "annually":
-		return t.AddDate(1, 0, 0)
-	default:
-		return t.AddDate(0, 1, 0)
-	}
+	return t.AddDate(0, 0, 1)
 }
 
 // Ensure fmt is used (for FormatPeriodLabel via dbpkg).

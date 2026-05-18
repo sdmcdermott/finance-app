@@ -31,10 +31,10 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response,
 
 	userID := plaidclient.UserID()
 
-	// Determine date range: default to current month
-	now := time.Now()
-	month := req.QueryStringParameters["month"] // optional "YYYY-MM"
+	// Determine date range: if month is provided restrict to that month,
+	// otherwise apply to all transactions (no date filter).
 	var startDate, endDate string
+	month := req.QueryStringParameters["month"] // optional "YYYY-MM"
 	if month != "" {
 		var y, m int
 		if _, err := fmt.Sscanf(month, "%d-%d", &y, &m); err == nil {
@@ -45,9 +45,9 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response,
 		}
 	}
 	if startDate == "" {
-		startDate = fmt.Sprintf("%d-%02d-01", now.Year(), now.Month())
-		last := time.Date(now.Year(), now.Month()+1, 0, 0, 0, 0, 0, time.UTC).Day()
-		endDate = fmt.Sprintf("%d-%02d-%02d", now.Year(), now.Month(), last)
+		// No month filter — span the full range of plausible dates
+		startDate = "2000-01-01"
+		endDate = "2999-12-31"
 	}
 
 	// Fetch all accounts and rules
@@ -85,14 +85,16 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response,
 	// Apply rules
 	updated := dbpkg.ApplyRulesToTransactions(rules, allTxns)
 
-	// Persist only the transactions whose customCategory actually changed
+	// Persist only the transactions whose customCategory or budgetId actually changed
 	var toWrite []dbpkg.Transaction
-	origMap := make(map[string]string, len(allTxns))
+	type origState struct{ cat, budget string }
+	origMap := make(map[string]origState, len(allTxns))
 	for _, t := range allTxns {
-		origMap[t.DateTransactionID] = t.CustomCategory
+		origMap[t.DateTransactionID] = origState{t.CustomCategory, t.BudgetID}
 	}
 	for _, t := range updated {
-		if t.CustomCategory != origMap[t.DateTransactionID] {
+		orig := origMap[t.DateTransactionID]
+		if t.CustomCategory != orig.cat || t.BudgetID != orig.budget {
 			toWrite = append(toWrite, t)
 		}
 	}

@@ -1,9 +1,11 @@
 import React, { useState } from 'react';
-import { Transaction, TransactionSplit, Category, putSplits } from '../api/client';
+import { Transaction, TransactionSplit, Category, Budget, putSplits } from '../api/client';
+import { fmtCurrency } from '../utils/dates';
 
 interface Props {
   txn: Transaction;
   categories: Category[];
+  budgets: Budget[];
   onClose: () => void;
   onSaved: (updated: Transaction) => void;
 }
@@ -17,9 +19,9 @@ const blankSplit = (): Omit<TransactionSplit, 'accountId' | 'dateTransactionId'>
   note: '',
 });
 
-const fmt2 = (n: number) => n.toFixed(2);
+const fmt2 = fmtCurrency;
 
-const SplitEditor: React.FC<Props> = ({ txn, categories, onClose, onSaved }) => {
+const SplitEditor: React.FC<Props> = ({ txn, categories, budgets, onClose, onSaved }) => {
   const parentAbs = Math.abs(txn.amount);
   const isCreditTxn = txn.amount < 0; // negative = credit/income in Plaid convention
 
@@ -112,7 +114,7 @@ const SplitEditor: React.FC<Props> = ({ txn, categories, onClose, onSaved }) => 
           <div className="split-editor-subtitle">
             {txn.merchantName || txn.name} &nbsp;·&nbsp;
             <span style={{ color: txn.amount > 0 ? '#e53e3e' : '#38a169', fontWeight: 600 }}>
-              {isCreditTxn ? '+' : '-'}${fmt2(parentAbs)}
+              {isCreditTxn ? '+' : '-'}{fmt2(parentAbs)}
             </span>
           </div>
         </div>
@@ -145,6 +147,16 @@ const SplitEditor: React.FC<Props> = ({ txn, categories, onClose, onSaved }) => 
                   <option key={c.categoryId} value={c.categoryId}>{c.name}</option>
                 ))}
               </select>
+              <select
+                className="split-cat"
+                value={row.budgetId}
+                onChange={e => setRow(idx, { budgetId: e.target.value })}
+              >
+                <option value="">— Budget —</option>
+                {budgets.map(b => (
+                  <option key={b.budgetId} value={b.budgetId}>{b.name}</option>
+                ))}
+              </select>
               <input
                 type="text"
                 className="split-note"
@@ -164,7 +176,7 @@ const SplitEditor: React.FC<Props> = ({ txn, categories, onClose, onSaved }) => 
         <span className={`split-remainder ${Math.abs(remainder) > 0.015 ? 'split-remainder--bad' : 'split-remainder--ok'}`}>
           {Math.abs(remainder) <= 0.015
             ? '✓ Amounts balance'
-            : `Remaining: $${fmt2(Math.abs(remainder))} ${remainder > 0 ? 'unallocated' : 'over'}`}
+            : `Remaining: ${fmtCurrency(Math.abs(remainder))} ${remainder > 0 ? 'unallocated' : 'over'}`}
         </span>
         {remainder > 0.015 && (
           <button className="split-distribute-btn" onClick={distributeRemainder}>

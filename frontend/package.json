@@ -13,6 +13,7 @@
     "@types/react-dom": "^19.2.3",
     "amazon-cognito-identity-js": "^6.3.16",
     "axios": "^1.15.2",
+    "qrcode.react": "^4.2.0",
     "react": "^19.2.5",
     "react-dom": "^19.2.5",
     "react-plaid-link": "^4.1.1",
@@ -33,6 +34,7 @@
       "react-app/jest"
     ]
   },
+  "proxy": "http://localhost:3001",
   "browserslist": {
     "production": [
       ">0.2%",

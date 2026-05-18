@@ -6,6 +6,7 @@
 //	USER#<userId>         ACCOUNT#<accountId>             Account
 //	USER#<userId>         CATEGORY#<categoryId>           Category
 //	USER#<userId>         RULE#<ruleId>                   Rule
+//	USER#<userId>         INCOME#<incomeSourceId>         IncomeSource
 //	USER#<userId>         BUDGET#<budgetId>               Budget
 //	BUDGET#<budgetId>     PERIOD#<startDate>              BudgetPeriod
 //	ACCOUNT#<accountId>   TXN#<date>#<txnId>              Transaction
@@ -15,6 +16,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"sort"
 	"strings"
@@ -33,10 +35,11 @@ func userPK(userID string) string         { return "USER#" + userID }
 func accountSK(accountID string) string   { return "ACCOUNT#" + accountID }
 func categorySK(categoryID string) string { return "CATEGORY#" + categoryID }
 func ruleSK(ruleID string) string         { return "RULE#" + ruleID }
-func budgetSK(budgetID string) string     { return "BUDGET#" + budgetID }
-func budgetPK(budgetID string) string     { return "BUDGET#" + budgetID }
-func periodSK(startDate string) string    { return "PERIOD#" + startDate }
-func accountPK(accountID string) string   { return "ACCOUNT#" + accountID }
+func budgetSK(budgetID string) string        { return "BUDGET#" + budgetID }
+func budgetPK(budgetID string) string        { return "BUDGET#" + budgetID }
+func periodSK(startDate string) string       { return "PERIOD#" + startDate }
+func accountPK(accountID string) string      { return "ACCOUNT#" + accountID }
+func incomeSourceSK(sourceID string) string  { return "INCOME#" + sourceID }
 
 // txnSK builds a lexicographically sortable sort key: TXN#<date>#<txnId>
 // date must be "YYYY-MM-DD" so range queries work correctly.
@@ -106,6 +109,13 @@ type Transaction struct {
 	// Manual reference link (e.g. Amazon order URL)
 	ReferenceURL  string `dynamodbav:"referenceUrl"  json:"referenceUrl"`
 	ReferenceNote string `dynamodbav:"referenceNote" json:"referenceNote"`
+	// Extra fields sourced from Plaid at sync time
+	OriginalDescription      string `dynamodbav:"originalDescription"      json:"originalDescription,omitempty"`
+	AuthorizedDate           string `dynamodbav:"authorizedDate"           json:"authorizedDate,omitempty"`
+	PaymentChannel           string `dynamodbav:"paymentChannel"           json:"paymentChannel,omitempty"`
+	PersonalFinancePrimary   string `dynamodbav:"personalFinancePrimary"   json:"personalFinancePrimary,omitempty"`
+	PersonalFinanceDetailed  string `dynamodbav:"personalFinanceDetailed"  json:"personalFinanceDetailed,omitempty"`
+	LogoURL                  string `dynamodbav:"logoUrl"                  json:"logoUrl,omitempty"`
 	// Splits — populated on read, not stored on the transaction item itself.
 	Splits []TransactionSplit `dynamodbav:"-" json:"splits,omitempty"`
 }
@@ -143,10 +153,6 @@ type Budget struct {
 	Period       string `dynamodbav:"period"       json:"period"`       // daily|weekly|biweekly|monthly|quarterly|annually
 	PeriodFormat string `dynamodbav:"periodFormat" json:"periodFormat"` // user-configured label template
 
-	// Category linkage — transactions whose customCategory is in this list
-	// contribute to the budget. The frontend also allows per-transaction override.
-	CategoryIDs []string `dynamodbav:"categoryIds" json:"categoryIds"`
-
 	// Goal-type fields
 	GoalAmount    float64 `dynamodbav:"goalAmount"    json:"goalAmount"`
 	GoalDirection string  `dynamodbav:"goalDirection" json:"goalDirection"` // "limit" | "target"
@@ -158,6 +164,78 @@ type Budget struct {
 
 	// Checkbook-type fields
 	OpeningBalance float64 `dynamodbav:"openingBalance" json:"openingBalance"`
+}
+
+// DeductionItem is a single named line item within a pre-tax deduction bucket.
+type DeductionItem struct {
+	Name   string  `dynamodbav:"name"   json:"name"`
+	Amount float64 `dynamodbav:"amount" json:"amount"`
+}
+
+// IncomeSource represents a recurring paycheck or income stream.
+//
+// FilingStatus: single | married_jointly | married_separately | head_of_household
+// Frequency:    weekly | biweekly | semimonthly | monthly
+type IncomeSource struct {
+	PK string `dynamodbav:"pk" json:"-"`
+	SK string `dynamodbav:"sk" json:"-"`
+
+	UserID         string  `dynamodbav:"userId"         json:"userId"`
+	IncomeSourceID string  `dynamodbav:"incomeSourceId" json:"incomeSourceId"`
+	Name           string  `dynamodbav:"name"           json:"name"`
+	Frequency      string  `dynamodbav:"frequency"      json:"frequency"`
+	GrossAmount    float64 `dynamodbav:"grossAmount"    json:"grossAmount"`
+	FilingStatus   string  `dynamodbav:"filingStatus"   json:"filingStatus"`
+	WorkState      string  `dynamodbav:"workState"      json:"workState"`
+	// Pre-tax deductions per period — split by tax treatment:
+	// Section125Deductions (cafeteria plan): health/dental/vision, HSA, FSA —
+	//   reduce both FICA (SS + Medicare) and income tax.
+	// RetirementDeductions (401k/403b/457 traditional): reduce income tax only,
+	//   not FICA.
+	// PreTaxDeductions is kept for backward compatibility; when both new fields
+	// are zero and PreTaxDeductions is non-zero, it is treated as Section 125.
+	Section125Deductions  float64         `dynamodbav:"section125Deductions"  json:"section125Deductions"`
+	Section125Items       []DeductionItem `dynamodbav:"section125Items,omitempty" json:"section125Items,omitempty"`
+	RetirementDeductions  float64         `dynamodbav:"retirementDeductions"  json:"retirementDeductions"`
+	RetirementItems       []DeductionItem `dynamodbav:"retirementItems,omitempty" json:"retirementItems,omitempty"`
+	PreTaxDeductions      float64 `dynamodbav:"preTaxDeductions"      json:"preTaxDeductions"` // legacy
+	// Flat additional federal withholding per period (W-4 line 4c)
+	AdditionalWithholding float64 `dynamodbav:"additionalWithholding" json:"additionalWithholding"`
+	// DeductionType: "standard" | "itemized"
+	DeductionType      string          `dynamodbav:"deductionType"      json:"deductionType"`
+	// ItemizedDeductions is the annual total when DeductionType is "itemized"
+	ItemizedDeductions      float64         `dynamodbav:"itemizedDeductions"      json:"itemizedDeductions"`
+	ItemizedDeductionItems  []DeductionItem `dynamodbav:"itemizedDeductionItems,omitempty" json:"itemizedDeductionItems,omitempty"`
+	// W-4 Step 3: total dependent/child tax credits (annual dollar amount)
+	Step3Credits       float64 `dynamodbav:"step3Credits"       json:"step3Credits"`
+	// W-4 Step 4a: other annual income not from jobs (interest, dividends, etc.)
+	Step4aOtherIncome  float64         `dynamodbav:"step4aOtherIncome"  json:"step4aOtherIncome"`
+	Step4aItems        []DeductionItem `dynamodbav:"step4aItems,omitempty" json:"step4aItems,omitempty"`
+	// W-4 Step 4b: additional annual deductions (student loan, IRA, etc.)
+	Step4bDeductions   float64         `dynamodbav:"step4bDeductions"   json:"step4bDeductions"`
+	Step4bItems        []DeductionItem `dynamodbav:"step4bItems,omitempty" json:"step4bItems,omitempty"`
+	IsActive             bool    `dynamodbav:"isActive"             json:"isActive"`
+	// LastNetPay is the most recently computed net pay breakdown. Stored so it
+	// survives page reloads without requiring another payrolltax API call.
+	LastNetPay *NetPayResult `dynamodbav:"lastNetPay,omitempty" json:"lastNetPay,omitempty"`
+}
+
+// NetPayResult mirrors payrolltax.NetPayResult for storage on IncomeSource.
+type NetPayResult struct {
+	GrossAmount           float64            `dynamodbav:"grossAmount"           json:"grossAmount"`
+	Section125Deductions  float64            `dynamodbav:"section125Deductions"  json:"section125Deductions"`
+	RetirementDeductions  float64            `dynamodbav:"retirementDeductions"  json:"retirementDeductions"`
+	FicaTaxableWages      float64            `dynamodbav:"ficaTaxableWages"      json:"ficaTaxableWages"`
+	IncomeTaxableWages    float64            `dynamodbav:"incomeTaxableWages"    json:"incomeTaxableWages"`
+	DeductionUsed         float64            `dynamodbav:"deductionUsed"         json:"deductionUsed"`
+	DeductionWarning      string             `dynamodbav:"deductionWarning,omitempty" json:"deductionWarning,omitempty"`
+	Step4aOtherIncome     float64            `dynamodbav:"step4aOtherIncome,omitempty" json:"step4aOtherIncome,omitempty"`
+	Step4bDeductions      float64            `dynamodbav:"step4bDeductions,omitempty" json:"step4bDeductions,omitempty"`
+	Step3Credits          float64            `dynamodbav:"step3Credits,omitempty" json:"step3Credits,omitempty"`
+	Withholdings          map[string]float64 `dynamodbav:"withholdings"          json:"withholdings"`
+	TotalWithheld         float64            `dynamodbav:"totalWithheld"         json:"totalWithheld"`
+	AdditionalWithholding float64            `dynamodbav:"additionalWithholding" json:"additionalWithholding"`
+	NetPay                float64            `dynamodbav:"netPay"                json:"netPay"`
 }
 
 // BudgetPeriod is one period instance of a Budget.
@@ -175,6 +253,10 @@ type BudgetPeriod struct {
 	RolledOverAmount float64 `dynamodbav:"rolledOverAmount" json:"rolledOverAmount"`
 	TransferredOut   float64 `dynamodbav:"transferredOut"   json:"transferredOut"`
 	Closed           bool    `dynamodbav:"closed"           json:"closed"`
+	// StaleWarning is set when a late-arriving transaction was written into this
+	// closed period but it is not the most-recent closed period (which is
+	// auto-re-closed on sync). The user should manually re-close it.
+	StaleWarning bool `dynamodbav:"staleWarning,omitempty" json:"staleWarning,omitempty"`
 }
 
 // ── Client ────────────────────────────────────────────────────────────────────
@@ -189,8 +271,16 @@ func New(ctx context.Context) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	var opts []func(*dynamodb.Options)
+	if endpoint := os.Getenv("DYNAMODB_ENDPOINT"); endpoint != "" {
+		opts = append(opts, func(o *dynamodb.Options) {
+			o.BaseEndpoint = aws.String(endpoint)
+		})
+	}
+
 	return &Client{
-		ddb:   dynamodb.NewFromConfig(cfg),
+		ddb:   dynamodb.NewFromConfig(cfg, opts...),
 		table: os.Getenv("DYNAMODB_TABLE"),
 	}, nil
 }
@@ -225,6 +315,17 @@ func (c *Client) GetAccounts(ctx context.Context, userID string) ([]Account, err
 	}
 	var accounts []Account
 	return accounts, attributevalue.UnmarshalListOfMaps(out.Items, &accounts)
+}
+
+func (c *Client) DeleteAccount(ctx context.Context, userID, accountID string) error {
+	_, err := c.ddb.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+		TableName: &c.table,
+		Key: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: userPK(userID)},
+			"sk": &types.AttributeValueMemberS{Value: accountSK(accountID)},
+		},
+	})
+	return err
 }
 
 func (c *Client) UpdateSyncCursor(ctx context.Context, userID, accountID, cursor string) error {
@@ -298,6 +399,11 @@ func (c *Client) DeleteTransactions(ctx context.Context, accountID string, txnKe
 	return nil
 }
 
+// DeleteTransaction removes a single transaction by accountId, date, and txnId.
+func (c *Client) DeleteTransaction(ctx context.Context, accountID, date, txnID string) error {
+	return c.DeleteTransactions(ctx, accountID, []struct{ Date, TxnID string }{{date, txnID}})
+}
+
 // GetTransactions returns transactions for an account between startDate and endDate (YYYY-MM-DD).
 func (c *Client) GetTransactions(ctx context.Context, accountID, startDate, endDate string) ([]Transaction, error) {
 	out, err := c.ddb.Query(ctx, &dynamodb.QueryInput{
@@ -318,6 +424,9 @@ func (c *Client) GetTransactions(ctx context.Context, accountID, startDate, endD
 }
 
 func (c *Client) UpdateTransactionCategory(ctx context.Context, accountID, date, txnID, customCategory string) error {
+	// If the user clears the category, also clear the manual flag so rules can
+	// re-apply to this transaction.
+	manual := customCategory != ""
 	_, err := c.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName: &c.table,
 		Key: map[string]types.AttributeValue{
@@ -327,7 +436,7 @@ func (c *Client) UpdateTransactionCategory(ctx context.Context, accountID, date,
 		UpdateExpression: aws.String("SET customCategory = :cat, manualCategory = :manual"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
 			":cat":    &types.AttributeValueMemberS{Value: customCategory},
-			":manual": &types.AttributeValueMemberBOOL{Value: true},
+			":manual": &types.AttributeValueMemberBOOL{Value: manual},
 		},
 	})
 	return err
@@ -548,8 +657,9 @@ func (c *Client) DeleteCategory(ctx context.Context, userID, categoryID string) 
 
 // ── Rules ─────────────────────────────────────────────────────────────────────
 
-// Rule auto-assigns a category to transactions whose merchant name contains
-// a given substring (case-insensitive). Lower Priority values are applied first.
+// Rule auto-assigns a category and/or budget to transactions whose merchant name
+// contains a given substring (case-insensitive). Lower Priority values are applied first.
+// AmountMatch/AmountTolerance and DayOfMonth/DayTolerance are optional AND conditions.
 type Rule struct {
 	PK string `dynamodbav:"pk" json:"-"`
 	SK string `dynamodbav:"sk" json:"-"`
@@ -558,7 +668,19 @@ type Rule struct {
 	RuleID     string `dynamodbav:"ruleId"     json:"ruleId"`
 	Pattern    string `dynamodbav:"pattern"    json:"pattern"`
 	CategoryID string `dynamodbav:"categoryId" json:"categoryId"`
+	BudgetID   string `dynamodbav:"budgetId"   json:"budgetId"`
 	Priority   int    `dynamodbav:"priority"   json:"priority"`
+
+	// Optional amount filter: match transactions where abs(amount) is within
+	// AmountTolerance of AmountMatch. Only applied when AmountMatch > 0.
+	AmountMatch     float64 `dynamodbav:"amountMatch,omitempty"     json:"amountMatch,omitempty"`
+	AmountTolerance float64 `dynamodbav:"amountTolerance,omitempty" json:"amountTolerance,omitempty"`
+
+	// Optional day-of-month filter: match transactions whose date's day is within
+	// DayTolerance days of DayOfMonth (wraps around month boundaries).
+	// Only applied when DayOfMonth > 0.
+	DayOfMonth   int `dynamodbav:"dayOfMonth,omitempty"   json:"dayOfMonth,omitempty"`
+	DayTolerance int `dynamodbav:"dayTolerance,omitempty" json:"dayTolerance,omitempty"`
 }
 
 func (c *Client) PutRule(ctx context.Context, rule Rule) error {
@@ -626,10 +748,43 @@ func ApplyRulesToTransactions(rules []Rule, txns []Transaction) []Transaction {
 			merchant = strings.ToLower(txn.Name)
 		}
 		for _, rule := range sorted {
-			if strings.Contains(merchant, strings.ToLower(rule.Pattern)) {
-				result[i].CustomCategory = rule.CategoryID
-				break
+			if !strings.Contains(merchant, strings.ToLower(rule.Pattern)) {
+				continue
 			}
+			// Optional amount filter
+			if rule.AmountMatch > 0 {
+				diff := math.Abs(math.Abs(txn.Amount) - rule.AmountMatch)
+				if diff > rule.AmountTolerance {
+					continue
+				}
+			}
+			// Optional day-of-month filter
+			if rule.DayOfMonth > 0 {
+				t, err := time.Parse("2006-01-02", txn.Date)
+				if err == nil {
+					day := t.Day()
+					// Compute circular distance within the month (1–daysInMonth)
+					daysInMonth := time.Date(t.Year(), t.Month()+1, 0, 0, 0, 0, 0, time.UTC).Day()
+					diff := day - rule.DayOfMonth
+					if diff < 0 {
+						diff = -diff
+					}
+					if diff > daysInMonth/2 {
+						diff = daysInMonth - diff
+					}
+					if diff > rule.DayTolerance {
+						continue
+					}
+				}
+			}
+			if rule.CategoryID != "" {
+				result[i].CustomCategory = rule.CategoryID
+			}
+			if rule.BudgetID != "" && !txn.ManualBudget {
+				result[i].BudgetID = rule.BudgetID
+				result[i].ManualBudget = true
+			}
+			break
 		}
 	}
 	return result
@@ -749,6 +904,57 @@ func (c *Client) GetBudgetPeriod(ctx context.Context, budgetID, startDate string
 	return &p, attributevalue.UnmarshalMap(out.Item, &p)
 }
 
+// ── Period totals (shared by sync and close-budget-period) ───────────────────
+
+// ComputePeriodTotals returns the debit and credit sums for transactions in
+// [startDate, endDate] that are assigned to the given budget.
+// When a transaction has splits, each split is evaluated independently.
+func (c *Client) ComputePeriodTotals(
+	ctx context.Context,
+	accounts []Account,
+	budget *Budget,
+	startDate, endDate string,
+) (debits, credits float64) {
+	for _, acct := range accounts {
+		txns, err := c.GetTransactions(ctx, acct.AccountID, startDate, endDate)
+		if err != nil {
+			continue
+		}
+		splitMap, err := c.GetSplitsForRange(ctx, acct.AccountID, startDate, endDate)
+		if err != nil {
+			splitMap = map[string][]TransactionSplit{}
+		}
+		for _, t := range txns {
+			if t.Pending {
+				continue
+			}
+			splits := splitMap[t.DateTransactionID]
+			if len(splits) > 0 {
+				for _, sp := range splits {
+					if sp.BudgetID != budget.BudgetID {
+						continue
+					}
+					if sp.Amount > 0 {
+						debits += sp.Amount
+					} else {
+						credits += -sp.Amount
+					}
+				}
+			} else {
+				if t.BudgetID != budget.BudgetID {
+					continue
+				}
+				if t.Amount > 0 {
+					debits += t.Amount
+				} else {
+					credits += -t.Amount
+				}
+			}
+		}
+	}
+	return
+}
+
 // ── Period label generation ───────────────────────────────────────────────────
 
 // FormatPeriodLabel renders a period label from the budget's PeriodFormat template.
@@ -825,4 +1031,87 @@ func PeriodDates(period string, ref time.Time) (start, end string) {
 		e := time.Date(ref.Year(), ref.Month()+1, 0, 0, 0, 0, 0, time.UTC)
 		return s.Format("2006-01-02"), e.Format("2006-01-02")
 	}
+}
+
+// --- IncomeSource CRUD -------------------------------------------------
+
+func (c *Client) PutIncomeSource(ctx context.Context, s IncomeSource) error {
+	s.PK = userPK(s.UserID)
+	s.SK = incomeSourceSK(s.IncomeSourceID)
+	item, err := attributevalue.MarshalMap(s)
+	if err != nil {
+		return err
+	}
+	_, err = c.ddb.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: &c.table,
+		Item:      item,
+	})
+	return err
+}
+
+func (c *Client) GetIncomeSources(ctx context.Context, userID string) ([]IncomeSource, error) {
+	out, err := c.ddb.Query(ctx, &dynamodb.QueryInput{
+		TableName:              &c.table,
+		KeyConditionExpression: aws.String("pk = :pk AND begins_with(sk, :prefix)"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":pk":     &types.AttributeValueMemberS{Value: userPK(userID)},
+			":prefix": &types.AttributeValueMemberS{Value: "INCOME#"},
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	var sources []IncomeSource
+	return sources, attributevalue.UnmarshalListOfMaps(out.Items, &sources)
+}
+
+func (c *Client) GetIncomeSource(ctx context.Context, userID, sourceID string) (*IncomeSource, error) {
+	out, err := c.ddb.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: aws.String(c.table),
+		Key: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: userPK(userID)},
+			"sk": &types.AttributeValueMemberS{Value: incomeSourceSK(sourceID)},
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	if out.Item == nil {
+		return nil, nil
+	}
+	var s IncomeSource
+	return &s, attributevalue.UnmarshalMap(out.Item, &s)
+}
+
+func (c *Client) DeleteIncomeSource(ctx context.Context, userID, sourceID string) error {
+	_, err := c.ddb.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+		TableName: aws.String(c.table),
+		Key: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: userPK(userID)},
+			"sk": &types.AttributeValueMemberS{Value: incomeSourceSK(sourceID)},
+		},
+	})
+	return err
+}
+
+// SaveIncomeSourceNetPay stores the computed net pay result onto the income
+// source record so it is available without re-calling the payroll tax API.
+func (c *Client) SaveIncomeSourceNetPay(ctx context.Context, userID, sourceID string, result NetPayResult) error {
+	item, err := attributevalue.MarshalMap(result)
+	if err != nil {
+		return err
+	}
+	av := &types.AttributeValueMemberM{Value: item}
+	_, err = c.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(c.table),
+		Key: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: userPK(userID)},
+			"sk": &types.AttributeValueMemberS{Value: incomeSourceSK(sourceID)},
+		},
+		UpdateExpression: aws.String("SET lastNetPay = :r"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":r": av,
+		},
+	})
+	return err
 }

@@ -12,7 +12,7 @@ import (
 	auth "github.com/smcdermott/finance-app/internal/auth"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
-	plaid "github.com/plaid/plaid-go/v26/plaid"
+	plaid "github.com/plaid/plaid-go/v42/plaid"
 	dbpkg "github.com/smcdermott/finance-app/internal/db"
 	plaidclient "github.com/smcdermott/finance-app/internal/plaid"
 )

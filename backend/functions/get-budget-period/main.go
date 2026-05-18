@@ -3,7 +3,8 @@ package main
 // get-budget-period returns all stored periods for a budget and also
 // ensures the current period exists (auto-creates it if needed).
 // The response includes computed totals (debit sum, credit sum, balance)
-// derived from transactions in each period's date range.
+// derived from transactions in each period's date range, plus the
+// individual transaction rows included in those totals.
 
 import (
 	"context"
@@ -21,14 +22,33 @@ import (
 
 type response = events.APIGatewayV2HTTPResponse
 
+// BudgetTxn is a flattened row for a transaction (or split) contributing to
+// this budget's totals.
+type BudgetTxn struct {
+	Date              string  `json:"date"`
+	Name              string  `json:"name"`
+	Amount            float64 `json:"amount"` // positive = debit, negative = credit
+	AccountID         string  `json:"accountId"`
+	DateTransactionID string  `json:"dateTransactionId"`
+	IsSplit           bool    `json:"isSplit,omitempty"`
+}
+
 type periodWithTotals struct {
 	dbpkg.BudgetPeriod
-	DebitTotal  float64 `json:"debitTotal"`
-	CreditTotal float64 `json:"creditTotal"`
-	// For goal budgets: effectiveGoal = GoalAmount ± rolledOver
-	EffectiveGoal float64 `json:"effectiveGoal"`
-	// For checkbook budgets: balance = openingBalance + rolledOver + credits - debits
-	Balance float64 `json:"balance"`
+	DebitTotal  float64     `json:"debitTotal"`
+	CreditTotal float64     `json:"creditTotal"`
+	// For goal budgets: effectiveGoal = GoalAmount + carry-in RolledOverAmount
+	EffectiveGoal float64    `json:"effectiveGoal"`
+	// For checkbook budgets: balance = openingBalance + carry-in + credits - debits
+	Balance      float64     `json:"balance"`
+	// LiveDelta is the live-computed surplus/shortfall for this period.
+	// For goal/limit:  effectiveGoal - debits  (positive = under, negative = over)
+	// For goal/target: debits - effectiveGoal  (positive = met/exceeded)
+	// For checkbook:   balance (same as Balance above)
+	// This is what a subsequent period's RolledOverAmount was seeded from at close
+	// time, but is always recomputed so late transactions are reflected accurately.
+	LiveDelta    float64     `json:"liveDelta"`
+	Transactions []BudgetTxn `json:"transactions"`
 }
 
 func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response, error) {
@@ -74,36 +94,45 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response,
 		}
 	}
 
+	// Fetch accounts once — used for both ensurePeriodsForTransactions and computeTotals.
+	accounts, err := dbClient.GetAccounts(ctx, userID)
+	if err != nil {
+		return errorResponse(http.StatusInternalServerError, err.Error()), nil
+	}
+
+	// Auto-create periods for any transactions assigned to this budget that fall
+	// outside already-stored periods.
+	if err := ensurePeriodsForTransactions(ctx, dbClient, userID, budget, accounts); err != nil {
+		// non-fatal: log and continue; worst case the period just won't appear yet
+		_ = err
+	}
+
 	// Fetch all periods
 	periods, err := dbClient.GetBudgetPeriods(ctx, budgetID)
 	if err != nil {
 		return errorResponse(http.StatusInternalServerError, err.Error()), nil
 	}
 
-	// Fetch accounts once for transaction lookups
-	accounts, err := dbClient.GetAccounts(ctx, userID)
-	if err != nil {
-		return errorResponse(http.StatusInternalServerError, err.Error()), nil
-	}
-
-	// Build category set for this budget
-	catSet := make(map[string]bool, len(budget.CategoryIDs))
-	for _, id := range budget.CategoryIDs {
-		catSet[id] = true
-	}
-
 	result := make([]periodWithTotals, 0, len(periods))
 	for _, p := range periods {
-		debits, credits := computeTotals(ctx, dbClient, accounts, budget, catSet, p.StartDate, p.EndDate)
+		debits, credits, txns := computeTotals(ctx, dbClient, accounts, budget, p.StartDate, p.EndDate)
 		pw := periodWithTotals{
 			BudgetPeriod: p,
 			DebitTotal:   debits,
 			CreditTotal:  credits,
+			Transactions: txns,
 		}
 		if budget.BudgetType == "goal" {
-			pw.EffectiveGoal = budget.GoalAmount + p.RolledOverAmount
+			effectiveGoal := budget.GoalAmount + p.RolledOverAmount
+			pw.EffectiveGoal = effectiveGoal
+			if budget.GoalDirection == "limit" {
+				pw.LiveDelta = effectiveGoal - debits
+			} else {
+				pw.LiveDelta = debits - effectiveGoal
+			}
 		} else {
 			pw.Balance = budget.OpeningBalance + p.RolledOverAmount + credits - debits
+			pw.LiveDelta = pw.Balance
 		}
 		result = append(result, pw)
 	}
@@ -116,23 +145,22 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response,
 }
 
 // computeTotals sums debits and credits for transactions in [startDate, endDate]
-// that belong to the budget's categories (or have a manual budgetId override).
+// that are directly assigned to this budget (txn.BudgetID == budget.BudgetID).
 // When a transaction has splits, each split is evaluated independently.
+// Returns debits, credits, and the individual rows that contributed.
 func computeTotals(
 	ctx context.Context,
 	dbClient *dbpkg.Client,
 	accounts []dbpkg.Account,
 	budget *dbpkg.Budget,
-	catSet map[string]bool,
 	startDate, endDate string,
-) (debits, credits float64) {
+) (debits, credits float64, rows []BudgetTxn) {
 	for _, acct := range accounts {
 		txns, err := dbClient.GetTransactions(ctx, acct.AccountID, startDate, endDate)
 		if err != nil {
 			continue
 		}
 
-		// Fetch splits for this account/range
 		splitMap, err := dbClient.GetSplitsForRange(ctx, acct.AccountID, startDate, endDate)
 		if err != nil {
 			splitMap = map[string][]dbpkg.TransactionSplit{}
@@ -146,15 +174,8 @@ func computeTotals(
 			splits := splitMap[t.DateTransactionID]
 
 			if len(splits) > 0 {
-				// Transaction is subdivided — evaluate each split independently
 				for _, sp := range splits {
-					inBudget := false
-					if sp.BudgetID != "" {
-						inBudget = sp.BudgetID == budget.BudgetID
-					} else if sp.CustomCategory != "" {
-						inBudget = catSet[sp.CustomCategory]
-					}
-					if !inBudget {
+					if sp.BudgetID != budget.BudgetID {
 						continue
 					}
 					if sp.Amount > 0 {
@@ -162,16 +183,17 @@ func computeTotals(
 					} else {
 						credits += -sp.Amount
 					}
+					rows = append(rows, BudgetTxn{
+						Date:              t.Date,
+						Name:              t.Name,
+						Amount:            sp.Amount,
+						AccountID:         acct.AccountID,
+						DateTransactionID: t.DateTransactionID,
+						IsSplit:           true,
+					})
 				}
 			} else {
-				// No splits — use transaction-level category/budget
-				effectiveBudget := ""
-				if t.ManualBudget {
-					effectiveBudget = t.BudgetID
-				} else if t.CustomCategory != "" && catSet[t.CustomCategory] {
-					effectiveBudget = budget.BudgetID
-				}
-				if effectiveBudget != budget.BudgetID {
+				if t.BudgetID != budget.BudgetID {
 					continue
 				}
 				if t.Amount > 0 {
@@ -179,10 +201,101 @@ func computeTotals(
 				} else {
 					credits += -t.Amount
 				}
+				rows = append(rows, BudgetTxn{
+					Date:              t.Date,
+					Name:              t.Name,
+					Amount:            t.Amount,
+					AccountID:         acct.AccountID,
+					DateTransactionID: t.DateTransactionID,
+				})
 			}
 		}
 	}
 	return
+}
+
+// ensurePeriodsForTransactions scans all transactions assigned to the budget,
+// determines which period each one belongs to, and creates any missing periods.
+func ensurePeriodsForTransactions(
+	ctx context.Context,
+	dbClient *dbpkg.Client,
+	userID string,
+	budget *dbpkg.Budget,
+	accounts []dbpkg.Account,
+) error {
+	// Collect every unique period start-date that has at least one matching transaction.
+	needed := map[string]string{} // startDate → endDate
+
+	for _, acct := range accounts {
+		txns, err := dbClient.GetTransactions(ctx, acct.AccountID, "2000-01-01", "2999-12-31")
+		if err != nil {
+			continue
+		}
+		splitMap, err := dbClient.GetSplitsForRange(ctx, acct.AccountID, "2000-01-01", "2999-12-31")
+		if err != nil {
+			splitMap = map[string][]dbpkg.TransactionSplit{}
+		}
+
+		for _, t := range txns {
+			if t.Pending {
+				continue
+			}
+			splits := splitMap[t.DateTransactionID]
+			matched := false
+			if len(splits) > 0 {
+				for _, sp := range splits {
+					if sp.BudgetID == budget.BudgetID {
+						matched = true
+						break
+					}
+				}
+			} else {
+				matched = t.BudgetID == budget.BudgetID
+			}
+			if !matched {
+				continue
+			}
+
+			ref, err := time.Parse("2006-01-02", t.Date)
+			if err != nil {
+				continue
+			}
+			s, e := dbpkg.PeriodDates(budget.Period, ref)
+			needed[s] = e
+		}
+	}
+
+	if len(needed) == 0 {
+		return nil
+	}
+
+	// Fetch existing periods so we don't duplicate.
+	existing, err := dbClient.GetBudgetPeriods(ctx, budget.BudgetID)
+	if err != nil {
+		return err
+	}
+	covered := map[string]bool{}
+	for _, p := range existing {
+		covered[p.StartDate] = true
+	}
+
+	for s, e := range needed {
+		if covered[s] {
+			continue
+		}
+		label := dbpkg.FormatPeriodLabel(budget.Name, budget.PeriodFormat, s)
+		p := dbpkg.BudgetPeriod{
+			PeriodID:  uuid.NewString(),
+			BudgetID:  budget.BudgetID,
+			StartDate: s,
+			EndDate:   e,
+			Label:     label,
+		}
+		if err := dbClient.PutBudgetPeriod(ctx, p); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func main() { lambda.Start(handler) }

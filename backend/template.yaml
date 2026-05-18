@@ -6,7 +6,7 @@ Globals:
   Function:
     Runtime: provided.al2023
     Architectures:
-      - arm64
+      - x86_64
     Timeout: 30
     MemorySize: 128
     Environment:
@@ -15,8 +15,10 @@ Globals:
         PLAID_CLIENT_ID: !Sub "{{resolve:ssm:/finance-app/${Stage}/plaid-client-id}}"
         PLAID_SECRET: !Sub "{{resolve:ssm:/finance-app/${Stage}/plaid-secret}}"
         PLAID_ENV: !Ref PlaidEnv
+        PAYROLLTAX_API_KEY: !Sub "{{resolve:ssm:/finance-app/${Stage}/payrolltax-api-key}}"
         STAGE: !Ref Stage
         AUTH_DISABLED: !Ref AuthDisabled
+        DYNAMODB_ENDPOINT: ""
   Api:
     Cors:
       AllowMethods: "'GET,POST,OPTIONS'"
@@ -60,6 +62,11 @@ Resources:
           RequireLowercase: true
           RequireNumbers: true
           RequireSymbols: false
+      # MFA: TOTP only (no SMS cost). OPTIONAL lets users enroll; change to
+      # REQUIRED to force MFA for all users.
+      MfaConfiguration: OPTIONAL
+      EnabledMfas:
+        - SOFTWARE_TOKEN_MFA
       Schema:
         - Name: email
           AttributeDataType: String
@@ -76,6 +83,7 @@ Resources:
       ExplicitAuthFlows:
         - ALLOW_USER_PASSWORD_AUTH
         - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
       AccessTokenValidity: 60        # minutes
       IdTokenValidity: 60
       RefreshTokenValidity: 30       # days
@@ -119,10 +127,10 @@ Resources:
   CreateLinkTokenFunction:
     Type: AWS::Serverless::Function
     Metadata:
-      BuildMethod: go1.x
+      BuildMethod: makefile
     Properties:
       FunctionName: !Sub "finance-app-${Stage}-create-link-token"
-      CodeUri: functions/create-link-token/
+      CodeUri: .
       Handler: bootstrap
       Description: Creates a Plaid Link token to initialize the Link flow
       Policies:
@@ -139,10 +147,10 @@ Resources:
   ExchangeTokenFunction:
     Type: AWS::Serverless::Function
     Metadata:
-      BuildMethod: go1.x
+      BuildMethod: makefile
     Properties:
       FunctionName: !Sub "finance-app-${Stage}-exchange-token"
-      CodeUri: functions/exchange-token/
+      CodeUri: .
       Handler: bootstrap
       Description: Exchanges a Plaid public token for an access token and stores it
       Policies:
@@ -161,10 +169,10 @@ Resources:
   GetAccountsFunction:
     Type: AWS::Serverless::Function
     Metadata:
-      BuildMethod: go1.x
+      BuildMethod: makefile
     Properties:
       FunctionName: !Sub "finance-app-${Stage}-get-accounts"
-      CodeUri: functions/get-accounts/
+      CodeUri: .
       Handler: bootstrap
       Description: Returns connected accounts from DynamoDB
       Policies:
@@ -178,13 +186,33 @@ Resources:
             Path: /accounts
             Method: GET
 
+  DeleteAccountFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-delete-account"
+      CodeUri: .
+      Handler: bootstrap
+      Description: Deletes a connected account from DynamoDB
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /accounts/{accountId}
+            Method: DELETE
+
   GetTransactionsFunction:
     Type: AWS::Serverless::Function
     Metadata:
-      BuildMethod: go1.x
+      BuildMethod: makefile
     Properties:
       FunctionName: !Sub "finance-app-${Stage}-get-transactions"
-      CodeUri: functions/get-transactions/
+      CodeUri: .
       Handler: bootstrap
       Description: Returns transactions from DynamoDB with optional date/account filters
       Policies:
@@ -201,10 +229,10 @@ Resources:
   SyncTransactionsFunction:
     Type: AWS::Serverless::Function
     Metadata:
-      BuildMethod: go1.x
+      BuildMethod: makefile
     Properties:
       FunctionName: !Sub "finance-app-${Stage}-sync-transactions"
-      CodeUri: functions/sync-transactions/
+      CodeUri: .
       Handler: bootstrap
       Description: Pulls latest transactions from Plaid and upserts into DynamoDB
       Timeout: 120
@@ -220,14 +248,20 @@ Resources:
             ScheduleExpression: "cron(0 6 * * ? *)"
             Description: Daily transaction sync
             State: ENABLED
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /plaid/sync
+            Method: POST
 
   GetCategoriesFunction:
     Type: AWS::Serverless::Function
     Metadata:
-      BuildMethod: go1.x
+      BuildMethod: makefile
     Properties:
       FunctionName: !Sub "finance-app-${Stage}-get-categories"
-      CodeUri: functions/get-categories/
+      CodeUri: .
       Handler: bootstrap
       Description: Returns all user-defined spending categories and budgets
       Policies:
@@ -244,10 +278,10 @@ Resources:
   PutCategoryFunction:
     Type: AWS::Serverless::Function
     Metadata:
-      BuildMethod: go1.x
+      BuildMethod: makefile
     Properties:
       FunctionName: !Sub "finance-app-${Stage}-put-category"
-      CodeUri: functions/put-category/
+      CodeUri: .
       Handler: bootstrap
       Description: Creates or updates a spending category and its monthly budget
       Policies:
@@ -264,10 +298,10 @@ Resources:
   DeleteCategoryFunction:
     Type: AWS::Serverless::Function
     Metadata:
-      BuildMethod: go1.x
+      BuildMethod: makefile
     Properties:
       FunctionName: !Sub "finance-app-${Stage}-delete-category"
-      CodeUri: functions/delete-category/
+      CodeUri: .
       Handler: bootstrap
       Description: Deletes a spending category
       Policies:
@@ -284,10 +318,10 @@ Resources:
   UpdateTransactionCategoryFunction:
     Type: AWS::Serverless::Function
     Metadata:
-      BuildMethod: go1.x
+      BuildMethod: makefile
     Properties:
       FunctionName: !Sub "finance-app-${Stage}-update-transaction-category"
-      CodeUri: functions/update-transaction-category/
+      CodeUri: .
       Handler: bootstrap
       Description: Assigns a custom category to a transaction
       Policies:
@@ -304,10 +338,10 @@ Resources:
   UpdateTransactionReferenceFunction:
     Type: AWS::Serverless::Function
     Metadata:
-      BuildMethod: go1.x
+      BuildMethod: makefile
     Properties:
       FunctionName: !Sub "finance-app-${Stage}-update-transaction-reference"
-      CodeUri: functions/update-transaction-reference/
+      CodeUri: .
       Handler: bootstrap
       Description: Saves a manual reference URL and note on a transaction
       Policies:
@@ -321,13 +355,33 @@ Resources:
             Path: /transactions/{accountId}/{dateTransactionId}/reference
             Method: PATCH
 
+  UpdateTransactionBudgetFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-update-transaction-budget"
+      CodeUri: .
+      Handler: bootstrap
+      Description: Assigns a manual budget override to a transaction
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /transactions/{accountId}/{dateTransactionId}/budget
+            Method: PATCH
+
   ImportAmazonCsvFunction:
     Type: AWS::Serverless::Function
     Metadata:
-      BuildMethod: go1.x
+      BuildMethod: makefile
     Properties:
       FunctionName: !Sub "finance-app-${Stage}-import-amazon-csv"
-      CodeUri: functions/import-amazon-csv/
+      CodeUri: .
       Handler: bootstrap
       Description: Parses an Amazon Order History CSV and returns a match report (read-only)
       Timeout: 60
@@ -345,10 +399,10 @@ Resources:
   ConfirmAmazonImportFunction:
     Type: AWS::Serverless::Function
     Metadata:
-      BuildMethod: go1.x
+      BuildMethod: makefile
     Properties:
       FunctionName: !Sub "finance-app-${Stage}-confirm-amazon-import"
-      CodeUri: functions/confirm-amazon-import/
+      CodeUri: .
       Handler: bootstrap
       Description: Persists confirmed order→transaction reference links
       Policies:
@@ -365,10 +419,10 @@ Resources:
   GetRulesFunction:
     Type: AWS::Serverless::Function
     Metadata:
-      BuildMethod: go1.x
+      BuildMethod: makefile
     Properties:
       FunctionName: !Sub "finance-app-${Stage}-get-rules"
-      CodeUri: functions/get-rules/
+      CodeUri: .
       Handler: bootstrap
       Description: Returns all auto-assignment rules for the user
       Policies:
@@ -385,10 +439,10 @@ Resources:
   PutRuleFunction:
     Type: AWS::Serverless::Function
     Metadata:
-      BuildMethod: go1.x
+      BuildMethod: makefile
     Properties:
       FunctionName: !Sub "finance-app-${Stage}-put-rule"
-      CodeUri: functions/put-rule/
+      CodeUri: .
       Handler: bootstrap
       Description: Creates or updates an auto-assignment rule
       Policies:
@@ -405,10 +459,10 @@ Resources:
   DeleteRuleFunction:
     Type: AWS::Serverless::Function
     Metadata:
-      BuildMethod: go1.x
+      BuildMethod: makefile
     Properties:
       FunctionName: !Sub "finance-app-${Stage}-delete-rule"
-      CodeUri: functions/delete-rule/
+      CodeUri: .
       Handler: bootstrap
       Description: Deletes an auto-assignment rule
       Policies:
@@ -425,10 +479,10 @@ Resources:
   ApplyRulesFunction:
     Type: AWS::Serverless::Function
     Metadata:
-      BuildMethod: go1.x
+      BuildMethod: makefile
     Properties:
       FunctionName: !Sub "finance-app-${Stage}-apply-rules"
-      CodeUri: functions/apply-rules/
+      CodeUri: .
       Handler: bootstrap
       Description: Re-applies all rules to transactions for the current month
       Timeout: 60
@@ -446,10 +500,10 @@ Resources:
   GetBudgetsFunction:
     Type: AWS::Serverless::Function
     Metadata:
-      BuildMethod: go1.x
+      BuildMethod: makefile
     Properties:
       FunctionName: !Sub "finance-app-${Stage}-get-budgets"
-      CodeUri: functions/get-budgets/
+      CodeUri: .
       Handler: bootstrap
       Description: Returns all budgets for the user
       Policies:
@@ -466,10 +520,10 @@ Resources:
   PutBudgetFunction:
     Type: AWS::Serverless::Function
     Metadata:
-      BuildMethod: go1.x
+      BuildMethod: makefile
     Properties:
       FunctionName: !Sub "finance-app-${Stage}-put-budget"
-      CodeUri: functions/put-budget/
+      CodeUri: .
       Handler: bootstrap
       Description: Creates or updates a budget
       Policies:
@@ -486,10 +540,10 @@ Resources:
   DeleteBudgetFunction:
     Type: AWS::Serverless::Function
     Metadata:
-      BuildMethod: go1.x
+      BuildMethod: makefile
     Properties:
       FunctionName: !Sub "finance-app-${Stage}-delete-budget"
-      CodeUri: functions/delete-budget/
+      CodeUri: .
       Handler: bootstrap
       Description: Deletes a budget
       Policies:
@@ -503,13 +557,93 @@ Resources:
             Path: /budgets/{budgetId}
             Method: DELETE
 
+  GetIncomeSourcesFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-get-income-sources"
+      CodeUri: .
+      Handler: bootstrap
+      Description: Returns all income sources for the user
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /income-sources
+            Method: GET
+
+  PutIncomeSourceFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-put-income-source"
+      CodeUri: .
+      Handler: bootstrap
+      Description: Creates or updates an income source
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /income-sources
+            Method: POST
+
+  DeleteIncomeSourceFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-delete-income-source"
+      CodeUri: .
+      Handler: bootstrap
+      Description: Deletes an income source
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /income-sources/{incomeSourceId}
+            Method: DELETE
+
+  GetNetPayFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-get-net-pay"
+      CodeUri: .
+      Handler: bootstrap
+      Description: Computes estimated net pay for an income source using payrolltaxapi.com
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /income-sources/{incomeSourceId}/net-pay
+            Method: GET
+
   GetBudgetPeriodFunction:
     Type: AWS::Serverless::Function
     Metadata:
-      BuildMethod: go1.x
+      BuildMethod: makefile
     Properties:
       FunctionName: !Sub "finance-app-${Stage}-get-budget-period"
-      CodeUri: functions/get-budget-period/
+      CodeUri: .
       Handler: bootstrap
       Description: Returns periods for a budget, optionally opening/creating the current period
       Policies:
@@ -526,10 +660,10 @@ Resources:
   CloseBudgetPeriodFunction:
     Type: AWS::Serverless::Function
     Metadata:
-      BuildMethod: go1.x
+      BuildMethod: makefile
     Properties:
       FunctionName: !Sub "finance-app-${Stage}-close-budget-period"
-      CodeUri: functions/close-budget-period/
+      CodeUri: .
       Handler: bootstrap
       Description: Closes a budget period, handling rollover or transfer
       Timeout: 60
@@ -547,10 +681,10 @@ Resources:
   PutSplitsFunction:
     Type: AWS::Serverless::Function
     Metadata:
-      BuildMethod: go1.x
+      BuildMethod: makefile
     Properties:
       FunctionName: !Sub "finance-app-${Stage}-put-splits"
-      CodeUri: functions/put-splits/
+      CodeUri: .
       Handler: bootstrap
       Description: Saves (or clears) the splits for a transaction
       Policies:
@@ -567,10 +701,10 @@ Resources:
   DeleteSplitsFunction:
     Type: AWS::Serverless::Function
     Metadata:
-      BuildMethod: go1.x
+      BuildMethod: makefile
     Properties:
       FunctionName: !Sub "finance-app-${Stage}-delete-splits"
-      CodeUri: functions/delete-splits/
+      CodeUri: .
       Handler: bootstrap
       Description: Removes all splits from a transaction
       Policies:
@@ -582,6 +716,46 @@ Resources:
           Properties:
             ApiId: !Ref FinanceApi
             Path: /transactions/{accountId}/{dateTransactionId}/splits
+            Method: DELETE
+
+  PutTransactionFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-put-transaction"
+      CodeUri: .
+      Handler: bootstrap
+      Description: Creates or updates a manual transaction
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /transactions
+            Method: PUT
+
+  DeleteTransactionFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-delete-transaction"
+      CodeUri: .
+      Handler: bootstrap
+      Description: Deletes a manually-created transaction
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /transactions/{accountId}/{dateTransactionId}
             Method: DELETE
 
   # ── DynamoDB Single Table ──────────────────────────────────────────────────

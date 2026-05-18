@@ -222,8 +222,8 @@ github.com/kisielk/gotool v1.0.0/go.mod h1:XhKaO+MFFWcvkIS/tQcRk01m1F5IRFswLeQ+o
 github.com/kr/pretty v0.1.0/go.mod h1:dAy3ld7l9f0ibDNOQOHHMYYIIbhfbHSm3C4ZsoJORNo=
 github.com/kr/pty v1.1.1/go.mod h1:pFQYn66WHrOpPYNljwOMqo10TkYh1fy3cYio2l3bCsQ=
 github.com/kr/text v0.1.0/go.mod h1:4Jbv+DJW3UT/LiOwJeYQe1efqtUx/iVham/4vfdArNI=
-github.com/plaid/plaid-go/v26 v26.0.0 h1:GY9eTOMPxCQ2wo2afaT9pG4Aa1BwhDllvC90iQOt8YM=
-github.com/plaid/plaid-go/v26 v26.0.0/go.mod h1:a5VNWkmS8AnVA1J3bVgyNmoPVlbnjH/eXCz/beywDMA=
+github.com/plaid/plaid-go/v42 v42.2.0 h1:I7BUzlaCLMZgxmq2MdYcR27lM3hC9LLO/CgAjpZrqUo=
+github.com/plaid/plaid-go/v42 v42.2.0/go.mod h1:afvz3OTvLgkyoqtXA22M/dbAODQ3J9+2brDTvgonGUE=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/prometheus/client_model v0.0.0-20190812154241-14fe0d1b01d4/go.mod h1:xMI15A0UPsDsEKsMN9yxemIoYk6Tm2C1GtYGdfGttqA=

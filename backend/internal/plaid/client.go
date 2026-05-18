@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"os"
 
-	plaid "github.com/plaid/plaid-go/v26/plaid"
+	plaid "github.com/plaid/plaid-go/v42/plaid"
 )
 
 // New returns a configured Plaid API client.
@@ -27,9 +27,8 @@ func New() (*plaid.APIClient, error) {
 	switch plaidEnv {
 	case "production":
 		cfg.UseEnvironment(plaid.Production)
-	case "development":
-		cfg.UseEnvironment(plaid.Development)
 	default:
+		// Plaid removed the Development tier in 2024; sandbox covers local dev.
 		cfg.UseEnvironment(plaid.Sandbox)
 	}
 

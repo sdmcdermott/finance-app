@@ -9,7 +9,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue v1.13.15
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.32.5
 	github.com/google/uuid v1.6.0
-	github.com/plaid/plaid-go/v26 v26.0.0
+	github.com/plaid/plaid-go/v42 v42.2.0
 )
 
 require (
