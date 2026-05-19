@@ -1,5 +1,6 @@
 import React, { useEffect, useState, useCallback } from 'react';
-import { BrowserRouter, Routes, Route, Link, useLocation } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, Link, useLocation, useNavigate } from 'react-router-dom';
+import { DirtyGuardProvider, useDirtyGuard } from './auth/DirtyGuardContext';
 import {
   Account, Category, Rule, Transaction, Budget,
   getTransactions, putTransaction, deleteTransaction,
@@ -17,6 +18,7 @@ import RulesPage from './pages/RulesPage';
 import ImportPage from './pages/ImportPage';
 import LoginPage from './pages/LoginPage';
 import { IncomePage } from './pages/IncomePage';
+import MasterBudgetPage from './pages/MasterBudgetPage';
 import { fmtDate } from './utils/dates';
 import { fmtCurrency } from './utils/dates';
 
@@ -24,7 +26,10 @@ import { fmtCurrency } from './utils/dates';
 const Nav: React.FC = () => {
   const { logout } = useAuth();
   const location = useLocation();
+  const navigate = useNavigate();
+  const dirtyGuard = useDirtyGuard();
   const [open, setOpen] = useState(false);
+  const [blockTarget, setBlockTarget] = useState<string | null>(null);
 
   // Close drawer on navigation
   useEffect(() => { setOpen(false); }, [location.pathname]);
@@ -34,27 +39,42 @@ const Nav: React.FC = () => {
     { to: '/', label: 'Transactions' },
     { to: '/categories', label: 'Categories' },
     { to: '/budgets', label: 'Budgets' },
+    { to: '/master-budget', label: 'Master Budget' },
     { to: '/rules', label: 'Rules' },
     { to: '/income', label: 'Income' },
     { to: '/import', label: 'Import' },
   ];
 
+  const handleNavClick = (to: string, e: React.MouseEvent) => {
+    if (location.pathname === to) return; // already here
+    if (dirtyGuard.isDirty()) {
+      e.preventDefault();
+      setBlockTarget(to);
+    }
+  };
+
+  const renderLink = (l: { to: string; label: string }) => {
+    const active = l.to === '/' ? location.pathname === '/' : location.pathname.startsWith(l.to);
+    return (
+      <Link
+        key={l.to}
+        className={`nav-link${active ? ' nav-link-active' : ''}`}
+        to={l.to}
+        onClick={e => handleNavClick(l.to, e)}
+      >
+        {l.label}
+      </Link>
+    );
+  };
+
   return (
     <>
       <nav className="nav">
         <span className="nav-brand">Finance Tracker</span>
-        {/* Desktop links */}
-        <div className="nav-links">
-          {links.map(l => {
-            const active = l.to === '/' ? location.pathname === '/' : location.pathname.startsWith(l.to);
-            return <Link key={l.to} className={`nav-link${active ? ' nav-link-active' : ''}`} to={l.to}>{l.label}</Link>;
-          })}
-        </div>
-        {/* Desktop actions */}
+        <div className="nav-links">{links.map(renderLink)}</div>
         <div className="nav-actions">
           <button style={inlineStyles.logoutBtn} onClick={logout}>Sign out</button>
         </div>
-        {/* Mobile hamburger */}
         <button
           className="nav-hamburger"
           aria-label={open ? 'Close menu' : 'Open menu'}
@@ -63,16 +83,38 @@ const Nav: React.FC = () => {
           {open ? '✕' : '☰'}
         </button>
       </nav>
-      {/* Mobile drawer */}
       <div className={`nav-drawer${open ? ' open' : ''}`}>
-        {links.map(l => {
-            const active = l.to === '/' ? location.pathname === '/' : location.pathname.startsWith(l.to);
-            return <Link key={l.to} className={`nav-link${active ? ' nav-link-active' : ''}`} to={l.to}>{l.label}</Link>;
-          })}
+        {links.map(renderLink)}
         <div className="nav-drawer-actions">
           <button style={{ ...inlineStyles.logoutBtn, width: '100%' }} onClick={logout}>Sign out</button>
         </div>
       </div>
+
+      {/* Unsaved-changes guard dialog */}
+      {blockTarget && (
+        <div style={navBlockStyles.overlay}>
+          <div style={navBlockStyles.dialog}>
+            <h3 style={navBlockStyles.title}>Unsaved Changes</h3>
+            <p style={navBlockStyles.body}>
+              You have unsaved changes. Do you want to discard them and leave, or stay and keep editing?
+            </p>
+            <div style={navBlockStyles.footer}>
+              <button
+                style={navBlockStyles.discardBtn}
+                onClick={() => { setBlockTarget(null); navigate(blockTarget); }}
+              >
+                Discard &amp; leave
+              </button>
+              <button
+                style={navBlockStyles.stayBtn}
+                onClick={() => setBlockTarget(null)}
+              >
+                Keep editing
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </>
   );
 };
@@ -145,6 +187,7 @@ const BudgetSelect: React.FC<{
     style={inlineStyles.catSelect}
   >
     <option value="">— No budget —</option>
+    <option value="__master_budget__">⬡ Master Budget</option>
     {budgets.map(b => <option key={b.budgetId} value={b.budgetId}>{b.name}</option>)}
   </select>
 );
@@ -1420,6 +1463,7 @@ const AppInner: React.FC = () => {
           <Route path="/budgets/:budgetId" element={<BudgetPeriodPage />} />
           <Route path="/rules" element={<RulesPage />} />
           <Route path="/income" element={<IncomePage />} />
+          <Route path="/master-budget" element={<MasterBudgetPage />} />
           <Route path="/import" element={<ImportPage />} />
         </Routes>
       </main>
@@ -1431,7 +1475,9 @@ const App: React.FC = () => (
   <BrowserRouter>
     <AuthProvider>
       <DataProvider>
-        <AppInner />
+        <DirtyGuardProvider>
+          <AppInner />
+        </DirtyGuardProvider>
       </DataProvider>
     </AuthProvider>
   </BrowserRouter>
@@ -1479,4 +1525,14 @@ const inlineStyles: Record<string, React.CSSProperties> = {
   refSaveBtn: { background: '#0d7a6b', color: '#fff', border: 'none', borderRadius: 4, padding: '0.35rem 0.6rem', cursor: 'pointer', fontSize: '0.8rem' },
   refCancelBtn: { background: 'none', border: 'none', cursor: 'pointer', color: '#718096', fontSize: '0.85rem' },
   merchantBtn: { background: 'none', border: 'none', padding: 0, cursor: 'pointer', color: '#2d3748', fontSize: 'inherit', textAlign: 'left', fontFamily: 'inherit' },
+};
+
+const navBlockStyles: Record<string, React.CSSProperties> = {
+  overlay:    { position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)', zIndex: 2000, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '1rem' },
+  dialog:     { background: '#fff', borderRadius: 12, padding: '1.5rem', maxWidth: 420, width: '100%', boxShadow: '0 8px 32px rgba(0,0,0,0.2)' },
+  title:      { margin: '0 0 0.75rem', fontSize: '1.05rem', fontWeight: 600, color: '#1a202c' },
+  body:       { margin: '0 0 1.25rem', fontSize: '0.9rem', color: '#4a5568', lineHeight: 1.5 },
+  footer:     { display: 'flex', gap: '0.6rem', justifyContent: 'flex-end' },
+  discardBtn: { background: 'transparent', color: '#dc2626', border: '1px solid #dc2626', borderRadius: 6, padding: '0.4rem 0.9rem', cursor: 'pointer', fontSize: '0.875rem' },
+  stayBtn:    { background: '#0d7a6b', color: '#fff', border: 'none', borderRadius: 6, padding: '0.4rem 0.9rem', cursor: 'pointer', fontSize: '0.875rem' },
 };

@@ -637,6 +637,66 @@ Resources:
             Path: /income-sources/{incomeSourceId}/net-pay
             Method: GET
 
+  SuggestFixedCostsFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-suggest-fixed-costs"
+      CodeUri: .
+      Handler: bootstrap
+      Description: Suggests recurring fixed costs from transaction history
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /suggest-fixed-costs
+            Method: GET
+
+  GetMasterBudgetFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-get-master-budget"
+      CodeUri: .
+      Handler: bootstrap
+      Description: Returns the user's master budget
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /master-budget
+            Method: GET
+
+  PutMasterBudgetFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-put-master-budget"
+      CodeUri: .
+      Handler: bootstrap
+      Description: Creates or replaces the user's master budget
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /master-budget
+            Method: POST
+
   GetBudgetPeriodFunction:
     Type: AWS::Serverless::Function
     Metadata:

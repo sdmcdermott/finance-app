@@ -71,6 +71,15 @@ build-DeleteIncomeSourceFunction:
 build-GetNetPayFunction:
 	$(GOENV) go build $(GOFLAGS) -o $(ARTIFACTS_DIR)/bootstrap ./functions/get-net-pay
 
+build-SuggestFixedCostsFunction:
+	$(GOENV) go build $(GOFLAGS) -o $(ARTIFACTS_DIR)/bootstrap ./functions/suggest-fixed-costs
+
+build-GetMasterBudgetFunction:
+	$(GOENV) go build $(GOFLAGS) -o $(ARTIFACTS_DIR)/bootstrap ./functions/get-master-budget
+
+build-PutMasterBudgetFunction:
+	$(GOENV) go build $(GOFLAGS) -o $(ARTIFACTS_DIR)/bootstrap ./functions/put-master-budget
+
 build-GetBudgetsFunction:
 	$(GOENV) go build $(GOFLAGS) -o $(ARTIFACTS_DIR)/bootstrap ./functions/get-budgets
 

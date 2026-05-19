@@ -368,6 +368,78 @@ export const deleteSplits = async (
   );
 };
 
+// ── Master Budget ─────────────────────────────────────────────────────────────
+
+// Sentinel budgetId for "assign to master budget" on a transaction
+export const MASTER_BUDGET_ID = '__master_budget__';
+
+export interface MBIncomeSource {
+  incomeSourceId: string;
+  monthlyOverride: number;  // 0 = use computed net pay
+  enabled: boolean;
+  linkedBudgetId?: string;  // optional checkbook budget tracking actual pay vs. expected
+}
+
+export interface MBFixedCost {
+  id: string;
+  name: string;
+  amount: number;
+  frequency: 'weekly' | 'biweekly' | 'semimonthly' | 'monthly' | 'quarterly' | 'annually';
+  ruleId?: string;
+  fromTxn?: boolean;
+  linkedBudgetId?: string;  // optional checkbook budget tracking actual spend vs. expected
+}
+
+export interface SuggestFixedCost {
+  merchant: string;
+  meanDay: number;
+  meanAmount: number;
+  frequency: 'weekly' | 'biweekly' | 'semimonthly' | 'monthly' | 'quarterly' | 'annually';
+  confidence: 'high' | 'low';
+  occurrences: number;
+  sampleDates: string[];
+}
+
+export interface SuggestFixedCostsResult {
+  suggestions: SuggestFixedCost[];
+  oldestDate: string;
+  monthsCovered: number;
+  fullWindow: boolean;
+}
+
+export const suggestFixedCosts = async (): Promise<SuggestFixedCostsResult> => {
+  const { data } = await api.get<SuggestFixedCostsResult>('/suggest-fixed-costs');
+  return data;
+};
+
+export interface MBBucket {
+  id: string;
+  name: string;
+  amountMonthly: number;  // 0 = use percent
+  percent: number;        // 0.0–1.0, 0 = use amountMonthly
+  linkedBudgetId?: string;
+  linkType?: 'goal' | 'credit';
+}
+
+export interface MasterBudget {
+  userId: string;
+  incomeSources: MBIncomeSource[];
+  fixedCosts: MBFixedCost[];
+  buckets: MBBucket[];
+}
+
+export const getMasterBudget = async (): Promise<MasterBudget> => {
+  const { data } = await api.get<MasterBudget>('/master-budget');
+  return data;
+};
+
+export const putMasterBudget = async (
+  mb: Omit<MasterBudget, 'userId'>
+): Promise<MasterBudget> => {
+  const { data } = await api.post<MasterBudget>('/master-budget', mb);
+  return data;
+};
+
 // --- Income Sources ---------------------------------------------------
 
 export interface NetPayResult {

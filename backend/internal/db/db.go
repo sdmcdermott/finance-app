@@ -8,6 +8,7 @@
 //	USER#<userId>         RULE#<ruleId>                   Rule
 //	USER#<userId>         INCOME#<incomeSourceId>         IncomeSource
 //	USER#<userId>         BUDGET#<budgetId>               Budget
+//	USER#<userId>         MASTERBUDGET                    MasterBudget
 //	BUDGET#<budgetId>     PERIOD#<startDate>              BudgetPeriod
 //	ACCOUNT#<accountId>   TXN#<date>#<txnId>              Transaction
 //	ACCOUNT#<accountId>   SPLIT#<date>#<txnId>#<splitId>  TransactionSplit
@@ -40,6 +41,8 @@ func budgetPK(budgetID string) string        { return "BUDGET#" + budgetID }
 func periodSK(startDate string) string       { return "PERIOD#" + startDate }
 func accountPK(accountID string) string      { return "ACCOUNT#" + accountID }
 func incomeSourceSK(sourceID string) string  { return "INCOME#" + sourceID }
+
+const masterBudgetSK = "MASTERBUDGET"
 
 // txnSK builds a lexicographically sortable sort key: TXN#<date>#<txnId>
 // date must be "YYYY-MM-DD" so range queries work correctly.
@@ -164,6 +167,94 @@ type Budget struct {
 
 	// Checkbook-type fields
 	OpeningBalance float64 `dynamodbav:"openingBalance" json:"openingBalance"`
+}
+
+// ── Master Budget ──────────────────────────────────────────────────────────────
+
+// MBIncomeSource is a reference to an IncomeSource used as income input.
+// The user can override the effective monthly amount or disable the source.
+type MBIncomeSource struct {
+	IncomeSourceID string  `dynamodbav:"incomeSourceId" json:"incomeSourceId"`
+	// MonthlyOverride: if > 0, use this instead of the computed net pay / period
+	MonthlyOverride float64 `dynamodbav:"monthlyOverride" json:"monthlyOverride"`
+	Enabled         bool    `dynamodbav:"enabled"         json:"enabled"`
+	// LinkedBudgetID: optional checkbook budget that tracks actual pay deposits vs. expected
+	LinkedBudgetID string `dynamodbav:"linkedBudgetId,omitempty" json:"linkedBudgetId,omitempty"`
+}
+
+// MBFixedCost is a recurring expense deducted before discretionary allocation.
+type MBFixedCost struct {
+	ID        string  `dynamodbav:"id"        json:"id"`
+	Name      string  `dynamodbav:"name"      json:"name"`
+	Amount    float64 `dynamodbav:"amount"    json:"amount"`
+	// Frequency mirrors IncomeSource.Frequency
+	Frequency string  `dynamodbav:"frequency" json:"frequency"`
+	// RuleID: if non-empty, this cost was created from a suggested rule
+	RuleID    string  `dynamodbav:"ruleId,omitempty" json:"ruleId,omitempty"`
+	// FromTxn: if true, this cost was manually assigned via budgetId=MASTER_BUDGET_ID on a transaction
+	FromTxn   bool    `dynamodbav:"fromTxn,omitempty" json:"fromTxn,omitempty"`
+	// LinkedBudgetID: optional checkbook budget that tracks actual spend vs. this expected amount
+	LinkedBudgetID string `dynamodbav:"linkedBudgetId,omitempty" json:"linkedBudgetId,omitempty"`
+}
+
+// MBBucket is a discretionary spending allocation linked optionally to a Budget.
+// Exactly one of AmountMonthly or Percent should be non-zero.
+type MBBucket struct {
+	ID            string  `dynamodbav:"id"            json:"id"`
+	Name          string  `dynamodbav:"name"          json:"name"`
+	// AmountMonthly: fixed monthly dollar amount (0 = use Percent instead)
+	AmountMonthly float64 `dynamodbav:"amountMonthly" json:"amountMonthly"`
+	// Percent: fraction of discretionary remainder (0.0–1.0, 0 = use AmountMonthly)
+	Percent       float64 `dynamodbav:"percent"       json:"percent"`
+	// LinkedBudgetID: optional budget to push this allocation to
+	LinkedBudgetID string `dynamodbav:"linkedBudgetId,omitempty" json:"linkedBudgetId,omitempty"`
+	// LinkType: "goal" (set goalAmount) or "credit" (set openingBalance / transfer credit)
+	LinkType      string  `dynamodbav:"linkType,omitempty"      json:"linkType,omitempty"`
+}
+
+// MasterBudget is a singleton per user that models total monthly cash flow.
+type MasterBudget struct {
+	PK string `dynamodbav:"pk" json:"-"`
+	SK string `dynamodbav:"sk" json:"-"`
+
+	UserID       string           `dynamodbav:"userId"       json:"userId"`
+	IncomeSources []MBIncomeSource `dynamodbav:"incomeSources" json:"incomeSources"`
+	FixedCosts    []MBFixedCost    `dynamodbav:"fixedCosts"    json:"fixedCosts"`
+	Buckets       []MBBucket       `dynamodbav:"buckets"       json:"buckets"`
+}
+
+// ── Master Budget CRUD ─────────────────────────────────────────────────────────
+
+func (c *Client) GetMasterBudget(ctx context.Context, userID string) (*MasterBudget, error) {
+	out, err := c.ddb.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: aws.String(c.table),
+		Key: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: userPK(userID)},
+			"sk": &types.AttributeValueMemberS{Value: masterBudgetSK},
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	if out.Item == nil {
+		return nil, nil
+	}
+	var mb MasterBudget
+	return &mb, attributevalue.UnmarshalMap(out.Item, &mb)
+}
+
+func (c *Client) PutMasterBudget(ctx context.Context, mb MasterBudget) error {
+	mb.PK = userPK(mb.UserID)
+	mb.SK = masterBudgetSK
+	item, err := attributevalue.MarshalMap(mb)
+	if err != nil {
+		return err
+	}
+	_, err = c.ddb.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: &c.table,
+		Item:      item,
+	})
+	return err
 }
 
 // DeductionItem is a single named line item within a pre-tax deduction bucket.
@@ -421,6 +512,245 @@ func (c *Client) GetTransactions(ctx context.Context, accountID, startDate, endD
 	}
 	var txns []Transaction
 	return txns, attributevalue.UnmarshalListOfMaps(out.Items, &txns)
+}
+
+// ── Suggest Fixed Costs ────────────────────────────────────────────────────────
+
+const MasterBudgetID = "__master_budget__"
+
+// SuggestFixedCost is a candidate recurring cost derived from transaction history.
+type SuggestFixedCost struct {
+	Merchant    string   `json:"merchant"`
+	MeanDay     int      `json:"meanDay"`     // mean day-of-month
+	MeanAmount  float64  `json:"meanAmount"`  // mean absolute amount
+	Frequency   string   `json:"frequency"`   // weekly/biweekly/semimonthly/monthly/quarterly/annually
+	Confidence  string   `json:"confidence"`  // "high" | "low"
+	Occurrences int      `json:"occurrences"` // how many times seen in window
+	SampleDates []string `json:"sampleDates"` // up to 6 sample dates (YYYY-MM-DD)
+}
+
+// SuggestFixedCostsResult bundles suggestions with metadata about the data window.
+type SuggestFixedCostsResult struct {
+	Suggestions    []SuggestFixedCost `json:"suggestions"`
+	OldestDate     string             `json:"oldestDate"`     // YYYY-MM-DD of oldest transaction found
+	MonthsCovered  float64            `json:"monthsCovered"`  // actual span in months
+	FullWindow     bool               `json:"fullWindow"`     // true if >= 5.5 months available
+}
+
+// SuggestFixedCosts scans the past 6 months of transactions across all accounts,
+// clusters by merchant name + approximate day-of-month (±1) and amount (±$5),
+// and returns candidates that appear at least twice. Transactions that already
+// have a category, budget, or budgetId==MASTER_BUDGET_ID are excluded.
+func (c *Client) SuggestFixedCosts(ctx context.Context, userID string) (*SuggestFixedCostsResult, error) {
+	accounts, err := c.GetAccounts(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	end := time.Now()
+	start := end.AddDate(0, -6, 0)
+	startStr := start.Format("2006-01-02")
+	endStr := end.Format("2006-01-02")
+
+	var allTxns []Transaction
+	for _, acct := range accounts {
+		txns, err := c.GetTransactions(ctx, acct.AccountID, startStr, endStr)
+		if err != nil {
+			return nil, err
+		}
+		allTxns = append(allTxns, txns...)
+	}
+
+	// Determine actual data window from oldest transaction date found
+	oldestDate := endStr
+	for _, t := range allTxns {
+		if t.Date < oldestDate {
+			oldestDate = t.Date
+		}
+	}
+	oldest, _ := time.Parse("2006-01-02", oldestDate)
+	monthsCovered := end.Sub(oldest).Hours() / 24 / 30.44
+	if monthsCovered > 6 {
+		monthsCovered = 6
+	}
+	fullWindow := monthsCovered >= 5.5
+
+	// Filter: skip already-categorized, already-budgeted, or master-budget-assigned
+	var candidates []Transaction
+	for _, t := range allTxns {
+		if t.CustomCategory != "" || t.BudgetID != "" {
+			continue
+		}
+		if t.Amount <= 0 { // credits/refunds
+			continue
+		}
+		candidates = append(candidates, t)
+	}
+
+	// Cluster: group transactions that share merchant and are within ±1 day / ±$5 of each other.
+	type cluster struct {
+		merchant string
+		txns     []Transaction
+	}
+	assigned := make([]bool, len(candidates))
+	var clusters []cluster
+
+	for i, t := range candidates {
+		if assigned[i] {
+			continue
+		}
+		merchant := t.MerchantName
+		if merchant == "" {
+			merchant = t.Name
+		}
+		if merchant == "" {
+			continue
+		}
+		date, _ := time.Parse("2006-01-02", t.Date)
+		dayI := date.Day()
+
+		cl := cluster{merchant: merchant, txns: []Transaction{t}}
+		assigned[i] = true
+
+		for j := i + 1; j < len(candidates); j++ {
+			if assigned[j] {
+				continue
+			}
+			u := candidates[j]
+			uMerchant := u.MerchantName
+			if uMerchant == "" {
+				uMerchant = u.Name
+			}
+			if !strings.EqualFold(merchant, uMerchant) {
+				continue
+			}
+			uDate, _ := time.Parse("2006-01-02", u.Date)
+			dayJ := uDate.Day()
+			dayDiff := dayI - dayJ
+			if dayDiff < 0 {
+				dayDiff = -dayDiff
+			}
+			if dayDiff > 15 {
+				dayDiff = 30 - dayDiff
+			}
+			if dayDiff > 1 {
+				continue
+			}
+			amtDiff := math.Abs(t.Amount) - math.Abs(u.Amount)
+			if amtDiff < 0 {
+				amtDiff = -amtDiff
+			}
+			if amtDiff > 5.0 {
+				continue
+			}
+			cl.txns = append(cl.txns, u)
+			assigned[j] = true
+		}
+
+		if len(cl.txns) >= 2 {
+			clusters = append(clusters, cl)
+		}
+	}
+
+	// Convert clusters to SuggestFixedCost
+	var results []SuggestFixedCost
+	for _, cl := range clusters {
+		var daySum, amtSum float64
+		var dates []string
+		for _, t := range cl.txns {
+			d, _ := time.Parse("2006-01-02", t.Date)
+			daySum += float64(d.Day())
+			amtSum += math.Abs(t.Amount)
+			dates = append(dates, t.Date)
+		}
+		n := float64(len(cl.txns))
+		meanDay := int(math.Round(daySum / n))
+		meanAmt := math.Round(amtSum/n*100) / 100
+
+		sort.Strings(dates)
+		if len(dates) > 6 {
+			dates = dates[len(dates)-6:]
+		}
+
+		freq, confidence := inferFrequencyWindowed(len(cl.txns), monthsCovered)
+
+		results = append(results, SuggestFixedCost{
+			Merchant:    cl.merchant,
+			MeanDay:     meanDay,
+			MeanAmount:  meanAmt,
+			Frequency:   freq,
+			Confidence:  confidence,
+			Occurrences: len(cl.txns),
+			SampleDates: dates,
+		})
+	}
+
+	// Sort by mean amount descending
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].MeanAmount > results[j].MeanAmount
+	})
+
+	return &SuggestFixedCostsResult{
+		Suggestions:   results,
+		OldestDate:    oldestDate,
+		MonthsCovered: math.Round(monthsCovered*10) / 10,
+		FullWindow:    fullWindow,
+	}, nil
+}
+
+// inferFrequencyWindowed guesses billing frequency from occurrence count relative
+// to the actual data window (in months), returning a frequency and a confidence
+// level ("high" or "low").
+//
+// The expected occurrence count for each frequency over a given window:
+//   monthly     → ~1× per month
+//   quarterly   → ~1× per 3 months
+//   biweekly    → ~2× per month
+//   weekly      → ~4× per month
+//   semimonthly → ~2× per month
+//   annually    → ~1× per 12 months
+//
+// Confidence is "high" when the count is consistent with the inferred frequency
+// over the available window, and "low" when the window is too short to be sure.
+func inferFrequencyWindowed(occurrences int, monthsCovered float64) (string, string) {
+	if monthsCovered < 0.5 {
+		monthsCovered = 0.5
+	}
+
+	// Expected counts for each frequency over the actual window
+	expected := map[string]float64{
+		"weekly":      monthsCovered * 4.33,
+		"biweekly":    monthsCovered * 2.17,
+		"semimonthly": monthsCovered * 2.0,
+		"monthly":     monthsCovered * 1.0,
+		"quarterly":   monthsCovered / 3.0,
+		"annually":    monthsCovered / 12.0,
+	}
+
+	// Find the frequency whose expected count is closest to observed count
+	best := "monthly"
+	bestDiff := math.MaxFloat64
+	order := []string{"weekly", "biweekly", "semimonthly", "monthly", "quarterly", "annually"}
+	for _, freq := range order {
+		diff := math.Abs(float64(occurrences) - expected[freq])
+		if diff < bestDiff {
+			bestDiff = diff
+			best = freq
+		}
+	}
+
+	// Confidence: high if observed count is within 1 of expected for that frequency,
+	// AND we have enough months to expect at least 2 occurrences at that frequency.
+	expectedForBest := expected[best]
+	withinOne := math.Abs(float64(occurrences)-expectedForBest) <= 1.0
+	enoughData := expectedForBest >= 1.5
+
+	confidence := "high"
+	if !withinOne || !enoughData {
+		confidence = "low"
+	}
+
+	return best, confidence
 }
 
 func (c *Client) UpdateTransactionCategory(ctx context.Context, accountID, date, txnID, customCategory string) error {
