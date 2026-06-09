@@ -16,17 +16,18 @@ import (
 type response = events.APIGatewayV2HTTPResponse
 
 type budgetRequest struct {
-	BudgetID         string  `json:"budgetId"`         // omit to create; include to update
-	Name             string  `json:"name"`             // required
-	BudgetType       string  `json:"budgetType"`       // "goal" | "checkbook"
-	Period           string  `json:"period"`           // daily|weekly|biweekly|monthly|quarterly|annually
-	PeriodFormat     string  `json:"periodFormat"`     // label template, e.g. "{name} - {mon} {yyyy}"
-	GoalAmount       float64 `json:"goalAmount"`       // goal type only
-	GoalDirection    string  `json:"goalDirection"`    // "limit" | "target"
-	SurplusHandling  string  `json:"surplusHandling"`  // "ignore"|"rollover"|"transfer"
-	TransferBudgetID string  `json:"transferBudgetId"` // dest budget when surplusHandling="transfer"
-	TransferAmount   float64 `json:"transferAmount"`   // 0 = full delta
-	OpeningBalance   float64 `json:"openingBalance"`   // checkbook type only
+	BudgetID           string  `json:"budgetId"`           // omit to create; include to update
+	Name               string  `json:"name"`               // required
+	BudgetType         string  `json:"budgetType"`         // "goal" | "checkbook"
+	Period             string  `json:"period"`             // daily|weekly|biweekly|monthly|quarterly|annually
+	PeriodFormat       string  `json:"periodFormat"`       // label template, e.g. "{name} - {mon} {yyyy}"
+	GoalAmount         float64 `json:"goalAmount"`         // goal type only
+	GoalDirection      string  `json:"goalDirection"`      // "limit" | "target"
+	MasterBudgetAmount float64 `json:"masterBudgetAmount"` // portion set by master budget link; 0 = not linked
+	SurplusHandling    string  `json:"surplusHandling"`    // "ignore"|"rollover"|"transfer"
+	TransferBudgetID   string  `json:"transferBudgetId"`   // dest budget when surplusHandling="transfer"
+	TransferAmount     float64 `json:"transferAmount"`     // 0 = full delta
+	OpeningBalance     float64 `json:"openingBalance"`     // checkbook type only
 }
 
 func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response, error) {
@@ -57,18 +58,19 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response,
 	}
 
 	budget := dbpkg.Budget{
-		UserID:           plaidclient.UserID(),
-		BudgetID:         body.BudgetID,
-		Name:             body.Name,
-		BudgetType:       body.BudgetType,
-		Period:           body.Period,
-		PeriodFormat:     body.PeriodFormat,
-		GoalAmount:       body.GoalAmount,
-		GoalDirection:    body.GoalDirection,
-		SurplusHandling:  body.SurplusHandling,
-		TransferBudgetID: body.TransferBudgetID,
-		TransferAmount:   body.TransferAmount,
-		OpeningBalance:   body.OpeningBalance,
+		UserID:             plaidclient.UserID(),
+		BudgetID:           body.BudgetID,
+		Name:               body.Name,
+		BudgetType:         body.BudgetType,
+		Period:             body.Period,
+		PeriodFormat:       body.PeriodFormat,
+		GoalAmount:         body.GoalAmount,
+		GoalDirection:      body.GoalDirection,
+		MasterBudgetAmount: body.MasterBudgetAmount,
+		SurplusHandling:    body.SurplusHandling,
+		TransferBudgetID:   body.TransferBudgetID,
+		TransferAmount:     body.TransferAmount,
+		OpeningBalance:     body.OpeningBalance,
 	}
 
 	if err := dbClient.PutBudget(ctx, budget); err != nil {

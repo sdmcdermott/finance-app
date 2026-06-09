@@ -4,6 +4,7 @@
 //
 //	PK                    SK                              Entity
 //	USER#<userId>         ACCOUNT#<accountId>             Account
+//	USER#<userId>         ITEM#<itemId>                   PlaidItem
 //	USER#<userId>         CATEGORY#<categoryId>           Category
 //	USER#<userId>         RULE#<ruleId>                   Rule
 //	USER#<userId>         INCOME#<incomeSourceId>         IncomeSource
@@ -34,6 +35,7 @@ import (
 
 func userPK(userID string) string         { return "USER#" + userID }
 func accountSK(accountID string) string   { return "ACCOUNT#" + accountID }
+func itemSK(itemID string) string         { return "ITEM#" + itemID }
 func categorySK(categoryID string) string { return "CATEGORY#" + categoryID }
 func ruleSK(ruleID string) string         { return "RULE#" + ruleID }
 func budgetSK(budgetID string) string        { return "BUDGET#" + budgetID }
@@ -42,7 +44,17 @@ func periodSK(startDate string) string       { return "PERIOD#" + startDate }
 func accountPK(accountID string) string      { return "ACCOUNT#" + accountID }
 func incomeSourceSK(sourceID string) string  { return "INCOME#" + sourceID }
 
-const masterBudgetSK = "MASTERBUDGET"
+// masterBudgetLegacySK is the SK for the pre-versioning singleton master budget record.
+// New versioned records use masterBudgetVersionSK(effectiveDate) instead.
+const masterBudgetLegacySK = "MASTERBUDGET"
+
+// masterBudgetVersionSK returns the SK for a versioned master budget record.
+// effectiveDate must be a YYYY-MM-DD string.
+func masterBudgetVersionSK(effectiveDate string) string { return "MASTERBUDGET#" + effectiveDate }
+
+// masterBudgetSKPrefix is used for begins_with queries that catch both legacy
+// and versioned master budget items in a single Query call.
+const masterBudgetSKPrefix = "MASTERBUDGET"
 
 // txnSK builds a lexicographically sortable sort key: TXN#<date>#<txnId>
 // date must be "YYYY-MM-DD" so range queries work correctly.
@@ -69,7 +81,6 @@ type Account struct {
 
 	UserID      string    `dynamodbav:"userId"      json:"userId"`
 	AccountID   string    `dynamodbav:"accountId"   json:"accountId"`
-	AccessToken string    `dynamodbav:"accessToken" json:"-"` // never sent to frontend
 	ItemID      string    `dynamodbav:"itemId"      json:"itemId"`
 	Institution string    `dynamodbav:"institution" json:"institution"`
 	Name        string    `dynamodbav:"name"        json:"name"`
@@ -77,6 +88,22 @@ type Account struct {
 	Subtype     string    `dynamodbav:"subtype"     json:"subtype"`
 	SyncCursor  string    `dynamodbav:"syncCursor"  json:"syncCursor"`
 	LastSynced  time.Time `dynamodbav:"lastSynced"  json:"lastSynced"`
+	// Enabled: false means skip this account during transaction sync and filter its txns from results.
+	// Defaults to true for new accounts; omitempty means absence == true in legacy records.
+	Enabled     *bool     `dynamodbav:"enabled,omitempty" json:"enabled"`
+}
+
+// PlaidItem holds the Plaid access token for a linked institution.
+// Stored separately from Account so that deleting an account never loses the token.
+// One item can have multiple accounts (e.g. checking + mortgage at the same bank).
+type PlaidItem struct {
+	PK string `dynamodbav:"pk" json:"-"`
+	SK string `dynamodbav:"sk" json:"-"`
+
+	UserID      string `dynamodbav:"userId"      json:"userId"`
+	ItemID      string `dynamodbav:"itemId"      json:"itemId"`
+	AccessToken string `dynamodbav:"accessToken" json:"-"` // never sent to frontend
+	Institution string `dynamodbav:"institution" json:"institution"`
 }
 
 // Category is a user-defined spending category (no longer carries a budget).
@@ -157,8 +184,12 @@ type Budget struct {
 	PeriodFormat string `dynamodbav:"periodFormat" json:"periodFormat"` // user-configured label template
 
 	// Goal-type fields
-	GoalAmount    float64 `dynamodbav:"goalAmount"    json:"goalAmount"`
-	GoalDirection string  `dynamodbav:"goalDirection" json:"goalDirection"` // "limit" | "target"
+	GoalAmount          float64 `dynamodbav:"goalAmount"          json:"goalAmount"`
+	GoalDirection       string  `dynamodbav:"goalDirection"       json:"goalDirection"`       // "limit" | "target"
+	// MasterBudgetAmount: the portion of GoalAmount set by the master budget link.
+	// GoalAmount = MasterBudgetAmount + any user-specified additional amount.
+	// Zero/absent means this budget is not linked to a master budget bucket.
+	MasterBudgetAmount  float64 `dynamodbav:"masterBudgetAmount,omitempty" json:"masterBudgetAmount,omitempty"`
 
 	// Surplus/shortfall handling
 	SurplusHandling  string  `dynamodbav:"surplusHandling"  json:"surplusHandling"`  // "ignore"|"rollover"|"transfer"
@@ -174,12 +205,12 @@ type Budget struct {
 // MBIncomeSource is a reference to an IncomeSource used as income input.
 // The user can override the effective monthly amount or disable the source.
 type MBIncomeSource struct {
-	IncomeSourceID string  `dynamodbav:"incomeSourceId" json:"incomeSourceId"`
-	// MonthlyOverride: if > 0, use this instead of the computed net pay / period
-	MonthlyOverride float64 `dynamodbav:"monthlyOverride" json:"monthlyOverride"`
-	Enabled         bool    `dynamodbav:"enabled"         json:"enabled"`
-	// LinkedBudgetID: optional checkbook budget that tracks actual pay deposits vs. expected
-	LinkedBudgetID string `dynamodbav:"linkedBudgetId,omitempty" json:"linkedBudgetId,omitempty"`
+	IncomeSourceID  string  `dynamodbav:"incomeSourceId"             json:"incomeSourceId"`
+	MonthlyOverride float64 `dynamodbav:"monthlyOverride"            json:"monthlyOverride"`
+	Enabled         bool    `dynamodbav:"enabled"                   json:"enabled"`
+	LinkedBudgetID  string  `dynamodbav:"linkedBudgetId,omitempty"  json:"linkedBudgetId,omitempty"`
+	// IncomeRuleID: points to a Rule record used to match paycheck deposit transactions.
+	IncomeRuleID   string  `dynamodbav:"incomeRuleId,omitempty"    json:"incomeRuleId,omitempty"`
 }
 
 // MBFixedCost is a recurring expense deducted before discretionary allocation.
@@ -198,7 +229,7 @@ type MBFixedCost struct {
 }
 
 // MBBucket is a discretionary spending allocation linked optionally to a Budget.
-// Exactly one of AmountMonthly or Percent should be non-zero.
+// Exactly one of AmountMonthly or Percent should be non-zero (except when AmountType is "remaining").
 type MBBucket struct {
 	ID            string  `dynamodbav:"id"            json:"id"`
 	Name          string  `dynamodbav:"name"          json:"name"`
@@ -206,6 +237,10 @@ type MBBucket struct {
 	AmountMonthly float64 `dynamodbav:"amountMonthly" json:"amountMonthly"`
 	// Percent: fraction of discretionary remainder (0.0–1.0, 0 = use AmountMonthly)
 	Percent       float64 `dynamodbav:"percent"       json:"percent"`
+	// AmountType: explicit allocation mode — "fixed", "percent", or "remaining".
+	// "remaining" means this bucket receives whatever discretionary income is left after all other buckets.
+	// If empty, infer from Percent (> 0 → "percent", else → "fixed") for backwards compatibility.
+	AmountType    string  `dynamodbav:"amountType,omitempty"    json:"amountType,omitempty"`
 	// LinkedBudgetID: optional budget to push this allocation to
 	LinkedBudgetID string `dynamodbav:"linkedBudgetId,omitempty" json:"linkedBudgetId,omitempty"`
 	// LinkType: "goal" (set goalAmount) or "credit" (set openingBalance / transfer credit)
@@ -217,35 +252,88 @@ type MasterBudget struct {
 	PK string `dynamodbav:"pk" json:"-"`
 	SK string `dynamodbav:"sk" json:"-"`
 
-	UserID       string           `dynamodbav:"userId"       json:"userId"`
-	IncomeSources []MBIncomeSource `dynamodbav:"incomeSources" json:"incomeSources"`
-	FixedCosts    []MBFixedCost    `dynamodbav:"fixedCosts"    json:"fixedCosts"`
-	Buckets       []MBBucket       `dynamodbav:"buckets"       json:"buckets"`
+	UserID        string           `dynamodbav:"userId"        json:"userId"`
+	// EffectiveDate is the first day this version of the master budget applies (YYYY-MM-DD).
+	// Empty means this is the legacy pre-versioning singleton (treated as the oldest version).
+	EffectiveDate string           `dynamodbav:"effectiveDate,omitempty" json:"effectiveDate,omitempty"`
+	// Label is an optional user-supplied name for the version, e.g. "2026 salary increase".
+	Label         string           `dynamodbav:"label,omitempty"         json:"label,omitempty"`
+	IncomeSources []MBIncomeSource `dynamodbav:"incomeSources"           json:"incomeSources"`
+	FixedCosts    []MBFixedCost    `dynamodbav:"fixedCosts"              json:"fixedCosts"`
+	Buckets       []MBBucket       `dynamodbav:"buckets"                 json:"buckets"`
 }
 
 // ── Master Budget CRUD ─────────────────────────────────────────────────────────
 
-func (c *Client) GetMasterBudget(ctx context.Context, userID string) (*MasterBudget, error) {
-	out, err := c.ddb.GetItem(ctx, &dynamodb.GetItemInput{
-		TableName: aws.String(c.table),
-		Key: map[string]types.AttributeValue{
-			"pk": &types.AttributeValueMemberS{Value: userPK(userID)},
-			"sk": &types.AttributeValueMemberS{Value: masterBudgetSK},
+// GetMasterBudgets returns all master budget versions for a user, sorted by
+// EffectiveDate ascending (the legacy pre-versioning item, if present, sorts
+// first because its EffectiveDate is empty and "" < any date string).
+func (c *Client) GetMasterBudgets(ctx context.Context, userID string) ([]MasterBudget, error) {
+	out, err := c.ddb.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String(c.table),
+		KeyConditionExpression: aws.String("pk = :pk AND begins_with(sk, :prefix)"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":pk":     &types.AttributeValueMemberS{Value: userPK(userID)},
+			":prefix": &types.AttributeValueMemberS{Value: masterBudgetSKPrefix},
 		},
+		ScanIndexForward: aws.Bool(true), // SK ascending = effectiveDate ascending
 	})
 	if err != nil {
 		return nil, err
 	}
-	if out.Item == nil {
-		return nil, nil
+	var versions []MasterBudget
+	if err := attributevalue.UnmarshalListOfMaps(out.Items, &versions); err != nil {
+		return nil, err
 	}
-	var mb MasterBudget
-	return &mb, attributevalue.UnmarshalMap(out.Item, &mb)
+	// Normalise nil slices to empty so callers can range without nil checks.
+	for i := range versions {
+		if versions[i].IncomeSources == nil { versions[i].IncomeSources = []MBIncomeSource{} }
+		if versions[i].FixedCosts    == nil { versions[i].FixedCosts    = []MBFixedCost{} }
+		if versions[i].Buckets       == nil { versions[i].Buckets       = []MBBucket{} }
+	}
+	return versions, nil
 }
 
+// GetEffectiveMasterBudget returns the master budget version whose EffectiveDate
+// is the latest one that is <= the given date string (YYYY-MM-DD).
+// The legacy pre-versioning item (EffectiveDate == "") always qualifies as "before
+// any real date", so it is used as a fallback when no dated version exists.
+// Returns nil, nil when there are no master budget records at all.
+func (c *Client) GetEffectiveMasterBudget(ctx context.Context, userID, date string) (*MasterBudget, error) {
+	versions, err := c.GetMasterBudgets(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	if len(versions) == 0 {
+		return nil, nil
+	}
+	// Versions are already sorted ascending.  Walk forward, keeping the last
+	// one whose EffectiveDate <= date.  Empty EffectiveDate ("") sorts before
+	// any real date string lexicographically, so it is always a candidate.
+	var best *MasterBudget
+	for i := range versions {
+		ed := versions[i].EffectiveDate
+		if ed == "" || ed <= date {
+			best = &versions[i]
+		}
+	}
+	if best == nil {
+		// All versions have EffectiveDate > date; return the earliest as fallback.
+		best = &versions[0]
+	}
+	return best, nil
+}
+
+// PutMasterBudget writes a master budget version.
+// If mb.EffectiveDate is non-empty the record is stored under the versioned SK
+// "MASTERBUDGET#<effectiveDate>"; otherwise the legacy SK "MASTERBUDGET" is used.
 func (c *Client) PutMasterBudget(ctx context.Context, mb MasterBudget) error {
 	mb.PK = userPK(mb.UserID)
-	mb.SK = masterBudgetSK
+	if mb.EffectiveDate != "" {
+		mb.SK = masterBudgetVersionSK(mb.EffectiveDate)
+	} else {
+		mb.SK = masterBudgetLegacySK
+	}
 	item, err := attributevalue.MarshalMap(mb)
 	if err != nil {
 		return err
@@ -257,7 +345,32 @@ func (c *Client) PutMasterBudget(ctx context.Context, mb MasterBudget) error {
 	return err
 }
 
-// DeductionItem is a single named line item within a pre-tax deduction bucket.
+// DeleteLegacyMasterBudget removes the pre-versioning singleton master budget
+// item (SK = "MASTERBUDGET") if it exists.  Called after successfully writing a
+// versioned item so the legacy entry no longer appears alongside dated versions.
+func (c *Client) DeleteLegacyMasterBudget(ctx context.Context, userID string) error {
+	_, err := c.ddb.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+		TableName: aws.String(c.table),
+		Key: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: userPK(userID)},
+			"sk": &types.AttributeValueMemberS{Value: masterBudgetLegacySK},
+		},
+	})
+	return err
+}
+
+// DeleteMasterBudgetVersion removes a specific versioned master budget item.
+// Used when the user renames a version's effective date.
+func (c *Client) DeleteMasterBudgetVersion(ctx context.Context, userID, effectiveDate string) error {
+	_, err := c.ddb.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+		TableName: aws.String(c.table),
+		Key: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: userPK(userID)},
+			"sk": &types.AttributeValueMemberS{Value: masterBudgetVersionSK(effectiveDate)},
+		},
+	})
+	return err
+}
 type DeductionItem struct {
 	Name   string  `dynamodbav:"name"   json:"name"`
 	Amount float64 `dynamodbav:"amount" json:"amount"`
@@ -348,6 +461,10 @@ type BudgetPeriod struct {
 	// closed period but it is not the most-recent closed period (which is
 	// auto-re-closed on sync). The user should manually re-close it.
 	StaleWarning bool `dynamodbav:"staleWarning,omitempty" json:"staleWarning,omitempty"`
+	// MasterBudgetGoal, when non-zero, overrides Budget.GoalAmount as the goal
+	// for this specific period.  Set by master budget version propagation so that
+	// each period reflects the master budget that was in effect on its start date.
+	MasterBudgetGoal float64 `dynamodbav:"masterBudgetGoal,omitempty" json:"masterBudgetGoal,omitempty"`
 }
 
 // ── Client ────────────────────────────────────────────────────────────────────
@@ -417,6 +534,84 @@ func (c *Client) DeleteAccount(ctx context.Context, userID, accountID string) er
 		},
 	})
 	return err
+}
+
+// AccountEnabled returns true if the account is enabled (nil means enabled by default).
+func AccountEnabled(a Account) bool {
+	return a.Enabled == nil || *a.Enabled
+}
+
+// UpdateAccountEnabled sets the enabled flag on an account record.
+func (c *Client) UpdateAccountEnabled(ctx context.Context, userID, accountID string, enabled bool) error {
+	_, err := c.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: &c.table,
+		Key: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: userPK(userID)},
+			"sk": &types.AttributeValueMemberS{Value: accountSK(accountID)},
+		},
+		UpdateExpression: aws.String("SET enabled = :enabled"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":enabled": &types.AttributeValueMemberBOOL{Value: enabled},
+		},
+	})
+	return err
+}
+
+// PutPlaidItem upserts a PlaidItem (access token + institution) keyed by itemId.
+func (c *Client) PutPlaidItem(ctx context.Context, item PlaidItem) error {
+	item.PK = userPK(item.UserID)
+	item.SK = itemSK(item.ItemID)
+	av, err := attributevalue.MarshalMap(item)
+	if err != nil {
+		return err
+	}
+	_, err = c.ddb.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: &c.table,
+		Item:      av,
+	})
+	return err
+}
+
+// GetPlaidItem fetches a single PlaidItem by itemId.
+func (c *Client) GetPlaidItem(ctx context.Context, userID, itemID string) (*PlaidItem, error) {
+	out, err := c.ddb.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: &c.table,
+		Key: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: userPK(userID)},
+			"sk": &types.AttributeValueMemberS{Value: itemSK(itemID)},
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	if out.Item == nil {
+		return nil, fmt.Errorf("plaid item %s not found", itemID)
+	}
+	var pi PlaidItem
+	if err := attributevalue.UnmarshalMap(out.Item, &pi); err != nil {
+		return nil, err
+	}
+	return &pi, nil
+}
+
+// GetPlaidItems returns all PlaidItem records for a user.
+func (c *Client) GetPlaidItems(ctx context.Context, userID string) ([]PlaidItem, error) {
+	out, err := c.ddb.Query(ctx, &dynamodb.QueryInput{
+		TableName:              &c.table,
+		KeyConditionExpression: aws.String("pk = :pk AND begins_with(sk, :prefix)"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":pk":     &types.AttributeValueMemberS{Value: userPK(userID)},
+			":prefix": &types.AttributeValueMemberS{Value: "ITEM#"},
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	var items []PlaidItem
+	if err := attributevalue.UnmarshalListOfMaps(out.Items, &items); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 func (c *Client) UpdateSyncCursor(ctx context.Context, userID, accountID, cursor string) error {
@@ -517,6 +712,15 @@ func (c *Client) GetTransactions(ctx context.Context, accountID, startDate, endD
 // ── Suggest Fixed Costs ────────────────────────────────────────────────────────
 
 const MasterBudgetID = "__master_budget__"
+
+// IncomeBudgetPrefix is prepended to an incomeSourceId to form the budgetId
+// stored on transactions matched by an income rule.
+// Full value: "__income__<incomeSourceId>"
+const IncomeBudgetPrefix = "__income__"
+
+// BuiltinIncomeCategoryID is the fixed category ID for paycheck/income deposits.
+// It is never stored in DynamoDB — it is injected by get-categories at query time.
+const BuiltinIncomeCategoryID = "__builtin_income__"
 
 // SuggestFixedCost is a candidate recurring cost derived from transaction history.
 type SuggestFixedCost struct {
@@ -1011,6 +1215,11 @@ type Rule struct {
 	// Only applied when DayOfMonth > 0.
 	DayOfMonth   int `dynamodbav:"dayOfMonth,omitempty"   json:"dayOfMonth,omitempty"`
 	DayTolerance int `dynamodbav:"dayTolerance,omitempty" json:"dayTolerance,omitempty"`
+
+	// IncomeSourceID: if set, this rule was created to match a paycheck deposit
+	// for the named income source. The matched transaction's budgetId will be set
+	// to IncomeBudgetPrefix + IncomeSourceID.
+	IncomeSourceID string `dynamodbav:"incomeSourceId,omitempty" json:"incomeSourceId,omitempty"`
 }
 
 func (c *Client) PutRule(ctx context.Context, rule Rule) error {
@@ -1213,6 +1422,57 @@ func (c *Client) GetBudgetPeriods(ctx context.Context, budgetID string) ([]Budge
 	}
 	var periods []BudgetPeriod
 	return periods, attributevalue.UnmarshalListOfMaps(out.Items, &periods)
+}
+
+// GetBudgetPeriodsByDateRange returns all periods for a budget whose startDate
+// is >= fromDate and < toDate (both YYYY-MM-DD).  Use toDate = "2999-12-31" for
+// an open-ended range.  Results are ordered by startDate ascending.
+func (c *Client) GetBudgetPeriodsByDateRange(ctx context.Context, budgetID, fromDate, toDate string) ([]BudgetPeriod, error) {
+	out, err := c.ddb.Query(ctx, &dynamodb.QueryInput{
+		TableName:              &c.table,
+		KeyConditionExpression: aws.String("pk = :pk AND sk BETWEEN :from AND :to"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":pk":   &types.AttributeValueMemberS{Value: budgetPK(budgetID)},
+			":from": &types.AttributeValueMemberS{Value: periodSK(fromDate)},
+			// Use the day before toDate so the range is exclusive at the upper bound.
+			// We filter precisely in Go below, but the key condition prunes most items.
+			":to":   &types.AttributeValueMemberS{Value: periodSK(toDate)},
+		},
+		ScanIndexForward: aws.Bool(true), // oldest first
+	})
+	if err != nil {
+		return nil, err
+	}
+	var all []BudgetPeriod
+	if err := attributevalue.UnmarshalListOfMaps(out.Items, &all); err != nil {
+		return nil, err
+	}
+	// Filter precisely: startDate >= fromDate AND startDate < toDate.
+	var result []BudgetPeriod
+	for _, p := range all {
+		if p.StartDate >= fromDate && p.StartDate < toDate {
+			result = append(result, p)
+		}
+	}
+	return result, nil
+}
+
+// UpdateBudgetPeriodMasterGoal sets the MasterBudgetGoal field on a single
+// budget period without overwriting any other fields.
+// goal == 0 clears the override (period will fall back to Budget.GoalAmount).
+func (c *Client) UpdateBudgetPeriodMasterGoal(ctx context.Context, budgetID, startDate string, goal float64) error {
+	_, err := c.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(c.table),
+		Key: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: budgetPK(budgetID)},
+			"sk": &types.AttributeValueMemberS{Value: periodSK(startDate)},
+		},
+		UpdateExpression: aws.String("SET masterBudgetGoal = :goal"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":goal": &types.AttributeValueMemberN{Value: fmt.Sprintf("%g", goal)},
+		},
+	})
+	return err
 }
 
 // GetBudgetPeriod returns a single period by budgetID + startDate.

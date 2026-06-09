@@ -49,6 +49,10 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response,
 		if filterAccountID != "" && acct.AccountID != filterAccountID {
 			continue
 		}
+		// Skip disabled accounts
+		if !dbpkg.AccountEnabled(acct) {
+			continue
+		}
 		txns, err := dbClient.GetTransactions(ctx, acct.AccountID, startDate, endDate)
 		if err != nil {
 			return errorResponse(http.StatusInternalServerError, err.Error()), nil

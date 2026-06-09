@@ -206,6 +206,26 @@ Resources:
             Path: /accounts/{accountId}
             Method: DELETE
 
+  UpdateAccountFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-update-account"
+      CodeUri: .
+      Handler: bootstrap
+      Description: Updates account properties (e.g. enabled/disabled)
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /accounts/{accountId}
+            Method: PATCH
+
   GetTransactionsFunction:
     Type: AWS::Serverless::Function
     Metadata:
@@ -696,6 +716,26 @@ Resources:
             ApiId: !Ref FinanceApi
             Path: /master-budget
             Method: POST
+
+  GetMasterBudgetVarianceFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-get-master-budget-variance"
+      CodeUri: .
+      Handler: bootstrap
+      Description: Returns income and fixed cost variance for a given month
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /master-budget/variance
+            Method: GET
 
   GetBudgetPeriodFunction:
     Type: AWS::Serverless::Function

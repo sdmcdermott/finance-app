@@ -5,7 +5,7 @@ import {
 } from '../api/client';
 import { useAuth } from './AuthContext';
 
-export type TxnRangeKey = 'last30' | 'last60' | 'last90' | 'currentMonth' | 'currentYear';
+export type TxnRangeKey = 'last30' | 'last60' | 'last90' | 'last6months' | 'currentMonth' | 'currentYear';
 export type TxnSortKey = 'date' | 'merchant' | 'amount';
 export type TxnSortDir = 'asc' | 'desc';
 

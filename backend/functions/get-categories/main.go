@@ -26,6 +26,16 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response,
 		return errorResponse(http.StatusInternalServerError, err.Error()), nil
 	}
 
+	// Prepend the built-in Income category so it always appears regardless of
+	// whether the user has created it manually in DynamoDB.
+	builtinIncome := dbpkg.Category{
+		UserID:     plaidclient.UserID(),
+		CategoryID: dbpkg.BuiltinIncomeCategoryID,
+		Name:       "Income",
+		Color:      "#0d7a6b",
+	}
+	cats = append([]dbpkg.Category{builtinIncome}, cats...)
+
 	body, _ := json.Marshal(map[string]interface{}{"categories": cats})
 	return response{StatusCode: http.StatusOK, Body: string(body), Headers: jsonHeaders()}, nil
 }

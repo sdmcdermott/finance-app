@@ -26,6 +26,9 @@ type ruleRequest struct {
 	AmountTolerance float64 `json:"amountTolerance,omitempty"`
 	DayOfMonth      int     `json:"dayOfMonth,omitempty"`
 	DayTolerance    int     `json:"dayTolerance,omitempty"`
+
+	// IncomeSourceID: if set, this rule matches paycheck deposits for the given income source.
+	IncomeSourceID string `json:"incomeSourceId,omitempty"`
 }
 
 func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response, error) {
@@ -61,6 +64,7 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response,
 		AmountTolerance: body.AmountTolerance,
 		DayOfMonth:      body.DayOfMonth,
 		DayTolerance:    body.DayTolerance,
+		IncomeSourceID:  body.IncomeSourceID,
 	}
 
 	if err := dbClient.PutRule(ctx, rule); err != nil {

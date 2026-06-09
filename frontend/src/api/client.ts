@@ -25,11 +25,13 @@ api.interceptors.request.use((config) => {
 
 export interface Account {
   accountId: string;
+  itemId: string;
   institution: string;
   name: string;
   type: string;
   subtype: string;
   lastSynced: string;
+  enabled?: boolean;  // absent == true (legacy records)
 }
 
 export interface Transaction {
@@ -101,6 +103,10 @@ export const deleteAccount = async (accountId: string): Promise<void> => {
   await api.delete(`/accounts/${encodeURIComponent(accountId)}`);
 };
 
+export const updateAccount = async (accountId: string, patch: { enabled: boolean }): Promise<void> => {
+  await api.patch(`/accounts/${encodeURIComponent(accountId)}`, patch);
+};
+
 export const getTransactions = async (params?: {
   accountId?: string;
   startDate?: string;
@@ -169,7 +175,7 @@ export const deleteCategory = async (categoryId: string): Promise<void> => {
 // ── Rules ─────────────────────────────────────────────────────────────────────
 
 export interface Rule {
-  userId: string;
+  userId?: string;
   ruleId: string;
   pattern: string;
   categoryId: string;
@@ -179,6 +185,7 @@ export interface Rule {
   amountTolerance?: number;
   dayOfMonth?: number;
   dayTolerance?: number;
+  incomeSourceId?: string;
 }
 
 export const getRules = async (): Promise<Rule[]> => {
@@ -213,6 +220,7 @@ export interface Budget {
   periodFormat: string;
   goalAmount: number;
   goalDirection: 'limit' | 'target';
+  masterBudgetAmount?: number;
   surplusHandling: 'ignore' | 'rollover' | 'transfer';
   transferBudgetId: string;
   transferAmount: number;
@@ -238,6 +246,9 @@ export interface BudgetPeriod {
   transferredOut: number;
   closed: boolean;
   staleWarning?: boolean;
+  // Set by master budget version propagation; when > 0, overrides Budget.goalAmount
+  // as the effective goal for this specific period.
+  masterBudgetGoal?: number;
   // computed by server (always live from transactions)
   debitTotal: number;
   creditTotal: number;
@@ -372,12 +383,15 @@ export const deleteSplits = async (
 
 // Sentinel budgetId for "assign to master budget" on a transaction
 export const MASTER_BUDGET_ID = '__master_budget__';
+export const INCOME_BUDGET_PREFIX = '__income__';
+export const INCOME_CATEGORY_ID = '__builtin_income__';
 
 export interface MBIncomeSource {
   incomeSourceId: string;
   monthlyOverride: number;  // 0 = use computed net pay
   enabled: boolean;
   linkedBudgetId?: string;  // optional checkbook budget tracking actual pay vs. expected
+  incomeRuleId?: string;    // optional rule ID matching paycheck deposit transactions
 }
 
 export interface MBFixedCost {
@@ -417,26 +431,72 @@ export interface MBBucket {
   name: string;
   amountMonthly: number;  // 0 = use percent
   percent: number;        // 0.0–1.0, 0 = use amountMonthly
+  /** Explicit allocation mode. If absent, infer: percent>0 → 'percent', else → 'fixed'. */
+  amountType?: 'fixed' | 'percent' | 'remaining';
   linkedBudgetId?: string;
   linkType?: 'goal' | 'credit';
 }
 
 export interface MasterBudget {
   userId: string;
+  /** YYYY-MM-DD: the first day this version applies. Empty = legacy pre-versioning singleton. */
+  effectiveDate?: string;
+  /** Optional user-supplied label, e.g. "2026 salary increase". */
+  label?: string;
   incomeSources: MBIncomeSource[];
   fixedCosts: MBFixedCost[];
   buckets: MBBucket[];
 }
 
-export const getMasterBudget = async (): Promise<MasterBudget> => {
-  const { data } = await api.get<MasterBudget>('/master-budget');
+export interface MasterBudgetListResponse {
+  versions: MasterBudget[];
+  current: MasterBudget;
+}
+
+export const getMasterBudget = async (): Promise<MasterBudgetListResponse> => {
+  const { data } = await api.get<MasterBudgetListResponse>('/master-budget');
   return data;
 };
 
+export interface PutMasterBudgetResponse {
+  version: MasterBudget;
+  updatedBudgetIds: string[];
+}
+
 export const putMasterBudget = async (
-  mb: Omit<MasterBudget, 'userId'>
-): Promise<MasterBudget> => {
-  const { data } = await api.post<MasterBudget>('/master-budget', mb);
+  mb: Omit<MasterBudget, 'userId'> & { previousEffectiveDate?: string },
+  discretionary: number,
+): Promise<PutMasterBudgetResponse> => {
+  const { data } = await api.post<PutMasterBudgetResponse>('/master-budget', { ...mb, discretionary });
+  return data;
+};
+
+export interface IncomeVariance {
+  incomeSourceId: string;
+  expectedMonthly: number;
+  actual: number;
+  variance: number;       // actual - expected; positive = received more than expected
+  matchedCount: number;
+}
+
+export interface FixedCostVariance {
+  fixedCostId: string;
+  name: string;
+  expectedMonthly: number;
+  actual: number;
+  variance: number;       // actual - expected; positive = spent more than expected
+  matchedCount: number;
+}
+
+export interface MasterBudgetVariance {
+  month: string;
+  income: IncomeVariance[];
+  fixedCosts: FixedCostVariance[];
+}
+
+export const getMasterBudgetVariance = async (month?: string): Promise<MasterBudgetVariance> => {
+  const params = month ? `?month=${month}` : '';
+  const { data } = await api.get<MasterBudgetVariance>(`/master-budget/variance${params}`);
   return data;
 };
 

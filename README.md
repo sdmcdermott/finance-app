@@ -234,14 +234,19 @@ aws configure
 
 ```bash
 aws ssm put-parameter \
-  --name "/finance-app/dev/plaid-client-id" \
+  --name "/finance-app/<dev-or-prod>/plaid-client-id" \
   --value "<your-plaid-client-id>" \
-  --type SecureString
+  --type String
 
 aws ssm put-parameter \
-  --name "/finance-app/dev/plaid-secret" \
+  --name "/finance-app/<dev-or-prod>/plaid-secret" \
   --value "<your-plaid-sandbox-secret>" \
-  --type SecureString
+  --type String
+
+aws ssm put-parameter \
+  --name "/finance-app/<dev-or-prod>/payrolltax-api-key" \
+  --value "<your-plaid-sandbox-secret>" \
+  --type String
 ```
 
 For production, repeat with `/finance-app/prod/...` and your Development or Production Plaid secret.
@@ -251,13 +256,15 @@ For production, repeat with `/finance-app/prod/...` and your Development or Prod
 SAM needs an S3 bucket to upload Lambda deployment packages. Choose a unique name:
 
 ```bash
-aws s3 mb s3://your-finance-app-sam-artifacts-<your-account-id>
+aws s3 mb s3://finance-app<dev/prod>-sam-artifacts-<your-account-id>
 ```
 
 ### Deploy the backend
 
 The easiest way is via the Makefile:
 
+``` bash
+make setup
 ```bash
 make deploy                          # deploys to dev (sandbox Plaid)
 make deploy STAGE=prod PLAID_ENV=production
@@ -270,7 +277,7 @@ cd backend
 sam build --use-container
 sam deploy \
   --stack-name finance-app-dev \
-  --s3-bucket your-finance-app-sam-artifacts-<your-account-id> \
+  --s3-bucket finance-app-sam-artifacts-<your-account-id> \
   --capabilities CAPABILITY_IAM \
   --parameter-overrides Stage=dev PlaidEnv=sandbox \
   --region us-east-1
@@ -295,7 +302,7 @@ For production:
 ```bash
 sam deploy \
   --stack-name finance-app-prod \
-  --s3-bucket your-finance-app-sam-artifacts-<your-account-id> \
+  --s3-bucket finance-prod-app-sam-artifacts-<your-account-id> \
   --capabilities CAPABILITY_IAM \
   --parameter-overrides Stage=prod PlaidEnv=development \
   --region us-east-1
@@ -309,10 +316,10 @@ The frontend is a static SPA — host it anywhere static files can be served. Th
 
 ```bash
 # Create bucket
-aws s3 mb s3://your-finance-app-frontend
+aws s3 mb s3://finance-app-frontend-<your-account-id> 
 
 # Enable static website hosting
-aws s3 website s3://your-finance-app-frontend \
+aws s3 website s3://finance-app-frontend-<your-account-id>  \
   --index-document index.html \
   --error-document index.html
 
@@ -322,23 +329,23 @@ REACT_APP_API_URL=https://<api-id>.execute-api.us-east-1.amazonaws.com/dev \
   npm run build
 
 # Upload
-aws s3 sync build/ s3://your-finance-app-frontend --delete
+aws s3 sync build/ s3://finance-app-frontend-<your-account-id>  --delete
 
 # Make public
 aws s3api put-bucket-policy \
-  --bucket your-finance-app-frontend \
+  --bucket finance-app-frontend-<your-account-id> \
   --policy '{
     "Version":"2012-10-17",
     "Statement":[{
       "Effect":"Allow",
       "Principal":"*",
       "Action":"s3:GetObject",
-      "Resource":"arn:aws:s3:::your-finance-app-frontend/*"
+      "Resource":"arn:aws:s3:::finance-app-frontend-<your-account-id> /*"
     }]
   }'
 ```
 
-Access via `http://your-finance-app-frontend.s3-website-us-east-1.amazonaws.com`.
+Access via `http://finance-app-frontend.s3-website-us-east-1.amazonaws.com`.
 
 #### Option B: S3 + CloudFront (HTTPS, recommended)
 

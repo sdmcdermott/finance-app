@@ -11,6 +11,7 @@ frontend/out
 # Build artifacts
 frontend/build/
 backend/.aws-sam/
+backend.samconfig.*
 
 # Environment / secrets — never commit these
 backend/local-env.json

@@ -1,0 +1,13 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "finance-app-prod"
+resolve_s3 = true
+s3_prefix = "finance-app-prod"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+parameter_overrides = "Stage=\"prod\" PlaidEnv=\"production\" AuthDisabled=\"false\""
+image_repositories = []
+
+[default.global.parameters]
+region = "us-east-1"

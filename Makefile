@@ -3,7 +3,8 @@ STAGE        ?= dev
 PLAID_ENV    ?= sandbox
 AWS_REGION   ?= us-east-1
 STACK_NAME    = finance-app-$(STAGE)
-S3_BUCKET     = $(STACK_NAME)-sam-artifacts
+AWS_ACCOUNT_ID   = $(shell aws sts get-caller-identity --query "Account" --output text --region $(AWS_REGION) 2>/dev/null)
+S3_BUCKET     = $(STACK_NAME)-sam-artifacts-$(AWS_ACCOUNT_ID)
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 .PHONY: help
@@ -26,21 +27,29 @@ setup:
 	@echo "Creating SAM artifact bucket..."
 	aws s3 mb s3://$(S3_BUCKET) --region $(AWS_REGION) 2>/dev/null || true
 	@echo ""
-	@echo "Storing Plaid credentials in SSM Parameter Store..."
-	@read -p "Plaid Client ID: " CLIENT_ID; \
+	@echo "Storing Plaid and PayrollTaxAPI credentials in SSM Parameter Store..."
+	@read -p "Plaid Client ID: " PLAID_CLIENT_ID; \
 	aws ssm put-parameter \
 		--name "/finance-app/$(STAGE)/plaid-client-id" \
-		--value "$$CLIENT_ID" \
-		--type SecureString \
+		--value "$$PLAID_CLIENT_ID" \
+		--type String \
 		--overwrite \
 		--region $(AWS_REGION)
-	@read -sp "Plaid Secret: " SECRET; echo; \
+	@read -sp "Plaid Secret: " PLAID_SECRET; echo; \
 	aws ssm put-parameter \
 		--name "/finance-app/$(STAGE)/plaid-secret" \
-		--value "$$SECRET" \
-		--type SecureString \
+		--value "$$PLAID_SECRET" \
+		--type String \
 		--overwrite \
 		--region $(AWS_REGION)
+	@read -sp "PayrollTaxAPI Key: " PAYROLLTAXAPI_KEY; echo; \
+	aws ssm put-parameter \
+		--name "/finance-app/$(STAGE)/payrolltax-api-key" \
+		--value "$$PAYROLLTAXAPI_KEY" \
+		--type String \
+		--overwrite \
+		--region $(AWS_REGION)
+		
 	@echo "Setup complete."
 
 # ── Backend ────────────────────────────────────────────────────────────────────

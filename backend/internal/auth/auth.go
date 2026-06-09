@@ -24,7 +24,8 @@ func Check(req events.APIGatewayV2HTTPRequest) *response {
 	}
 	// API Gateway HTTP API JWT authorizer populates
 	// req.RequestContext.Authorizer.JWT when auth succeeds.
-	if req.RequestContext.Authorizer.JWT == nil ||
+	if req.RequestContext.Authorizer == nil ||
+		req.RequestContext.Authorizer.JWT == nil ||
 		req.RequestContext.Authorizer.JWT.Claims == nil {
 		r := unauthorizedResponse()
 		return &r

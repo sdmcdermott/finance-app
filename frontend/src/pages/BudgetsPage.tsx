@@ -1,6 +1,7 @@
 import React, { useState } from 'react';import { useNavigate } from 'react-router-dom';
 import { Budget, putBudget, deleteBudget } from '../api/client';
 import { useData } from '../auth/DataContext';
+import { fmtCurrency } from '../utils/dates';
 
 const PERIODS = ['daily', 'weekly', 'biweekly', 'monthly', 'quarterly', 'annually'] as const;
 const DEFAULT_FORMATS: Record<string, string> = {
@@ -120,7 +121,30 @@ const BudgetsPage: React.FC = () => {
         <>
           <div className="form-row">
             <label style={s.label}>Goal Amount ($)</label>
-            <input style={{ ...s.input, maxWidth: 160 }} type="number" min="0" step="0.01" value={form.goalAmount || ''} onChange={(e) => setField('goalAmount', parseFloat(e.target.value) || 0)} placeholder="0.00" />
+            {(form.masterBudgetAmount ?? 0) > 0 ? (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                <div style={{ fontSize: 13, color: '#555' }}>
+                  From master budget: <strong>{fmtCurrency(form.masterBudgetAmount!)}</strong>
+                </div>
+                <label style={{ fontSize: 13, color: '#555' }}>
+                  Additional ($)
+                  <input
+                    style={{ ...s.input, maxWidth: 160, marginLeft: 8 }}
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    value={Math.max(0, Math.round((form.goalAmount - form.masterBudgetAmount!) * 100) / 100) || ''}
+                    onChange={(e) => setField('goalAmount', form.masterBudgetAmount! + (parseFloat(e.target.value) || 0))}
+                    placeholder="0.00"
+                  />
+                </label>
+                <div style={{ fontSize: 13, color: '#555' }}>
+                  Total: <strong>{fmtCurrency(form.goalAmount)}</strong>
+                </div>
+              </div>
+            ) : (
+              <input style={{ ...s.input, maxWidth: 160 }} type="number" min="0" step="0.01" value={form.goalAmount || ''} onChange={(e) => setField('goalAmount', parseFloat(e.target.value) || 0)} placeholder="0.00" />
+            )}
           </div>
           <div className="form-row">
             <label style={s.label}>Goal Direction</label>
@@ -140,7 +164,30 @@ const BudgetsPage: React.FC = () => {
       {form.budgetType === 'checkbook' && (
         <div className="form-row">
           <label style={s.label}>Opening Balance ($)</label>
-          <input style={{ ...s.input, maxWidth: 160 }} type="number" step="0.01" value={form.openingBalance || ''} onChange={(e) => setField('openingBalance', parseFloat(e.target.value) || 0)} placeholder="0.00" />
+          {(form.masterBudgetAmount ?? 0) > 0 ? (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              <div style={{ fontSize: 13, color: '#555' }}>
+                From master budget: <strong>{fmtCurrency(form.masterBudgetAmount!)}</strong>
+              </div>
+              <label style={{ fontSize: 13, color: '#555' }}>
+                Additional ($)
+                <input
+                  style={{ ...s.input, maxWidth: 160, marginLeft: 8 }}
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  value={Math.max(0, Math.round((form.openingBalance - form.masterBudgetAmount!) * 100) / 100) || ''}
+                  onChange={(e) => setField('openingBalance', form.masterBudgetAmount! + (parseFloat(e.target.value) || 0))}
+                  placeholder="0.00"
+                />
+              </label>
+              <div style={{ fontSize: 13, color: '#555' }}>
+                Total: <strong>{fmtCurrency(form.openingBalance)}</strong>
+              </div>
+            </div>
+          ) : (
+            <input style={{ ...s.input, maxWidth: 160 }} type="number" step="0.01" value={form.openingBalance || ''} onChange={(e) => setField('openingBalance', parseFloat(e.target.value) || 0)} placeholder="0.00" />
+          )}
         </div>
       )}
       <div className="form-row">

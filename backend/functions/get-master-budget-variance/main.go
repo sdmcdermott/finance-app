@@ -1,0 +1,226 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"math"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/aws/aws-lambda-go/events"
+	"github.com/aws/aws-lambda-go/lambda"
+	auth "github.com/smcdermott/finance-app/internal/auth"
+	dbpkg "github.com/smcdermott/finance-app/internal/db"
+	plaidclient "github.com/smcdermott/finance-app/internal/plaid"
+)
+
+type response = events.APIGatewayV2HTTPResponse
+
+// IncomeVariance holds expected vs actual for one income source for a given month.
+type IncomeVariance struct {
+	IncomeSourceID  string  `json:"incomeSourceId"`
+	ExpectedMonthly float64 `json:"expectedMonthly"`
+	Actual          float64 `json:"actual"`       // sum of matched deposit amounts (negative = credit)
+	Variance        float64 `json:"variance"`     // actual - expected (positive = more than expected)
+	MatchedCount    int     `json:"matchedCount"` // number of transactions matched
+}
+
+// FixedCostVariance holds expected vs actual for one fixed cost for a given month.
+type FixedCostVariance struct {
+	FixedCostID     string  `json:"fixedCostId"`
+	Name            string  `json:"name"`
+	ExpectedMonthly float64 `json:"expectedMonthly"`
+	Actual          float64 `json:"actual"`
+	Variance        float64 `json:"variance"`
+	MatchedCount    int     `json:"matchedCount"`
+}
+
+type varianceResponse struct {
+	Month          string              `json:"month"` // YYYY-MM
+	Income         []IncomeVariance    `json:"income"`
+	FixedCosts     []FixedCostVariance `json:"fixedCosts"`
+}
+
+func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response, error) {
+	if deny := auth.Check(req); deny != nil {
+		return *deny, nil
+	}
+
+	// ?month=YYYY-MM  (defaults to current month)
+	month := req.QueryStringParameters["month"]
+	if month == "" {
+		month = time.Now().UTC().Format("2006-01")
+	}
+	startDate := month + "-01"
+	t, err := time.Parse("2006-01", month)
+	if err != nil {
+		return errorResponse(http.StatusBadRequest, "invalid month format, use YYYY-MM"), nil
+	}
+	endDate := t.AddDate(0, 1, -1).Format("2006-01-02")
+
+	dbClient, err := dbpkg.New(ctx)
+	if err != nil {
+		return errorResponse(http.StatusInternalServerError, err.Error()), nil
+	}
+	userID := plaidclient.UserID()
+
+	// Load master budget for expected values — use the version effective on the queried month.
+	mb, err := dbClient.GetEffectiveMasterBudget(ctx, userID, startDate)
+	if err != nil {
+		return errorResponse(http.StatusInternalServerError, err.Error()), nil
+	}
+
+	// Load all accounts then fetch transactions for the month
+	accounts, err := dbClient.GetAccounts(ctx, userID)
+	if err != nil {
+		return errorResponse(http.StatusInternalServerError, err.Error()), nil
+	}
+
+	var allTxns []dbpkg.Transaction
+	for _, acct := range accounts {
+		if !dbpkg.AccountEnabled(acct) {
+			continue
+		}
+		txns, err := dbClient.GetTransactions(ctx, acct.AccountID, startDate, endDate)
+		if err != nil {
+			continue
+		}
+		allTxns = append(allTxns, txns...)
+	}
+
+	// ── Income variance ───────────────────────────────────────────────────────
+	// Build a map: incomeSourceId -> sum of matched transaction amounts
+	incomeActuals := make(map[string]struct {
+		sum   float64
+		count int
+	})
+	for _, txn := range allTxns {
+		if strings.HasPrefix(txn.BudgetID, dbpkg.IncomeBudgetPrefix) {
+			srcID := strings.TrimPrefix(txn.BudgetID, dbpkg.IncomeBudgetPrefix)
+			e := incomeActuals[srcID]
+			// Income deposits are negative amounts in Plaid (credits)
+			e.sum += math.Abs(txn.Amount)
+			e.count++
+			incomeActuals[srcID] = e
+		}
+	}
+
+	// Load income sources to get net pay
+	incomeSources, err := dbClient.GetIncomeSources(ctx, userID)
+	if err != nil {
+		return errorResponse(http.StatusInternalServerError, err.Error()), nil
+	}
+	srcByID := make(map[string]dbpkg.IncomeSource, len(incomeSources))
+	for _, s := range incomeSources {
+		srcByID[s.IncomeSourceID] = s
+	}
+
+	var incomeVariances []IncomeVariance
+	for _, mbi := range mb.IncomeSources {
+		if !mbi.Enabled {
+			continue
+		}
+		src, ok := srcByID[mbi.IncomeSourceID]
+		if !ok {
+			continue
+		}
+		// Expected monthly: override takes precedence, else computed net pay
+		var expected float64
+		if mbi.MonthlyOverride > 0 {
+			expected = mbi.MonthlyOverride
+		} else {
+			netPerPeriod := src.GrossAmount
+			if src.LastNetPay != nil {
+				netPerPeriod = src.LastNetPay.NetPay
+			}
+			expected = monthlyAmount(netPerPeriod, src.Frequency)
+		}
+
+		actual := incomeActuals[mbi.IncomeSourceID]
+		incomeVariances = append(incomeVariances, IncomeVariance{
+			IncomeSourceID:  mbi.IncomeSourceID,
+			ExpectedMonthly: expected,
+			Actual:          actual.sum,
+			Variance:        actual.sum - expected,
+			MatchedCount:    actual.count,
+		})
+	}
+
+	// ── Fixed cost variance ───────────────────────────────────────────────────
+	// Transactions assigned to __master_budget__ count as actual fixed cost spend
+	masterActuals := make(map[string]struct {
+		sum   float64
+		count int
+	})
+	for _, txn := range allTxns {
+		if txn.BudgetID == dbpkg.MasterBudgetID {
+			// Match by rule pattern if available — for now bucket all into a single pool
+			// keyed by merchant name (lowercased) to match against fixed cost names
+			key := strings.ToLower(txn.MerchantName)
+			if key == "" {
+				key = strings.ToLower(txn.Name)
+			}
+			e := masterActuals[key]
+			e.sum += math.Abs(txn.Amount)
+			e.count++
+			masterActuals[key] = e
+		}
+	}
+
+	var fixedCostVariances []FixedCostVariance
+	for _, fc := range mb.FixedCosts {
+		expected := monthlyAmount(fc.Amount, fc.Frequency)
+		key := strings.ToLower(fc.Name)
+		actual := masterActuals[key]
+		fixedCostVariances = append(fixedCostVariances, FixedCostVariance{
+			FixedCostID:     fc.ID,
+			Name:            fc.Name,
+			ExpectedMonthly: expected,
+			Actual:          actual.sum,
+			Variance:        actual.sum - expected,
+			MatchedCount:    actual.count,
+		})
+	}
+
+	out, _ := json.Marshal(varianceResponse{
+		Month:      month,
+		Income:     incomeVariances,
+		FixedCosts: fixedCostVariances,
+	})
+	return response{StatusCode: http.StatusOK, Body: string(out), Headers: jsonHeaders()}, nil
+}
+
+// monthlyAmount converts an amount + frequency to a monthly equivalent.
+func monthlyAmount(amount float64, frequency string) float64 {
+	switch frequency {
+	case "weekly":
+		return amount * 52 / 12
+	case "biweekly":
+		return amount * 26 / 12
+	case "semimonthly":
+		return amount * 2
+	case "monthly":
+		return amount
+	case "quarterly":
+		return amount / 3
+	case "annually":
+		return amount / 12
+	default:
+		return amount
+	}
+}
+
+func main() { lambda.Start(handler) }
+
+func errorResponse(status int, msg string) response {
+	body, _ := json.Marshal(map[string]string{"error": msg})
+	return response{StatusCode: status, Body: string(body), Headers: jsonHeaders()}
+}
+
+func jsonHeaders() map[string]string {
+	return map[string]string{
+		"Content-Type":                "application/json",
+		"Access-Control-Allow-Origin": "*",
+	}
+}

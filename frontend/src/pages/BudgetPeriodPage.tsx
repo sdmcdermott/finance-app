@@ -38,7 +38,7 @@ const ClosePeriodModal: React.FC<{
   onConfirm: () => void;
   closing: boolean;
 }> = ({ period, budget, onCancel, onConfirm, closing }) => (
-  <div style={cm.overlay} onClick={e => { if (e.target === e.currentTarget) onCancel(); }}>
+  <div style={cm.overlay}>
     <div style={cm.box}>
       <div style={cm.header}>
         <span style={cm.title}>Close Period</span>
@@ -89,7 +89,7 @@ const ReClosePeriodModal: React.FC<{
   onConfirm: () => void;
   closing: boolean;
 }> = ({ period, onCancel, onConfirm, closing }) => (
-  <div style={cm.overlay} onClick={e => { if (e.target === e.currentTarget) onCancel(); }}>
+  <div style={cm.overlay}>
     <div style={cm.box}>
       <div style={cm.header}>
         <span style={cm.title}>Re-close Period</span>

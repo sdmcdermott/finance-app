@@ -4,6 +4,9 @@ import { useDirtyGuard } from '../auth/DirtyGuardContext';
 import {
   MasterBudget, MBIncomeSource, MBFixedCost, MBBucket,
   getMasterBudget, putMasterBudget, getTransactions, Transaction,
+  putRule, applyRules,
+  INCOME_BUDGET_PREFIX, INCOME_CATEGORY_ID,
+  getMasterBudgetVariance, MasterBudgetVariance,
 } from '../api/client';
 import { fmtCurrency } from '../utils/dates';
 import { MoneyInput } from '../components/MoneyInput';
@@ -163,9 +166,17 @@ const Toggle: React.FC<{ on: boolean; onChange: (v: boolean) => void }> = ({ on,
 // ── Main component ─────────────────────────────────────────────────────────────
 
 const MasterBudgetPage: React.FC = () => {
-  const { incomeSources, budgets } = useData();
+  const { incomeSources, budgets, refreshAll, rules } = useData();
 
   const [mb, setMb] = useState<MasterBudget | null>(null);
+  const [versions, setVersions] = useState<MasterBudget[]>([]);
+  // Date string of the version currently being viewed/edited ("" = legacy)
+  const [selectedVersionDate, setSelectedVersionDate] = useState<string>('');
+  // The effectiveDate the version had when it was last loaded or saved —
+  // used to delete the old DynamoDB item when the user renames the date.
+  const [originalVersionDate, setOriginalVersionDate] = useState<string>('');
+  // New-version creation form state (null = form not open)
+  const [newVersionForm, setNewVersionForm] = useState<{ effectiveDate: string; label: string } | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
@@ -173,6 +184,7 @@ const MasterBudgetPage: React.FC = () => {
   const [showSuggest, setShowSuggest] = useState(false);
   const [txnFixedCosts, setTxnFixedCosts] = useState<TxnFixedCost[]>([]);
   const [showTxnCosts, setShowTxnCosts] = useState(false);
+  const [variance, setVariance] = useState<MasterBudgetVariance | null>(null);
 
   // Register dirty check with nav guard; unregister on unmount
   const dirtyGuard = useDirtyGuard();
@@ -192,24 +204,97 @@ const MasterBudgetPage: React.FC = () => {
   const [percentMode, setPercentMode] = useState<Set<string>>(new Set());
   const [remainingMode, setRemainingMode] = useState<Set<string>>(new Set());
 
+  // Income rule config: which rows are expanded, and local draft state
+  const [expandedIncomeRule, setExpandedIncomeRule] = useState<Set<string>>(new Set());
+  const [incomeRuleDraft, setIncomeRuleDraft] = useState<Record<string, {
+    pattern: string; amountMatch: number; amountTolerance: number;
+  }>>({});
+  const [incomeRuleSaving, setIncomeRuleSaving] = useState<Set<string>>(new Set());
+
+  const toggleIncomeRuleExpand = (sourceId: string) => {
+    setExpandedIncomeRule(prev => {
+      const s = new Set(prev);
+      if (s.has(sourceId)) { s.delete(sourceId); return s; }
+      s.add(sourceId);
+      // Seed draft from existing rule matched by incomeSourceId
+      if (!incomeRuleDraft[sourceId]) {
+        const existing = rules.find(r => r.incomeSourceId === sourceId);
+        setIncomeRuleDraft(d => ({
+          ...d,
+          [sourceId]: {
+            pattern:         existing?.pattern         ?? '',
+            amountMatch:     existing?.amountMatch     ?? 0,
+            amountTolerance: existing?.amountTolerance ?? 50,
+          },
+        }));
+      }
+      return s;
+    });
+  };
+
+  const patchRuleDraft = (sourceId: string, patch: Partial<typeof incomeRuleDraft[string]>) => {
+    setIncomeRuleDraft(d => ({ ...d, [sourceId]: { ...d[sourceId], ...patch } }));
+  };
+
+  const saveIncomeRule = async (mbi: MBIncomeSource) => {
+    const draft = incomeRuleDraft[mbi.incomeSourceId];
+    if (!draft?.pattern) return;
+    setIncomeRuleSaving(prev => new Set(prev).add(mbi.incomeSourceId));
+    try {
+      const ruleId = mbi.incomeRuleId || crypto.randomUUID();
+      await putRule({
+        ruleId,
+        pattern:         draft.pattern,
+        categoryId:      INCOME_CATEGORY_ID,
+        budgetId:        INCOME_BUDGET_PREFIX + mbi.incomeSourceId,
+        priority:        10,
+        amountMatch:     draft.amountMatch,
+          amountTolerance: draft.amountTolerance,
+        incomeSourceId:  mbi.incomeSourceId,
+      });
+      // Persist ruleId back onto the MBIncomeSource
+      updateMBIS(mbi.incomeSourceId, { incomeRuleId: ruleId });
+      // Auto-apply rules so existing transactions get tagged
+      try { await applyRules(); } catch { /* non-fatal */ }
+      setExpandedIncomeRule(prev => { const s = new Set(prev); s.delete(mbi.incomeSourceId); return s; });
+    } catch (e: any) {
+      alert('Failed to save income rule: ' + e.message);
+    } finally {
+      setIncomeRuleSaving(prev => { const s = new Set(prev); s.delete(mbi.incomeSourceId); return s; });
+    }
+  };
+
   // Load once on mount
   useEffect(() => {
     getMasterBudget()
-      .then(data => {
+      .then(({ versions: vers, current }) => {
+        setVersions(vers);
+        const active = current ?? (vers.length > 0 ? vers[vers.length - 1] : null);
+        if (!active) { setLoading(false); return; }
+        setSelectedVersionDate(active.effectiveDate ?? '');
+        setOriginalVersionDate(active.effectiveDate ?? '');
+
         // Merge: ensure every income source has an MBIncomeSource entry
         setMb(() => {
-          const existingIds = new Set((data.incomeSources ?? []).map(s => s.incomeSourceId));
+          const existingIds = new Set((active.incomeSources ?? []).map(s => s.incomeSourceId));
           const merged: MBIncomeSource[] = [
-            ...(data.incomeSources ?? []),
+            ...(active.incomeSources ?? []),
             ...incomeSources
               .filter(s => !existingIds.has(s.incomeSourceId))
               .map(s => ({ incomeSourceId: s.incomeSourceId, monthlyOverride: 0, enabled: true })),
           ];
-          return { ...data, incomeSources: merged };
+          return { ...active, incomeSources: merged };
         });
-        // Init percent mode from saved buckets
+        // Init percent/remaining mode from saved buckets.
+        // Use explicit amountType when present; fall back to inferring from percent > 0
+        // for records saved before amountType was introduced.
         setPercentMode(new Set(
-          (data.buckets ?? []).filter(b => b.percent > 0).map(b => b.id)
+          (active.buckets ?? [])
+            .filter(b => b.amountType === 'percent' || (!b.amountType && b.percent > 0))
+            .map(b => b.id)
+        ));
+        setRemainingMode(new Set(
+          (active.buckets ?? []).filter(b => b.amountType === 'remaining').map(b => b.id)
         ));
       })
       .finally(() => setLoading(false));
@@ -224,7 +309,6 @@ const MasterBudgetPage: React.FC = () => {
       const clusters = clusterMasterBudgetTxns(txns);
       setTxnFixedCosts(clusters);
       // Auto-expand if there are clusters not yet added as managed fixed costs
-      // We check against the mb loaded above; safe because both fetches are in the same effect
       setMb(prev => {
         if (prev && clusters.some(tc => !prev.fixedCosts.some(fc => fc.name.toLowerCase() === tc.merchant.toLowerCase()))) {
           setShowTxnCosts(true);
@@ -248,6 +332,11 @@ const MasterBudgetPage: React.FC = () => {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [incomeSources]);
 
+  // Load variance for current month
+  useEffect(() => {
+    getMasterBudgetVariance().then(setVariance).catch(() => {});
+  }, []);
+
   const patch = useCallback((update: Partial<MasterBudget>) => {
     setMb(prev => prev ? { ...prev, ...update } : prev);
     setDirty(true);
@@ -258,18 +347,84 @@ const MasterBudgetPage: React.FC = () => {
     setSaving(true);
     setError('');
     try {
-      const saved = await putMasterBudget({
+      const { version: saved } = await putMasterBudget({
+        effectiveDate:         mb.effectiveDate,
+        label:                 mb.label,
+        previousEffectiveDate: originalVersionDate !== (mb.effectiveDate ?? '') ? originalVersionDate : undefined,
         incomeSources: mb.incomeSources,
         fixedCosts:    mb.fixedCosts,
         buckets:       mb.buckets,
+      }, discretionary);
+      // Update local version list: replace or add the saved version, and remove
+      // any stale entry for the old date if the user renamed it.
+      setVersions(prev => {
+        let next = prev.filter(v => (v.effectiveDate ?? '') !== originalVersionDate || (v.effectiveDate ?? '') === (saved.effectiveDate ?? ''));
+        const existing = next.findIndex(v => (v.effectiveDate ?? '') === (saved.effectiveDate ?? ''));
+        if (existing >= 0) {
+          next[existing] = saved;
+        } else {
+          next = [...next, saved];
+        }
+        return next.sort((a, b) => (a.effectiveDate ?? '') < (b.effectiveDate ?? '') ? -1 : 1);
       });
       setMb(saved);
+      setSelectedVersionDate(saved.effectiveDate ?? '');
+      setOriginalVersionDate(saved.effectiveDate ?? '');
       setDirty(false);
+      setNewVersionForm(null);
+      // Refresh the budgets cache — backend has updated linked budgets and their periods.
+      await refreshAll();
     } catch {
       setError('Save failed.');
     } finally {
       setSaving(false);
     }
+  };
+
+  // Switch the editor to a different version.
+  const selectVersion = (effectiveDate: string) => {
+    if (dirty && !window.confirm('You have unsaved changes. Switch versions and discard them?')) return;
+    const v = versions.find(ver => (ver.effectiveDate ?? '') === effectiveDate);
+    if (!v) return;
+    setSelectedVersionDate(effectiveDate);
+    setOriginalVersionDate(effectiveDate);
+    setMb(v);
+    setDirty(false);
+    setNewVersionForm(null);
+    setPercentMode(new Set(
+      (v.buckets ?? [])
+        .filter(b => b.amountType === 'percent' || (!b.amountType && b.percent > 0))
+        .map(b => b.id)
+    ));
+    setRemainingMode(new Set(
+      (v.buckets ?? []).filter(b => b.amountType === 'remaining').map(b => b.id)
+    ));
+  };
+
+  // Start creating a new version as a clone of the currently viewed version.
+  const startNewVersion = () => {
+    setNewVersionForm({ effectiveDate: '', label: '' });
+  };
+
+  // Confirm the new version form: clone mb into a new version with the given date.
+  const confirmNewVersion = () => {
+    if (!newVersionForm || !mb) return;
+    const date = newVersionForm.effectiveDate;
+    if (!date) { alert('Please set an effective date for the new version.'); return; }
+    if (versions.some(v => v.effectiveDate === date)) {
+      alert(`A version with effective date ${date} already exists.`);
+      return;
+    }
+    const cloned: MasterBudget = {
+      ...mb,
+      effectiveDate: date,
+      label: newVersionForm.label || undefined,
+    };
+    setMb(cloned);
+    setSelectedVersionDate(date);
+    setOriginalVersionDate(''); // new version — no prior SK to delete
+    setDirty(true);
+    setNewVersionForm(null);
   };
 
   // ── Derived numbers ──────────────────────────────────────────────────────────
@@ -381,6 +536,95 @@ const MasterBudgetPage: React.FC = () => {
         </button>
       </div>
 
+      {/* ── Version selector bar ─────────────────────────────────────────── */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12, flexWrap: 'wrap' }}>
+        <span style={{ fontSize: 13, color: '#6b7280', fontWeight: 500 }}>Version:</span>
+        <select
+          style={{ fontSize: 13, padding: '4px 8px', border: '1px solid #cbd5e0', borderRadius: 5 }}
+          value={selectedVersionDate}
+          onChange={e => selectVersion(e.target.value)}
+        >
+          {versions.map(v => {
+            const key = v.effectiveDate ?? '';
+            const label = v.label
+              ? `${v.label}${v.effectiveDate ? ` (from ${v.effectiveDate})` : ''}`
+              : v.effectiveDate
+                ? `From ${v.effectiveDate}`
+                : 'Original (no date)';
+            return <option key={key} value={key}>{label}</option>;
+          })}
+        </select>
+        {mb && mb.effectiveDate && (
+          <span style={{ fontSize: 12, color: '#6b7280' }}>
+            Effective from <strong>{mb.effectiveDate}</strong>
+            {(() => {
+              const idx = versions.findIndex(v => (v.effectiveDate ?? '') === (mb.effectiveDate ?? ''));
+              const next = versions[idx + 1];
+              return next?.effectiveDate
+                ? <> through <strong>{next.effectiveDate}</strong> (exclusive)</>
+                : <> onward</>;
+            })()}
+          </span>
+        )}
+        {mb && !mb.effectiveDate && (
+          <span style={{ fontSize: 12, color: '#b45309', background: '#fffbeb', padding: '2px 8px', borderRadius: 4, border: '1px solid #fde68a' }}>
+            No effective date — set one when saving to enable date-based propagation
+          </span>
+        )}
+        {!newVersionForm ? (
+          <button
+            style={{ ...s.secondaryBtn, marginLeft: 'auto' }}
+            onClick={startNewVersion}
+          >
+            + New Version
+          </button>
+        ) : (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginLeft: 'auto', background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 6, padding: '6px 12px' }}>
+            <span style={{ fontSize: 13, fontWeight: 500 }}>New version — effective from:</span>
+            <input
+              type="date"
+              value={newVersionForm.effectiveDate}
+              onChange={e => setNewVersionForm(f => f ? { ...f, effectiveDate: e.target.value } : f)}
+              style={{ fontSize: 13, padding: '3px 6px', border: '1px solid #cbd5e0', borderRadius: 4 }}
+            />
+            <input
+              type="text"
+              placeholder="Label (optional)"
+              value={newVersionForm.label}
+              onChange={e => setNewVersionForm(f => f ? { ...f, label: e.target.value } : f)}
+              style={{ fontSize: 13, padding: '3px 6px', border: '1px solid #cbd5e0', borderRadius: 4, minWidth: 160 }}
+            />
+            <button style={s.primaryBtn} onClick={confirmNewVersion}>Clone &amp; Edit</button>
+            <button style={s.secondaryBtn} onClick={() => setNewVersionForm(null)}>Cancel</button>
+          </div>
+        )}
+      </div>
+
+      {/* Editable label/date — always shown so the user can set a date on the legacy version */}
+      {mb && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12, flexWrap: 'wrap' }}>
+          <label style={{ fontSize: 13, color: '#6b7280' }}>
+            Effective date:
+            <input
+              type="date"
+              value={mb.effectiveDate ?? ''}
+              onChange={e => patch({ effectiveDate: e.target.value })}
+              style={{ marginLeft: 6, fontSize: 13, padding: '3px 6px', border: '1px solid #cbd5e0', borderRadius: 4 }}
+            />
+          </label>
+          <label style={{ fontSize: 13, color: '#6b7280' }}>
+            Label:
+            <input
+              type="text"
+              placeholder="e.g. 2026 salary increase"
+              value={mb.label ?? ''}
+              onChange={e => patch({ label: e.target.value || undefined })}
+              style={{ marginLeft: 6, fontSize: 13, padding: '3px 6px', border: '1px solid #cbd5e0', borderRadius: 4, minWidth: 200 }}
+            />
+          </label>
+        </div>
+      )}
+
       {error && <p style={s.error}>{error}</p>}
 
       {/* ── Summary bar ─────────────────────────────────────────────────── */}
@@ -411,7 +655,8 @@ const MasterBudgetPage: React.FC = () => {
               <th style={{ ...s.th, textAlign: 'right' }}>Net Pay / Period</th>
               <th style={{ ...s.th, textAlign: 'right' }}>Monthly Net Pay</th>
               <th style={{ ...s.th, textAlign: 'right' }}>Monthly Override</th>
-              <th style={s.th}>Track variance in budget</th>
+              <th style={s.th}>Variance budget</th>
+              <th style={s.th}>Match rule</th>
             </tr>
           </thead>
           <tbody>
@@ -420,8 +665,12 @@ const MasterBudgetPage: React.FC = () => {
               if (!src) return null;
               const netPerPeriod = src.lastNetPay?.netPay ?? src.grossAmount;
               const monthly = monthlyNetPay(mbi.incomeSourceId);
+              const isExpanded = expandedIncomeRule.has(mbi.incomeSourceId);
+              const draft = incomeRuleDraft[mbi.incomeSourceId];
+              const hasRule = !!mbi.incomeRuleId || rules.some(r => r.incomeSourceId === mbi.incomeSourceId);
               return (
-                <tr key={mbi.incomeSourceId} style={s.tr}>
+                <React.Fragment key={mbi.incomeSourceId}>
+                <tr style={s.tr}>
                   <td style={s.td}>
                     <Toggle on={mbi.enabled} onChange={v => updateMBIS(mbi.incomeSourceId, { enabled: v })} />
                   </td>
@@ -451,12 +700,67 @@ const MasterBudgetPage: React.FC = () => {
                       onChange={e => updateMBIS(mbi.incomeSourceId, { linkedBudgetId: e.target.value || undefined })}
                     >
                       <option value="">— none —</option>
-                      {budgets.filter(b => b.budgetType === 'checkbook').map(b => (
+                    {budgets.map(b => (
                         <option key={b.budgetId} value={b.budgetId}>{b.name}</option>
                       ))}
                     </select>
                   </td>
+                  <td style={s.td}>
+                    <button
+                      style={{ ...s.suggestLink, fontSize: '0.78rem' }}
+                      onClick={() => toggleIncomeRuleExpand(mbi.incomeSourceId)}
+                    >
+                      {hasRule ? '✓ rule' : '+ match rule'}{isExpanded ? ' ▲' : ' ▼'}
+                    </button>
+                  </td>
                 </tr>
+                {isExpanded && (
+                  <tr style={{ background: '#f7fafc' }}>
+                    <td colSpan={8} style={{ padding: '0.75rem 1rem', borderBottom: '1px solid #e2e8f0' }}>
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.75rem', alignItems: 'flex-end' }}>
+                        <label style={s.ruleLabel}>
+                          Deposit description contains
+                          <input
+                            style={s.ruleInput}
+                            placeholder="e.g. ADP, DIRECT DEP"
+                            value={draft?.pattern ?? ''}
+                            onChange={e => patchRuleDraft(mbi.incomeSourceId, { pattern: e.target.value })}
+                          />
+                        </label>
+                        <label style={s.ruleLabel}>
+                          Expected amount ($)
+                          <input
+                            style={s.ruleInput}
+                            type="number" min="0" step="0.01"
+                            placeholder={String(netPerPeriod.toFixed(2))}
+                            value={draft?.amountMatch || ''}
+                            onChange={e => patchRuleDraft(mbi.incomeSourceId, { amountMatch: parseFloat(e.target.value) || 0 })}
+                          />
+                        </label>
+                        <label style={s.ruleLabel}>
+                          ± tolerance ($)
+                          <input
+                            style={{ ...s.ruleInput, maxWidth: 70 }}
+                            type="number" min="0" step="0.01"
+                            value={draft?.amountTolerance ?? 5}
+                            onChange={e => patchRuleDraft(mbi.incomeSourceId, { amountTolerance: parseFloat(e.target.value) || 0 })}
+                          />
+                        </label>
+                        <button
+                          style={draft?.pattern ? s.addBtn : { ...s.addBtn, opacity: 0.5 }}
+                          disabled={!draft?.pattern || incomeRuleSaving.has(mbi.incomeSourceId)}
+                          onClick={() => saveIncomeRule(mbi)}
+                        >
+                          {incomeRuleSaving.has(mbi.incomeSourceId) ? 'Saving…' : 'Save rule'}
+                        </button>
+                      </div>
+                      <p style={{ ...s.muted, marginTop: '0.4rem', fontSize: '0.78rem' }}>
+                        Matching deposits will be categorized as <strong>Income</strong> and linked to this source for variance tracking.
+                      </p>
+                    </td>
+                  </tr>
+                )}
+                </React.Fragment>
               );
             })}
           </tbody>
@@ -479,7 +783,7 @@ const MasterBudgetPage: React.FC = () => {
               <th style={s.th}>Frequency</th>
               <th style={{ ...s.th, textAlign: 'right' }}>Amount</th>
               <th style={{ ...s.th, textAlign: 'right' }}>Monthly</th>
-              <th style={s.th}>Track variance in budget</th>
+              <th style={s.th}>Variance budget</th>
               <th style={s.th}></th>
             </tr>
           </thead>
@@ -522,7 +826,7 @@ const MasterBudgetPage: React.FC = () => {
                     onChange={e => updateFixedCost(fc.id, { linkedBudgetId: e.target.value || undefined })}
                   >
                     <option value="">— none —</option>
-                    {budgets.filter(b => b.budgetType === 'checkbook').map(b => (
+                    {budgets.map(b => (
                       <option key={b.budgetId} value={b.budgetId}>{b.name}</option>
                     ))}
                   </select>
@@ -606,6 +910,88 @@ const MasterBudgetPage: React.FC = () => {
         )}
       </Section>
 
+      {/* ── Variance Summary ────────────────────────────────────────────── */}
+      {variance && (
+        <Section title={`Variance — ${variance.month}`}>
+          {/* Income variance */}
+          {variance.income.length > 0 && (
+            <>
+              <p style={{ ...s.sectionNote, marginBottom: '0.4rem' }}>Income</p>
+              <table style={s.table}>
+                <thead>
+                  <tr>
+                    <th style={s.th}>Source</th>
+                    <th style={{ ...s.th, textAlign: 'right' }}>Expected</th>
+                    <th style={{ ...s.th, textAlign: 'right' }}>Actual</th>
+                    <th style={{ ...s.th, textAlign: 'right' }}>Variance</th>
+                    <th style={{ ...s.th, textAlign: 'center' }}>Matched</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {variance.income.map(v => {
+                    const src = incomeSources.find(s2 => s2.incomeSourceId === v.incomeSourceId);
+                    const varColor = v.variance >= 0 ? '#16a34a' : '#dc2626';
+                    return (
+                      <tr key={v.incomeSourceId} style={s.tr}>
+                        <td style={s.td}>{src?.name ?? v.incomeSourceId}</td>
+                        <td style={{ ...s.td, textAlign: 'right' }}>{fmtCurrency(v.expectedMonthly)}</td>
+                        <td style={{ ...s.td, textAlign: 'right' }}>{fmtCurrency(v.actual)}</td>
+                        <td style={{ ...s.td, textAlign: 'right', color: varColor, fontWeight: 600 }}>
+                          {v.variance >= 0 ? '+' : ''}{fmtCurrency(v.variance)}
+                        </td>
+                        <td style={{ ...s.td, textAlign: 'center', color: v.matchedCount === 0 ? '#dc2626' : '#2d3748' }}>
+                          {v.matchedCount === 0 ? '⚠ none' : `${v.matchedCount}×`}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </>
+          )}
+          {variance.income.length === 0 && (
+            <p style={s.muted}>No income sources with match rules yet. Configure a match rule on each income source above.</p>
+          )}
+
+          {/* Fixed cost variance */}
+          {variance.fixedCosts.length > 0 && (
+            <>
+              <p style={{ ...s.sectionNote, marginTop: '1rem', marginBottom: '0.4rem' }}>Fixed / Recurring Costs</p>
+              <table style={s.table}>
+                <thead>
+                  <tr>
+                    <th style={s.th}>Cost</th>
+                    <th style={{ ...s.th, textAlign: 'right' }}>Expected</th>
+                    <th style={{ ...s.th, textAlign: 'right' }}>Actual</th>
+                    <th style={{ ...s.th, textAlign: 'right' }}>Variance</th>
+                    <th style={{ ...s.th, textAlign: 'center' }}>Matched</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {variance.fixedCosts.map(v => {
+                    // Positive variance = spent more than expected (bad for costs)
+                    const varColor = v.variance > 0 ? '#dc2626' : v.variance < 0 ? '#16a34a' : '#2d3748';
+                    return (
+                      <tr key={v.fixedCostId} style={s.tr}>
+                        <td style={s.td}>{v.name}</td>
+                        <td style={{ ...s.td, textAlign: 'right' }}>{fmtCurrency(v.expectedMonthly)}</td>
+                        <td style={{ ...s.td, textAlign: 'right' }}>{fmtCurrency(v.actual)}</td>
+                        <td style={{ ...s.td, textAlign: 'right', color: varColor, fontWeight: 600 }}>
+                          {v.variance > 0 ? '+' : ''}{fmtCurrency(v.variance)}
+                        </td>
+                        <td style={{ ...s.td, textAlign: 'center', color: v.matchedCount === 0 ? '#9ca3af' : '#2d3748' }}>
+                          {v.matchedCount === 0 ? '—' : `${v.matchedCount}×`}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </>
+          )}
+        </Section>
+      )}
+
       {/* ── Discretionary Buckets ───────────────────────────────────────── */}
       <Section title="Discretionary Buckets">
         <p style={s.sectionNote}>
@@ -670,13 +1056,13 @@ const MasterBudgetPage: React.FC = () => {
                         if (val === 'percent') {
                           setPercentMode(prev => new Set(prev).add(b.id));
                           const pct = discretionary > 0 ? monthly / discretionary : 0;
-                          updateBucket(b.id, { amountMonthly: 0, percent: pct });
+                          updateBucket(b.id, { amountMonthly: 0, percent: pct, amountType: 'percent' });
                         } else if (val === 'remaining') {
                           setRemainingMode(prev => new Set(prev).add(b.id));
-                          updateBucket(b.id, { amountMonthly: 0, percent: 0 });
+                          updateBucket(b.id, { amountMonthly: 0, percent: 0, amountType: 'remaining' });
                         } else {
                           // fixed — convert current displayed monthly to $, rounded
-                          updateBucket(b.id, { percent: 0, amountMonthly: Math.round(monthly * 100) / 100 });
+                          updateBucket(b.id, { percent: 0, amountMonthly: Math.round(monthly * 100) / 100, amountType: 'fixed' });
                         }
                       }}
                     >
@@ -829,6 +1215,10 @@ const s: Record<string, React.CSSProperties> = {
 
   primaryBtn:         { background: '#0d7a6b', color: '#fff', border: 'none', borderRadius: 6, padding: '0.45rem 1rem', cursor: 'pointer', fontSize: '0.875rem' },
   primaryBtnDisabled: { background: '#a0aec0', color: '#fff', border: 'none', borderRadius: 6, padding: '0.45rem 1rem', cursor: 'default', fontSize: '0.875rem' },
+  secondaryBtn:       { background: '#fff', color: '#374151', border: '1px solid #d1d5db', borderRadius: 6, padding: '0.4rem 0.9rem', cursor: 'pointer', fontSize: '0.875rem' },
+
+  ruleLabel: { display: 'flex', flexDirection: 'column' as const, gap: '0.2rem', fontSize: '0.78rem', color: '#4a5568', fontWeight: 600 },
+  ruleInput: { border: '1px solid #d1d5db', borderRadius: 4, padding: '0.3rem 0.5rem', fontSize: '0.85rem', minWidth: 140 },
 };
 
 export default MasterBudgetPage;

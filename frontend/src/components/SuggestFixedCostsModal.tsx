@@ -62,7 +62,7 @@ export const SuggestFixedCostsModal: React.FC<Props> = ({ onConfirm, onClose }) 
         const s = suggestions[i];
         const ruleId = uuidv4();
 
-        await putRule({
+        const rulePayload = {
           ruleId,
           pattern:         s.merchant,
           categoryId:      '',
@@ -72,7 +72,10 @@ export const SuggestFixedCostsModal: React.FC<Props> = ({ onConfirm, onClose }) 
           amountTolerance: 5,
           dayOfMonth:      s.meanDay,
           dayTolerance:    1,
-        });
+        };
+        console.log('[SuggestFixedCosts] calling putRule with', rulePayload);
+        const savedRule = await putRule(rulePayload);
+        console.log('[SuggestFixedCosts] putRule response', savedRule);
 
         added.push({
           id:        uuidv4(),
@@ -83,7 +86,8 @@ export const SuggestFixedCostsModal: React.FC<Props> = ({ onConfirm, onClose }) 
         });
       }
       onConfirm(added);
-    } catch {
+    } catch (err) {
+      console.error('[SuggestFixedCosts] putRule failed', err);
       setError('Failed to save rules. Some may have been saved.');
       setSaving(false);
       return;
@@ -113,7 +117,7 @@ export const SuggestFixedCostsModal: React.FC<Props> = ({ onConfirm, onClose }) 
   })();
 
   return (
-    <div style={s.overlay} onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
+    <div style={s.overlay}>
       <div style={s.modal}>
         <div style={s.header}>
           <h3 style={s.title}>Suggest from Transactions</h3>

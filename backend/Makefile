@@ -17,6 +17,9 @@ build-GetAccountsFunction:
 build-DeleteAccountFunction:
 	$(GOENV) go build $(GOFLAGS) -o $(ARTIFACTS_DIR)/bootstrap ./functions/delete-account
 
+build-UpdateAccountFunction:
+	$(GOENV) go build $(GOFLAGS) -o $(ARTIFACTS_DIR)/bootstrap ./functions/update-account
+
 build-GetTransactionsFunction:
 	$(GOENV) go build $(GOFLAGS) -o $(ARTIFACTS_DIR)/bootstrap ./functions/get-transactions
 
@@ -79,6 +82,9 @@ build-GetMasterBudgetFunction:
 
 build-PutMasterBudgetFunction:
 	$(GOENV) go build $(GOFLAGS) -o $(ARTIFACTS_DIR)/bootstrap ./functions/put-master-budget
+
+build-GetMasterBudgetVarianceFunction:
+	$(GOENV) go build $(GOFLAGS) -o $(ARTIFACTS_DIR)/bootstrap ./functions/get-master-budget-variance
 
 build-GetBudgetsFunction:
 	$(GOENV) go build $(GOFLAGS) -o $(ARTIFACTS_DIR)/bootstrap ./functions/get-budgets

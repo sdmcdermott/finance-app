@@ -37,13 +37,10 @@ export const ItemizeModal: React.FC<Props> = ({ title, items: initialItems, name
     onConfirm(valid);
   };
 
-  // Close on backdrop click
-  const handleBackdrop = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (e.target === e.currentTarget) onClose();
-  };
+  // Modal is truly modal — no backdrop dismiss
 
   return (
-    <div style={styles.backdrop} onClick={handleBackdrop}>
+    <div style={styles.backdrop}>
       <div style={styles.modal} role="dialog" aria-modal="true" aria-label={title}>
         <div style={styles.header}>
           <span style={styles.headerTitle}>{title}</span>

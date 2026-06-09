@@ -123,7 +123,11 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response,
 			Transactions: txns,
 		}
 		if budget.BudgetType == "goal" {
-			effectiveGoal := budget.GoalAmount + p.RolledOverAmount
+			periodGoal := budget.GoalAmount
+			if p.MasterBudgetGoal > 0 {
+				periodGoal = p.MasterBudgetGoal
+			}
+			effectiveGoal := periodGoal + p.RolledOverAmount
 			pw.EffectiveGoal = effectiveGoal
 			if budget.GoalDirection == "limit" {
 				pw.LiveDelta = effectiveGoal - debits

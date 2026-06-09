@@ -47,16 +47,14 @@ export const GrossPayCalcModal: React.FC<Props> = ({ frequency: initialFrequency
   const fmtMoney = (v: number) =>
     v.toLocaleString('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 2 });
 
-  const handleBackdrop = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (e.target === e.currentTarget) onClose();
-  };
+  // Modal is truly modal — no backdrop dismiss
 
   const handleConfirm = () => {
     if (grossPerPeriod !== null) onConfirm(grossPerPeriod, frequency);
   };
 
   return (
-    <div style={s.backdrop} onClick={handleBackdrop}>
+    <div style={s.backdrop}>
       <div style={s.modal} role="dialog" aria-modal="true" aria-label="Calculate Gross Pay">
         <div style={s.header}>
           <span style={s.headerTitle}>Calculate Gross Pay per Period</span>

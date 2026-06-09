@@ -93,6 +93,17 @@ func runSync(ctx context.Context) (*syncResult, error) {
 		return nil, fmt.Errorf("failed to get accounts: %w", err)
 	}
 
+	// Load all PlaidItem records to get access tokens (tokens live on the item,
+	// not the account, so deleting an account never loses a token).
+	plaidItems, err := dbClient.GetPlaidItems(ctx, userID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get plaid items: %w", err)
+	}
+	tokenByItemID := make(map[string]string, len(plaidItems))
+	for _, pi := range plaidItems {
+		tokenByItemID[pi.ItemID] = pi.AccessToken
+	}
+
 	// Group accounts by Plaid Item (one Item can have multiple accounts)
 	type itemGroup struct {
 		accessToken string
@@ -100,8 +111,13 @@ func runSync(ctx context.Context) (*syncResult, error) {
 	}
 	itemMap := make(map[string]*itemGroup)
 	for _, acct := range accounts {
+		// Skip disabled accounts — don't sync their transactions
+		if !dbpkg.AccountEnabled(acct) {
+			continue
+		}
 		if _, ok := itemMap[acct.ItemID]; !ok {
-			itemMap[acct.ItemID] = &itemGroup{accessToken: acct.AccessToken}
+			token := tokenByItemID[acct.ItemID]
+			itemMap[acct.ItemID] = &itemGroup{accessToken: token}
 		}
 		itemMap[acct.ItemID].accounts = append(itemMap[acct.ItemID].accounts, acct)
 	}

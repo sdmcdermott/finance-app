@@ -2,7 +2,7 @@ import React, { useEffect, useState, useCallback } from 'react';
 import { BrowserRouter, Routes, Route, Link, useLocation, useNavigate } from 'react-router-dom';
 import { DirtyGuardProvider, useDirtyGuard } from './auth/DirtyGuardContext';
 import {
-  Account, Category, Rule, Transaction, Budget,
+  Account, Category, Rule, Transaction, Budget, IncomeSource,
   getTransactions, putTransaction, deleteTransaction,
   updateTransactionCategory, updateTransactionBudget, updateTransactionReference, applyRules, syncTransactions,
   putCategory, putRule,
@@ -19,8 +19,10 @@ import ImportPage from './pages/ImportPage';
 import LoginPage from './pages/LoginPage';
 import { IncomePage } from './pages/IncomePage';
 import MasterBudgetPage from './pages/MasterBudgetPage';
+import { IncomeSourceModal } from './components/IncomeSourceModal';
 import { fmtDate } from './utils/dates';
 import { fmtCurrency } from './utils/dates';
+import { INCOME_CATEGORY_ID } from './api/client';
 
 // ── Nav ───────────────────────────────────────────────────────────────────────
 const Nav: React.FC = () => {
@@ -176,21 +178,26 @@ const CatBadge: React.FC<{ catId: string; categories: Category[] }> = ({ catId, 
 };
 
 const BudgetSelect: React.FC<{
-  txn: Transaction; budgets: Budget[];
+  txn: Transaction; budgets: Budget[]; incomeSources: IncomeSource[];
   assigningId: string | null;
   onAssign: (txn: Transaction, budgetId: string) => void;
-}> = ({ txn, budgets, assigningId, onAssign }) => (
-  <select
-    value={txn.budgetId || ''}
-    disabled={assigningId === txn.dateTransactionId}
-    onChange={e => onAssign(txn, e.target.value)}
-    style={inlineStyles.catSelect}
-  >
-    <option value="">— No budget —</option>
-    <option value="__master_budget__">⬡ Master Budget</option>
-    {budgets.map(b => <option key={b.budgetId} value={b.budgetId}>{b.name}</option>)}
-  </select>
-);
+}> = ({ txn, budgets, incomeSources, assigningId, onAssign }) => {
+  // Income sentinel budgetIds are managed via IncomeSourceModal, not the dropdown
+  const isIncomeSentinel = txn.budgetId?.startsWith('__income__');
+
+  return (
+    <select
+      value={isIncomeSentinel ? '__master_budget__' : (txn.budgetId || '')}
+      disabled={assigningId === txn.dateTransactionId}
+      onChange={e => onAssign(txn, e.target.value)}
+      style={inlineStyles.catSelect}
+    >
+      <option value="">— No budget —</option>
+      <option value="__master_budget__">⬡ Master Budget</option>
+      {budgets.map(b => <option key={b.budgetId} value={b.budgetId}>{b.name}</option>)}
+    </select>
+  );
+};
 
 // ── PFC → Category modal ──────────────────────────────────────────────────────
 const PFC_COLORS = [
@@ -336,7 +343,7 @@ const PfcCategoryModal: React.FC<PfcModalProps> = ({
   const ruleDisabled = !catReady;
 
   return (
-    <div style={modalStyles.overlay} onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
+    <div style={modalStyles.overlay}>
       <div style={modalStyles.box}>
         <div style={modalStyles.header}>
           <span style={modalStyles.title}>Assign Category?</span>
@@ -714,7 +721,7 @@ const AccountFilterDropdown: React.FC<{
         Filter Accounts ({totalSelected})
       </button>
       {isOpen && (
-        <div style={modalStyles.overlay} onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
+        <div style={modalStyles.overlay}>
           <div style={{ ...modalStyles.box, maxWidth: 380 }}>
             <div style={modalStyles.header}>
               <span style={modalStyles.title}>Filter Accounts ({totalSelected})</span>
@@ -857,7 +864,7 @@ const AddTransactionModal: React.FC<AddTxnModalProps> = ({
   };
 
   return (
-    <div style={modalStyles.overlay} onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
+    <div style={modalStyles.overlay}>
       <div style={{ ...modalStyles.box, maxWidth: 420 }}>
         <div style={modalStyles.header}>
           <span style={modalStyles.title}>{initial ? 'Edit Transaction' : 'Add Transaction'}</span>
@@ -920,7 +927,7 @@ const addTxnStyles: Record<string, React.CSSProperties> = {
 
 // ── Transactions page ─────────────────────────────────────────────────────────
 const TransactionsPage: React.FC = () => {
-  const { accounts, categories, setCategories, budgets, rules, setRules,
+  const { accounts, categories, setCategories, budgets, rules, setRules, incomeSources,
           txnRange, setTxnRange, txnSortKey, setTxnSortKey, txnSortDir, setTxnSortDir } = useData();
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [selectedAccounts, setSelectedAccounts] = useState<Set<string>>(new Set());
@@ -949,6 +956,7 @@ const TransactionsPage: React.FC = () => {
   const [pfcModal, setPfcModal] = useState<{ txn: Transaction; label: string } | null>(null);
   const [addTxnModal, setAddTxnModal] = useState<{ txn?: Transaction } | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [incomeModal, setIncomeModal] = useState<Transaction | null>(null);
 
   const toggleDetail = (id: string) =>
     setDetailId(prev => prev === id ? null : id);
@@ -965,6 +973,8 @@ const TransactionsPage: React.FC = () => {
         return { startDate: isoDate(new Date(now.getFullYear(), now.getMonth(), now.getDate() - 59)), endDate: today };
       case 'last90':
         return { startDate: isoDate(new Date(now.getFullYear(), now.getMonth(), now.getDate() - 89)), endDate: today };
+      case 'last6months':
+        return { startDate: isoDate(new Date(now.getFullYear(), now.getMonth() - 6, now.getDate())), endDate: today };
       case 'currentMonth':
         return {
           startDate: isoDate(new Date(now.getFullYear(), now.getMonth(), 1)),
@@ -983,6 +993,7 @@ const TransactionsPage: React.FC = () => {
     { value: 'last30',       label: 'Last 30 days' },
     { value: 'last60',       label: 'Last 60 days' },
     { value: 'last90',       label: 'Last 90 days' },
+    { value: 'last6months',  label: 'Last 6 months' },
     { value: 'currentYear',  label: 'Current year' },
   ];
 
@@ -999,6 +1010,17 @@ const TransactionsPage: React.FC = () => {
   useEffect(() => { load(); }, [load]);
 
   const assignCategory = async (txn: Transaction, categoryId: string) => {
+    // If the user picks the Income category, open the income source modal first
+    if (categoryId === INCOME_CATEGORY_ID) {
+      setAssigningId(null);
+      setIncomeModal(txn);
+      // Still set the category optimistically so the dropdown reflects it
+      await updateTransactionCategory(txn.accountId, txn.dateTransactionId, categoryId);
+      setTransactions(prev => prev.map(t =>
+        t.dateTransactionId === txn.dateTransactionId ? { ...t, customCategory: categoryId } : t
+      ));
+      return;
+    }
     setAssigningId(txn.dateTransactionId);
     try {
       await updateTransactionCategory(txn.accountId, txn.dateTransactionId, categoryId);
@@ -1144,6 +1166,37 @@ const TransactionsPage: React.FC = () => {
           onSave={handleSaveManualTxn}
         />
       )}
+      {incomeModal && (() => {
+        // Build map of incomeSourceId -> existing income rule for pre-population
+        const incomeRulesBySourceId: Record<string, Rule> = {};
+        for (const rule of rules) {
+          if (rule.incomeSourceId) incomeRulesBySourceId[rule.incomeSourceId] = rule;
+        }
+        return (
+          <IncomeSourceModal
+            transaction={incomeModal}
+            incomeSources={incomeSources}
+            incomeRulesBySourceId={incomeRulesBySourceId}
+            onClose={() => setIncomeModal(null)}
+            onConfirm={(sourceId, budgetId, rule) => {
+              if (budgetId) {
+                setTransactions(prev => prev.map(t =>
+                  t.dateTransactionId === incomeModal.dateTransactionId
+                    ? { ...t, budgetId, manualBudget: true }
+                    : t
+                ));
+              }
+              if (rule) {
+                setRules(prev => {
+                  const without = prev.filter(r => r.ruleId !== rule.ruleId);
+                  return [...without, rule];
+                });
+              }
+              setIncomeModal(null);
+            }}
+          />
+        );
+      })()}
       {error && <div style={inlineStyles.error}>{error}</div>}
       {applyMsg && <div style={inlineStyles.success}>{applyMsg}</div>}
 
@@ -1246,7 +1299,7 @@ const TransactionsPage: React.FC = () => {
                         {txn.splits && txn.splits.length > 0 ? (
                           <span style={{ fontSize: '0.8rem', color: '#718096', fontStyle: 'italic' }}>per split</span>
                         ) : (
-                          <BudgetSelect txn={txn} budgets={budgets} assigningId={assigningBudgetId} onAssign={assignBudget} />
+                          <BudgetSelect txn={txn} budgets={budgets} incomeSources={incomeSources} assigningId={assigningBudgetId} onAssign={assignBudget} />
                         )}
                       </div>
                     </td>
@@ -1363,7 +1416,7 @@ const TransactionsPage: React.FC = () => {
                     <>
                       <CatSelect txn={txn} categories={categories} assigningId={assigningId} onAssign={assignCategory} />
                       <div style={{ marginTop: '0.4rem' }}>
-                        <BudgetSelect txn={txn} budgets={budgets} assigningId={assigningBudgetId} onAssign={assignBudget} />
+                        <BudgetSelect txn={txn} budgets={budgets} incomeSources={incomeSources} assigningId={assigningBudgetId} onAssign={assignBudget} />
                       </div>
                     </>
                   )}

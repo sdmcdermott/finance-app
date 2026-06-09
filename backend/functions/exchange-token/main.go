@@ -11,7 +11,6 @@ import (
 	"github.com/aws/aws-lambda-go/lambda"
 	auth "github.com/smcdermott/finance-app/internal/auth"
 	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	plaid "github.com/plaid/plaid-go/v42/plaid"
 	dbpkg "github.com/smcdermott/finance-app/internal/db"
 	plaidclient "github.com/smcdermott/finance-app/internal/plaid"
@@ -64,7 +63,7 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response,
 	if err != nil {
 		return errorResponse(http.StatusInternalServerError, err.Error()), nil
 	}
-	_ = dynamodb.NewFromConfig(awsCfg) // ensure SDK is linked
+	_ = awsCfg // used implicitly by dbpkg.New
 
 	dbClient, err := dbpkg.New(ctx)
 	if err != nil {
@@ -74,11 +73,22 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response,
 	userID := plaidclient.UserID()
 	var savedAccounts []dbpkg.Account
 
+	// Persist the access token in its own PlaidItem record — separate from accounts
+	// so that deleting an account never loses the token.
+	plaidItem := dbpkg.PlaidItem{
+		UserID:      userID,
+		ItemID:      itemID,
+		AccessToken: accessToken,
+		Institution: body.InstitutionName,
+	}
+	if err := dbClient.PutPlaidItem(ctx, plaidItem); err != nil {
+		return errorResponse(http.StatusInternalServerError, fmt.Sprintf("failed to save plaid item: %v", err)), nil
+	}
+
 	for _, acct := range accountsResp.GetAccounts() {
 		record := dbpkg.Account{
 			UserID:      userID,
 			AccountID:   acct.GetAccountId(),
-			AccessToken: accessToken,
 			ItemID:      itemID,
 			Institution: body.InstitutionName,
 			Name:        acct.GetName(),
