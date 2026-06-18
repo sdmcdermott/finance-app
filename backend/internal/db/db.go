@@ -17,9 +17,11 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -33,16 +35,16 @@ import (
 
 // ── Key helpers ───────────────────────────────────────────────────────────────
 
-func userPK(userID string) string         { return "USER#" + userID }
-func accountSK(accountID string) string   { return "ACCOUNT#" + accountID }
-func itemSK(itemID string) string         { return "ITEM#" + itemID }
-func categorySK(categoryID string) string { return "CATEGORY#" + categoryID }
-func ruleSK(ruleID string) string         { return "RULE#" + ruleID }
-func budgetSK(budgetID string) string        { return "BUDGET#" + budgetID }
-func budgetPK(budgetID string) string        { return "BUDGET#" + budgetID }
-func periodSK(startDate string) string       { return "PERIOD#" + startDate }
-func accountPK(accountID string) string      { return "ACCOUNT#" + accountID }
-func incomeSourceSK(sourceID string) string  { return "INCOME#" + sourceID }
+func userPK(userID string) string           { return "USER#" + userID }
+func accountSK(accountID string) string     { return "ACCOUNT#" + accountID }
+func itemSK(itemID string) string           { return "ITEM#" + itemID }
+func categorySK(categoryID string) string   { return "CATEGORY#" + categoryID }
+func ruleSK(ruleID string) string           { return "RULE#" + ruleID }
+func budgetSK(budgetID string) string       { return "BUDGET#" + budgetID }
+func budgetPK(budgetID string) string       { return "BUDGET#" + budgetID }
+func periodSK(startDate string) string      { return "PERIOD#" + startDate }
+func accountPK(accountID string) string     { return "ACCOUNT#" + accountID }
+func incomeSourceSK(sourceID string) string { return "INCOME#" + sourceID }
 
 // masterBudgetLegacySK is the SK for the pre-versioning singleton master budget record.
 // New versioned records use masterBudgetVersionSK(effectiveDate) instead.
@@ -90,7 +92,9 @@ type Account struct {
 	LastSynced  time.Time `dynamodbav:"lastSynced"  json:"lastSynced"`
 	// Enabled: false means skip this account during transaction sync and filter its txns from results.
 	// Defaults to true for new accounts; omitempty means absence == true in legacy records.
-	Enabled     *bool     `dynamodbav:"enabled,omitempty" json:"enabled"`
+	Enabled *bool `dynamodbav:"enabled,omitempty"  json:"enabled"`
+	// NickName is an optional user-supplied display name that overrides the Plaid-provided Name.
+	NickName string `dynamodbav:"nickName,omitempty" json:"nickName,omitempty"`
 }
 
 // PlaidItem holds the Plaid access token for a linked institution.
@@ -117,6 +121,19 @@ type Category struct {
 	Color      string `dynamodbav:"color"      json:"color"`
 }
 
+// TransactionLocation holds physical location data sourced from Plaid.
+// All fields are optional; the struct is omitted when Plaid returns no location data.
+// Only persisted when at least one of address/city/region/postalCode is non-empty.
+type TransactionLocation struct {
+	Address    string   `dynamodbav:"address,omitempty"    json:"address,omitempty"`
+	City       string   `dynamodbav:"city,omitempty"       json:"city,omitempty"`
+	Region     string   `dynamodbav:"region,omitempty"     json:"region,omitempty"`
+	PostalCode string   `dynamodbav:"postalCode,omitempty" json:"postalCode,omitempty"`
+	Country    string   `dynamodbav:"country,omitempty"    json:"country,omitempty"`
+	Lat        *float64 `dynamodbav:"lat,omitempty"        json:"lat,omitempty"`
+	Lon        *float64 `dynamodbav:"lon,omitempty"        json:"lon,omitempty"`
+}
+
 // Transaction is a single financial transaction.
 type Transaction struct {
 	PK string `dynamodbav:"pk" json:"-"`
@@ -139,13 +156,17 @@ type Transaction struct {
 	// Manual reference link (e.g. Amazon order URL)
 	ReferenceURL  string `dynamodbav:"referenceUrl"  json:"referenceUrl"`
 	ReferenceNote string `dynamodbav:"referenceNote" json:"referenceNote"`
+	// CustomName is an optional user-supplied display name that overrides MerchantName/Name.
+	CustomName string `dynamodbav:"customName,omitempty" json:"customName,omitempty"`
 	// Extra fields sourced from Plaid at sync time
-	OriginalDescription      string `dynamodbav:"originalDescription"      json:"originalDescription,omitempty"`
-	AuthorizedDate           string `dynamodbav:"authorizedDate"           json:"authorizedDate,omitempty"`
-	PaymentChannel           string `dynamodbav:"paymentChannel"           json:"paymentChannel,omitempty"`
-	PersonalFinancePrimary   string `dynamodbav:"personalFinancePrimary"   json:"personalFinancePrimary,omitempty"`
-	PersonalFinanceDetailed  string `dynamodbav:"personalFinanceDetailed"  json:"personalFinanceDetailed,omitempty"`
-	LogoURL                  string `dynamodbav:"logoUrl"                  json:"logoUrl,omitempty"`
+	OriginalDescription     string `dynamodbav:"originalDescription"      json:"originalDescription,omitempty"`
+	AuthorizedDate          string `dynamodbav:"authorizedDate"           json:"authorizedDate,omitempty"`
+	PaymentChannel          string `dynamodbav:"paymentChannel"           json:"paymentChannel,omitempty"`
+	PersonalFinancePrimary  string `dynamodbav:"personalFinancePrimary"   json:"personalFinancePrimary,omitempty"`
+	PersonalFinanceDetailed string `dynamodbav:"personalFinanceDetailed"  json:"personalFinanceDetailed,omitempty"`
+	LogoURL                 string `dynamodbav:"logoUrl"                  json:"logoUrl,omitempty"`
+	// Location is physical location data from Plaid. Nil for online/unlocated transactions.
+	Location *TransactionLocation `dynamodbav:"location,omitempty" json:"location,omitempty"`
 	// Splits — populated on read, not stored on the transaction item itself.
 	Splits []TransactionSplit `dynamodbav:"-" json:"splits,omitempty"`
 }
@@ -184,12 +205,12 @@ type Budget struct {
 	PeriodFormat string `dynamodbav:"periodFormat" json:"periodFormat"` // user-configured label template
 
 	// Goal-type fields
-	GoalAmount          float64 `dynamodbav:"goalAmount"          json:"goalAmount"`
-	GoalDirection       string  `dynamodbav:"goalDirection"       json:"goalDirection"`       // "limit" | "target"
+	GoalAmount    float64 `dynamodbav:"goalAmount"          json:"goalAmount"`
+	GoalDirection string  `dynamodbav:"goalDirection"       json:"goalDirection"` // "limit" | "target"
 	// MasterBudgetAmount: the portion of GoalAmount set by the master budget link.
 	// GoalAmount = MasterBudgetAmount + any user-specified additional amount.
 	// Zero/absent means this budget is not linked to a master budget bucket.
-	MasterBudgetAmount  float64 `dynamodbav:"masterBudgetAmount,omitempty" json:"masterBudgetAmount,omitempty"`
+	MasterBudgetAmount float64 `dynamodbav:"masterBudgetAmount,omitempty" json:"masterBudgetAmount,omitempty"`
 
 	// Surplus/shortfall handling
 	SurplusHandling  string  `dynamodbav:"surplusHandling"  json:"surplusHandling"`  // "ignore"|"rollover"|"transfer"
@@ -210,20 +231,20 @@ type MBIncomeSource struct {
 	Enabled         bool    `dynamodbav:"enabled"                   json:"enabled"`
 	LinkedBudgetID  string  `dynamodbav:"linkedBudgetId,omitempty"  json:"linkedBudgetId,omitempty"`
 	// IncomeRuleID: points to a Rule record used to match paycheck deposit transactions.
-	IncomeRuleID   string  `dynamodbav:"incomeRuleId,omitempty"    json:"incomeRuleId,omitempty"`
+	IncomeRuleID string `dynamodbav:"incomeRuleId,omitempty"    json:"incomeRuleId,omitempty"`
 }
 
 // MBFixedCost is a recurring expense deducted before discretionary allocation.
 type MBFixedCost struct {
-	ID        string  `dynamodbav:"id"        json:"id"`
-	Name      string  `dynamodbav:"name"      json:"name"`
-	Amount    float64 `dynamodbav:"amount"    json:"amount"`
+	ID     string  `dynamodbav:"id"        json:"id"`
+	Name   string  `dynamodbav:"name"      json:"name"`
+	Amount float64 `dynamodbav:"amount"    json:"amount"`
 	// Frequency mirrors IncomeSource.Frequency
-	Frequency string  `dynamodbav:"frequency" json:"frequency"`
+	Frequency string `dynamodbav:"frequency" json:"frequency"`
 	// RuleID: if non-empty, this cost was created from a suggested rule
-	RuleID    string  `dynamodbav:"ruleId,omitempty" json:"ruleId,omitempty"`
+	RuleID string `dynamodbav:"ruleId,omitempty" json:"ruleId,omitempty"`
 	// FromTxn: if true, this cost was manually assigned via budgetId=MASTER_BUDGET_ID on a transaction
-	FromTxn   bool    `dynamodbav:"fromTxn,omitempty" json:"fromTxn,omitempty"`
+	FromTxn bool `dynamodbav:"fromTxn,omitempty" json:"fromTxn,omitempty"`
 	// LinkedBudgetID: optional checkbook budget that tracks actual spend vs. this expected amount
 	LinkedBudgetID string `dynamodbav:"linkedBudgetId,omitempty" json:"linkedBudgetId,omitempty"`
 }
@@ -231,20 +252,20 @@ type MBFixedCost struct {
 // MBBucket is a discretionary spending allocation linked optionally to a Budget.
 // Exactly one of AmountMonthly or Percent should be non-zero (except when AmountType is "remaining").
 type MBBucket struct {
-	ID            string  `dynamodbav:"id"            json:"id"`
-	Name          string  `dynamodbav:"name"          json:"name"`
+	ID   string `dynamodbav:"id"            json:"id"`
+	Name string `dynamodbav:"name"          json:"name"`
 	// AmountMonthly: fixed monthly dollar amount (0 = use Percent instead)
 	AmountMonthly float64 `dynamodbav:"amountMonthly" json:"amountMonthly"`
 	// Percent: fraction of discretionary remainder (0.0–1.0, 0 = use AmountMonthly)
-	Percent       float64 `dynamodbav:"percent"       json:"percent"`
+	Percent float64 `dynamodbav:"percent"       json:"percent"`
 	// AmountType: explicit allocation mode — "fixed", "percent", or "remaining".
 	// "remaining" means this bucket receives whatever discretionary income is left after all other buckets.
 	// If empty, infer from Percent (> 0 → "percent", else → "fixed") for backwards compatibility.
-	AmountType    string  `dynamodbav:"amountType,omitempty"    json:"amountType,omitempty"`
+	AmountType string `dynamodbav:"amountType,omitempty"    json:"amountType,omitempty"`
 	// LinkedBudgetID: optional budget to push this allocation to
 	LinkedBudgetID string `dynamodbav:"linkedBudgetId,omitempty" json:"linkedBudgetId,omitempty"`
 	// LinkType: "goal" (set goalAmount) or "credit" (set openingBalance / transfer credit)
-	LinkType      string  `dynamodbav:"linkType,omitempty"      json:"linkType,omitempty"`
+	LinkType string `dynamodbav:"linkType,omitempty"      json:"linkType,omitempty"`
 }
 
 // MasterBudget is a singleton per user that models total monthly cash flow.
@@ -252,10 +273,10 @@ type MasterBudget struct {
 	PK string `dynamodbav:"pk" json:"-"`
 	SK string `dynamodbav:"sk" json:"-"`
 
-	UserID        string           `dynamodbav:"userId"        json:"userId"`
+	UserID string `dynamodbav:"userId"        json:"userId"`
 	// EffectiveDate is the first day this version of the master budget applies (YYYY-MM-DD).
 	// Empty means this is the legacy pre-versioning singleton (treated as the oldest version).
-	EffectiveDate string           `dynamodbav:"effectiveDate,omitempty" json:"effectiveDate,omitempty"`
+	EffectiveDate string `dynamodbav:"effectiveDate,omitempty" json:"effectiveDate,omitempty"`
 	// Label is an optional user-supplied name for the version, e.g. "2026 salary increase".
 	Label         string           `dynamodbav:"label,omitempty"         json:"label,omitempty"`
 	IncomeSources []MBIncomeSource `dynamodbav:"incomeSources"           json:"incomeSources"`
@@ -287,9 +308,15 @@ func (c *Client) GetMasterBudgets(ctx context.Context, userID string) ([]MasterB
 	}
 	// Normalise nil slices to empty so callers can range without nil checks.
 	for i := range versions {
-		if versions[i].IncomeSources == nil { versions[i].IncomeSources = []MBIncomeSource{} }
-		if versions[i].FixedCosts    == nil { versions[i].FixedCosts    = []MBFixedCost{} }
-		if versions[i].Buckets       == nil { versions[i].Buckets       = []MBBucket{} }
+		if versions[i].IncomeSources == nil {
+			versions[i].IncomeSources = []MBIncomeSource{}
+		}
+		if versions[i].FixedCosts == nil {
+			versions[i].FixedCosts = []MBFixedCost{}
+		}
+		if versions[i].Buckets == nil {
+			versions[i].Buckets = []MBBucket{}
+		}
 	}
 	return versions, nil
 }
@@ -371,6 +398,7 @@ func (c *Client) DeleteMasterBudgetVersion(ctx context.Context, userID, effectiv
 	})
 	return err
 }
+
 type DeductionItem struct {
 	Name   string  `dynamodbav:"name"   json:"name"`
 	Amount float64 `dynamodbav:"amount" json:"amount"`
@@ -398,27 +426,27 @@ type IncomeSource struct {
 	//   not FICA.
 	// PreTaxDeductions is kept for backward compatibility; when both new fields
 	// are zero and PreTaxDeductions is non-zero, it is treated as Section 125.
-	Section125Deductions  float64         `dynamodbav:"section125Deductions"  json:"section125Deductions"`
-	Section125Items       []DeductionItem `dynamodbav:"section125Items,omitempty" json:"section125Items,omitempty"`
-	RetirementDeductions  float64         `dynamodbav:"retirementDeductions"  json:"retirementDeductions"`
-	RetirementItems       []DeductionItem `dynamodbav:"retirementItems,omitempty" json:"retirementItems,omitempty"`
-	PreTaxDeductions      float64 `dynamodbav:"preTaxDeductions"      json:"preTaxDeductions"` // legacy
+	Section125Deductions float64         `dynamodbav:"section125Deductions"  json:"section125Deductions"`
+	Section125Items      []DeductionItem `dynamodbav:"section125Items,omitempty" json:"section125Items,omitempty"`
+	RetirementDeductions float64         `dynamodbav:"retirementDeductions"  json:"retirementDeductions"`
+	RetirementItems      []DeductionItem `dynamodbav:"retirementItems,omitempty" json:"retirementItems,omitempty"`
+	PreTaxDeductions     float64         `dynamodbav:"preTaxDeductions"      json:"preTaxDeductions"` // legacy
 	// Flat additional federal withholding per period (W-4 line 4c)
 	AdditionalWithholding float64 `dynamodbav:"additionalWithholding" json:"additionalWithholding"`
 	// DeductionType: "standard" | "itemized"
-	DeductionType      string          `dynamodbav:"deductionType"      json:"deductionType"`
+	DeductionType string `dynamodbav:"deductionType"      json:"deductionType"`
 	// ItemizedDeductions is the annual total when DeductionType is "itemized"
-	ItemizedDeductions      float64         `dynamodbav:"itemizedDeductions"      json:"itemizedDeductions"`
-	ItemizedDeductionItems  []DeductionItem `dynamodbav:"itemizedDeductionItems,omitempty" json:"itemizedDeductionItems,omitempty"`
+	ItemizedDeductions     float64         `dynamodbav:"itemizedDeductions"      json:"itemizedDeductions"`
+	ItemizedDeductionItems []DeductionItem `dynamodbav:"itemizedDeductionItems,omitempty" json:"itemizedDeductionItems,omitempty"`
 	// W-4 Step 3: total dependent/child tax credits (annual dollar amount)
-	Step3Credits       float64 `dynamodbav:"step3Credits"       json:"step3Credits"`
+	Step3Credits float64 `dynamodbav:"step3Credits"       json:"step3Credits"`
 	// W-4 Step 4a: other annual income not from jobs (interest, dividends, etc.)
-	Step4aOtherIncome  float64         `dynamodbav:"step4aOtherIncome"  json:"step4aOtherIncome"`
-	Step4aItems        []DeductionItem `dynamodbav:"step4aItems,omitempty" json:"step4aItems,omitempty"`
+	Step4aOtherIncome float64         `dynamodbav:"step4aOtherIncome"  json:"step4aOtherIncome"`
+	Step4aItems       []DeductionItem `dynamodbav:"step4aItems,omitempty" json:"step4aItems,omitempty"`
 	// W-4 Step 4b: additional annual deductions (student loan, IRA, etc.)
-	Step4bDeductions   float64         `dynamodbav:"step4bDeductions"   json:"step4bDeductions"`
-	Step4bItems        []DeductionItem `dynamodbav:"step4bItems,omitempty" json:"step4bItems,omitempty"`
-	IsActive             bool    `dynamodbav:"isActive"             json:"isActive"`
+	Step4bDeductions float64         `dynamodbav:"step4bDeductions"   json:"step4bDeductions"`
+	Step4bItems      []DeductionItem `dynamodbav:"step4bItems,omitempty" json:"step4bItems,omitempty"`
+	IsActive         bool            `dynamodbav:"isActive"             json:"isActive"`
 	// LastNetPay is the most recently computed net pay breakdown. Stored so it
 	// survives page reloads without requiring another payrolltax API call.
 	LastNetPay *NetPayResult `dynamodbav:"lastNetPay,omitempty" json:"lastNetPay,omitempty"`
@@ -557,6 +585,28 @@ func (c *Client) UpdateAccountEnabled(ctx context.Context, userID, accountID str
 	return err
 }
 
+// UpdateAccountNickName sets or clears the user-supplied friendly name for an account.
+// Passing an empty string removes the attribute so the Plaid name shows instead.
+func (c *Client) UpdateAccountNickName(ctx context.Context, userID, accountID, nickName string) error {
+	input := &dynamodb.UpdateItemInput{
+		TableName: &c.table,
+		Key: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: userPK(userID)},
+			"sk": &types.AttributeValueMemberS{Value: accountSK(accountID)},
+		},
+	}
+	if nickName == "" {
+		input.UpdateExpression = aws.String("REMOVE nickName")
+	} else {
+		input.UpdateExpression = aws.String("SET nickName = :v")
+		input.ExpressionAttributeValues = map[string]types.AttributeValue{
+			":v": &types.AttributeValueMemberS{Value: nickName},
+		}
+	}
+	_, err := c.ddb.UpdateItem(ctx, input)
+	return err
+}
+
 // PutPlaidItem upserts a PlaidItem (access token + institution) keyed by itemId.
 func (c *Client) PutPlaidItem(ctx context.Context, item PlaidItem) error {
 	item.PK = userPK(item.UserID)
@@ -690,6 +740,84 @@ func (c *Client) DeleteTransaction(ctx context.Context, accountID, date, txnID s
 	return c.DeleteTransactions(ctx, accountID, []struct{ Date, TxnID string }{{date, txnID}})
 }
 
+// DeleteTransactionsByPlaidIDs finds and deletes transaction records whose
+// TransactionID (raw Plaid ID) is in plaidIDs, searching across all provided
+// accountIDs. It is used during sync to remove orphaned pending records when
+// Plaid reports them as removed (pending→posted transitions). Returns the
+// number of records actually deleted.
+func (c *Client) DeleteTransactionsByPlaidIDs(ctx context.Context, accountIDs []string, plaidIDs map[string]bool) (int, error) {
+	if len(plaidIDs) == 0 || len(accountIDs) == 0 {
+		return 0, nil
+	}
+
+	type deleteKey struct{ pk, sk string }
+	var toDelete []deleteKey
+
+	for _, accountID := range accountIDs {
+		var lastKey map[string]types.AttributeValue
+		for {
+			qInput := &dynamodb.QueryInput{
+				TableName:              &c.table,
+				KeyConditionExpression: aws.String("pk = :pk AND begins_with(sk, :prefix)"),
+				ExpressionAttributeValues: map[string]types.AttributeValue{
+					":pk":     &types.AttributeValueMemberS{Value: accountPK(accountID)},
+					":prefix": &types.AttributeValueMemberS{Value: "TXN#"},
+				},
+			}
+			if lastKey != nil {
+				qInput.ExclusiveStartKey = lastKey
+			}
+			out, err := c.ddb.Query(ctx, qInput)
+			if err != nil {
+				return 0, fmt.Errorf("query account %s for removals: %w", accountID, err)
+			}
+			var txns []Transaction
+			if err := attributevalue.UnmarshalListOfMaps(out.Items, &txns); err != nil {
+				return 0, fmt.Errorf("unmarshal transactions for account %s: %w", accountID, err)
+			}
+			for _, t := range txns {
+				if plaidIDs[t.TransactionID] {
+					toDelete = append(toDelete, deleteKey{t.PK, t.SK})
+				}
+			}
+			if out.LastEvaluatedKey == nil {
+				break
+			}
+			lastKey = out.LastEvaluatedKey
+		}
+	}
+
+	if len(toDelete) == 0 {
+		return 0, nil
+	}
+
+	const batchSize = 25
+	for i := 0; i < len(toDelete); i += batchSize {
+		end := i + batchSize
+		if end > len(toDelete) {
+			end = len(toDelete)
+		}
+		var reqs []types.WriteRequest
+		for _, k := range toDelete[i:end] {
+			reqs = append(reqs, types.WriteRequest{
+				DeleteRequest: &types.DeleteRequest{
+					Key: map[string]types.AttributeValue{
+						"pk": &types.AttributeValueMemberS{Value: k.pk},
+						"sk": &types.AttributeValueMemberS{Value: k.sk},
+					},
+				},
+			})
+		}
+		if _, err := c.ddb.BatchWriteItem(ctx, &dynamodb.BatchWriteItemInput{
+			RequestItems: map[string][]types.WriteRequest{c.table: reqs},
+		}); err != nil {
+			return 0, fmt.Errorf("batch delete removed transactions: %w", err)
+		}
+	}
+
+	return len(toDelete), nil
+}
+
 // GetTransactions returns transactions for an account between startDate and endDate (YYYY-MM-DD).
 func (c *Client) GetTransactions(ctx context.Context, accountID, startDate, endDate string) ([]Transaction, error) {
 	out, err := c.ddb.Query(ctx, &dynamodb.QueryInput{
@@ -722,6 +850,90 @@ const IncomeBudgetPrefix = "__income__"
 // It is never stored in DynamoDB — it is injected by get-categories at query time.
 const BuiltinIncomeCategoryID = "__builtin_income__"
 
+// ── Transaction name normalization ────────────────────────────────────────────
+
+// Compiled patterns for noise stripping in normalizeTxnName.
+var (
+	reRef        = regexp.MustCompile(`(?i)REF\s*#?\s*[A-Z0-9]+`)
+	rePOSCode    = regexp.MustCompile(`\*[A-Z0-9]{5,}`)
+	reLongAlnum  = regexp.MustCompile(`\b[A-Z0-9]{10,}\b`)
+	reLongDigits = regexp.MustCompile(`\b\d{6,}\b`)
+	reSpaces     = regexp.MustCompile(`\s{2,}`)
+)
+
+// normalizeTxnName strips common noise from a transaction name: reference codes,
+// POS terminal identifiers, long alphanumeric blobs, and long digit sequences.
+// The result is trimmed and has internal runs of whitespace collapsed.
+func normalizeTxnName(s string) string {
+	s = reRef.ReplaceAllString(s, " ")
+	s = rePOSCode.ReplaceAllString(s, " ")
+	s = reLongAlnum.ReplaceAllString(s, " ")
+	s = reLongDigits.ReplaceAllString(s, " ")
+	s = reSpaces.ReplaceAllString(s, " ")
+	return strings.TrimSpace(s)
+}
+
+// boilerplateTokens is the set of common words dropped from significant-token analysis.
+var boilerplateTokens = map[string]bool{
+	"the": true, "and": true, "a": true, "an": true, "of": true,
+	"at": true, "in": true, "for": true, "to": true, "on": true,
+	"llc": true, "inc": true, "corp": true, "co": true,
+	"com": true, "www": true, "http": true, "https": true,
+}
+
+// reAlnum matches strings that contain both letters and digits (mixed codes).
+var reAlnum = regexp.MustCompile(`[0-9]`)
+
+// significantTokens splits a normalized name into lowercase tokens and returns
+// only those that are "meaningful": ≥3 chars, not pure-numeric, not mixed
+// alphanumeric codes, and not boilerplate words.
+func significantTokens(s string) map[string]bool {
+	// Split on whitespace and common punctuation
+	fields := regexp.MustCompile(`[\s\.\,\-\/\(\)\&\+]+`).Split(s, -1)
+	out := make(map[string]bool)
+	for _, tok := range fields {
+		tok = strings.ToLower(strings.TrimSpace(tok))
+		if len(tok) <= 2 {
+			continue
+		}
+		if boilerplateTokens[tok] {
+			continue
+		}
+		// Drop tokens that contain any digit (POS codes, order IDs, etc.)
+		if reAlnum.MatchString(tok) {
+			continue
+		}
+		out[tok] = true
+	}
+	return out
+}
+
+// txnNamesMatch returns true when two merchant names refer to the same merchant.
+// Both names are normalized; then their significant-token sets must be identical
+// (set equality). This prevents false merges like "Uber Eats" vs "Uber Rides"
+// while still merging minor formatting variations of the same name.
+// Falls back to case-insensitive comparison of the normalized names when either
+// token set is empty (e.g. very short or all-boilerplate names).
+func txnNamesMatch(a, b string) bool {
+	na := normalizeTxnName(a)
+	nb := normalizeTxnName(b)
+	ta := significantTokens(na)
+	tb := significantTokens(nb)
+
+	if len(ta) == 0 || len(tb) == 0 {
+		return strings.EqualFold(na, nb)
+	}
+	if len(ta) != len(tb) {
+		return false
+	}
+	for tok := range ta {
+		if !tb[tok] {
+			return false
+		}
+	}
+	return true
+}
+
 // SuggestFixedCost is a candidate recurring cost derived from transaction history.
 type SuggestFixedCost struct {
 	Merchant    string   `json:"merchant"`
@@ -735,10 +947,10 @@ type SuggestFixedCost struct {
 
 // SuggestFixedCostsResult bundles suggestions with metadata about the data window.
 type SuggestFixedCostsResult struct {
-	Suggestions    []SuggestFixedCost `json:"suggestions"`
-	OldestDate     string             `json:"oldestDate"`     // YYYY-MM-DD of oldest transaction found
-	MonthsCovered  float64            `json:"monthsCovered"`  // actual span in months
-	FullWindow     bool               `json:"fullWindow"`     // true if >= 5.5 months available
+	Suggestions   []SuggestFixedCost `json:"suggestions"`
+	OldestDate    string             `json:"oldestDate"`    // YYYY-MM-DD of oldest transaction found
+	MonthsCovered float64            `json:"monthsCovered"` // actual span in months
+	FullWindow    bool               `json:"fullWindow"`    // true if >= 5.5 months available
 }
 
 // SuggestFixedCosts scans the past 6 months of transactions across all accounts,
@@ -803,12 +1015,19 @@ func (c *Client) SuggestFixedCosts(ctx context.Context, userID string) (*Suggest
 		if assigned[i] {
 			continue
 		}
-		merchant := t.MerchantName
-		if merchant == "" {
-			merchant = t.Name
+		rawMerchant := t.MerchantName
+		if rawMerchant == "" {
+			rawMerchant = t.Name
 		}
-		if merchant == "" {
+		if rawMerchant == "" {
 			continue
+		}
+		// Use the normalized, lowercased name as the cluster key and as the
+		// suggested rule pattern.  Fallback to the raw name if normalization
+		// strips everything (very short names).
+		merchant := strings.ToLower(normalizeTxnName(rawMerchant))
+		if merchant == "" {
+			merchant = strings.ToLower(rawMerchant)
 		}
 		date, _ := time.Parse("2006-01-02", t.Date)
 		dayI := date.Day()
@@ -825,7 +1044,7 @@ func (c *Client) SuggestFixedCosts(ctx context.Context, userID string) (*Suggest
 			if uMerchant == "" {
 				uMerchant = u.Name
 			}
-			if !strings.EqualFold(merchant, uMerchant) {
+			if !txnNamesMatch(rawMerchant, uMerchant) {
 				continue
 			}
 			uDate, _ := time.Parse("2006-01-02", u.Date)
@@ -837,7 +1056,7 @@ func (c *Client) SuggestFixedCosts(ctx context.Context, userID string) (*Suggest
 			if dayDiff > 15 {
 				dayDiff = 30 - dayDiff
 			}
-			if dayDiff > 1 {
+			if dayDiff > 3 {
 				continue
 			}
 			amtDiff := math.Abs(t.Amount) - math.Abs(u.Amount)
@@ -907,12 +1126,13 @@ func (c *Client) SuggestFixedCosts(ctx context.Context, userID string) (*Suggest
 // level ("high" or "low").
 //
 // The expected occurrence count for each frequency over a given window:
-//   monthly     → ~1× per month
-//   quarterly   → ~1× per 3 months
-//   biweekly    → ~2× per month
-//   weekly      → ~4× per month
-//   semimonthly → ~2× per month
-//   annually    → ~1× per 12 months
+//
+//	monthly     → ~1× per month
+//	quarterly   → ~1× per 3 months
+//	biweekly    → ~2× per month
+//	weekly      → ~4× per month
+//	semimonthly → ~2× per month
+//	annually    → ~1× per 12 months
 //
 // Confidence is "high" when the count is consistent with the inferred frequency
 // over the available window, and "low" when the window is too short to be sure.
@@ -977,6 +1197,10 @@ func (c *Client) UpdateTransactionCategory(ctx context.Context, accountID, date,
 }
 
 func (c *Client) UpdateTransactionBudget(ctx context.Context, accountID, date, txnID, budgetID string) error {
+
+	// Clear the manual flag if the budgetID is empty; otherwise set it to true.
+	manual := budgetID != ""
+
 	_, err := c.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName: &c.table,
 		Key: map[string]types.AttributeValue{
@@ -986,7 +1210,7 @@ func (c *Client) UpdateTransactionBudget(ctx context.Context, accountID, date, t
 		UpdateExpression: aws.String("SET budgetId = :b, manualBudget = :manual"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
 			":b":      &types.AttributeValueMemberS{Value: budgetID},
-			":manual": &types.AttributeValueMemberBOOL{Value: true},
+			":manual": &types.AttributeValueMemberBOOL{Value: manual},
 		},
 	})
 	return err
@@ -1006,6 +1230,61 @@ func (c *Client) UpdateTransactionReference(ctx context.Context, accountID, date
 		},
 	})
 	return err
+}
+
+// UpdateTransactionName sets or clears the user-supplied display name for a transaction.
+// Passing an empty string removes the attribute so merchantName/name shows instead.
+func (c *Client) UpdateTransactionName(ctx context.Context, accountID, date, txnID, customName string) error {
+	input := &dynamodb.UpdateItemInput{
+		TableName: &c.table,
+		Key: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: accountPK(accountID)},
+			"sk": &types.AttributeValueMemberS{Value: txnSK(date, txnID)},
+		},
+	}
+	if customName == "" {
+		input.UpdateExpression = aws.String("REMOVE customName")
+	} else {
+		input.UpdateExpression = aws.String("SET customName = :v")
+		input.ExpressionAttributeValues = map[string]types.AttributeValue{
+			":v": &types.AttributeValueMemberS{Value: customName},
+		}
+	}
+	_, err := c.ddb.UpdateItem(ctx, input)
+	return err
+}
+
+// UpdateTransactionLocation writes location data onto an existing transaction.
+// Uses attribute_not_exists(location) so it is a no-op when location is already
+// set — safe to call repeatedly during a backfill run.
+func (c *Client) UpdateTransactionLocation(ctx context.Context, accountID, date, txnID string, loc TransactionLocation) error {
+	locAV, err := attributevalue.Marshal(loc)
+	if err != nil {
+		return err
+	}
+	_, err = c.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: &c.table,
+		Key: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: accountPK(accountID)},
+			"sk": &types.AttributeValueMemberS{Value: txnSK(date, txnID)},
+		},
+		ConditionExpression: aws.String("attribute_not_exists(#loc)"),
+		UpdateExpression:    aws.String("SET #loc = :loc"),
+		ExpressionAttributeNames: map[string]string{
+			"#loc": "location",
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":loc": locAV,
+		},
+	})
+	if err != nil {
+		var ccfe *types.ConditionalCheckFailedException
+		if errors.As(err, &ccfe) {
+			return nil // already set — skip
+		}
+		return err
+	}
+	return nil
 }
 
 // ── Transaction Splits ────────────────────────────────────────────────────────
@@ -1287,9 +1566,15 @@ func ApplyRulesToTransactions(rules []Rule, txns []Transaction) []Transaction {
 			merchant = strings.ToLower(txn.Name)
 		}
 		for _, rule := range sorted {
+
+			// Stop early once both category and budget are resolved
+			if result[i].CustomCategory != "" && (result[i].BudgetID != "" || txn.ManualBudget) {
+				break
+			}
 			if !strings.Contains(merchant, strings.ToLower(rule.Pattern)) {
 				continue
 			}
+
 			// Optional amount filter
 			if rule.AmountMatch > 0 {
 				diff := math.Abs(math.Abs(txn.Amount) - rule.AmountMatch)
@@ -1297,6 +1582,7 @@ func ApplyRulesToTransactions(rules []Rule, txns []Transaction) []Transaction {
 					continue
 				}
 			}
+
 			// Optional day-of-month filter
 			if rule.DayOfMonth > 0 {
 				t, err := time.Parse("2006-01-02", txn.Date)
@@ -1316,16 +1602,20 @@ func ApplyRulesToTransactions(rules []Rule, txns []Transaction) []Transaction {
 					}
 				}
 			}
-			if rule.CategoryID != "" {
+			// Category: first matching rule with a category wins
+			if rule.CategoryID != "" && result[i].CustomCategory == "" {
 				result[i].CustomCategory = rule.CategoryID
 			}
-			if rule.BudgetID != "" && !txn.ManualBudget {
+			
+			// Budget: first matching rule with a budget wins (manual assignments protected)
+			if rule.BudgetID != "" && !txn.ManualBudget && result[i].BudgetID == "" {
+
 				result[i].BudgetID = rule.BudgetID
 				result[i].ManualBudget = true
 			}
-			break
 		}
 	}
+
 	return result
 }
 
@@ -1436,7 +1726,7 @@ func (c *Client) GetBudgetPeriodsByDateRange(ctx context.Context, budgetID, from
 			":from": &types.AttributeValueMemberS{Value: periodSK(fromDate)},
 			// Use the day before toDate so the range is exclusive at the upper bound.
 			// We filter precisely in Go below, but the key condition prunes most items.
-			":to":   &types.AttributeValueMemberS{Value: periodSK(toDate)},
+			":to": &types.AttributeValueMemberS{Value: periodSK(toDate)},
 		},
 		ScanIndexForward: aws.Bool(true), // oldest first
 	})

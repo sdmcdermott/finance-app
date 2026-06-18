@@ -7,14 +7,17 @@ package main
 // The user reviews the report in the UI and calls /import/amazon-csv/confirm
 // to persist the chosen matches.
 //
-// Expected CSV columns (Amazon Order History Report):
-//   "Order Date", "Order ID", "Order Total", "Title", "ASIN/ISBN",
-//   "Quantity", "Item Total", "Shipping Address Name", "Shipment Date",
-//   "Tracking Number", "Carrier Name & Tracking Number", "Subtotal",
-//   "Shipping Charge", "Tax Charged", "Total Charged", "Title"
+// Supported CSV formats:
 //
-// Only "Order Date", "Order ID", and "Total Charged" (or "Order Total") are
-// strictly required. Line items are grouped by Order ID.
+//  1. Amazon Order History Report (legacy export):
+//     "Order Date", "Order ID", "Order Total" / "Total Charged", "Title"
+//
+//  2. Amazon Order History Exporter Chrome extension:
+//     "orderId", "orderPlaced", "total", "itemTitles" (pipe-separated),
+//     "orderDetailsUrl", "shipmentStatus"
+//
+// Only Order ID, Order Date, and Amount columns are strictly required.
+// Multiple item titles in a single cell are split on "|".
 
 import (
 	"context"
@@ -45,7 +48,8 @@ type AmazonOrder struct {
 	OrderDate string   `json:"orderDate"` // YYYY-MM-DD
 	Amount    float64  `json:"amount"`    // total charged (dollars)
 	Titles    []string `json:"titles"`    // item titles
-	OrderURL  string   `json:"orderUrl"`  // deep link
+	OrderURL  string   `json:"orderUrl"`  // deep link to order details
+	Refunded  bool     `json:"refunded"`  // true when shipmentStatus contains "refund"
 }
 
 // MatchStatus indicates how confident the match is.
@@ -146,18 +150,20 @@ func parseCSV(data string) ([]AmazonOrder, error) {
 		return nil, fmt.Errorf("CSV has no data rows")
 	}
 
-	// Build column index map (case-insensitive)
+	// Build column index map (case-insensitive, strip spaces)
 	colIdx := make(map[string]int)
 	for i, h := range records[0] {
 		colIdx[strings.ToLower(strings.TrimSpace(h))] = i
 	}
 
-	// Required columns with fallbacks
-	orderIDCol := firstCol(colIdx, "order id", "order_id")
-	orderDateCol := firstCol(colIdx, "order date", "order_date")
-	// "Total Charged" is the actual charge; fall back to "Order Total"
-	amountCol := firstCol(colIdx, "total charged", "order total", "item total")
-	titleCol := firstCol(colIdx, "title", "product name", "item name")
+	// Required columns — support both legacy Amazon export and Chrome extension formats
+	orderIDCol   := firstCol(colIdx, "order id", "order_id", "orderid")
+	orderDateCol := firstCol(colIdx, "order date", "order_date", "orderplaced")
+	amountCol    := firstCol(colIdx, "total charged", "order total", "item total", "total")
+	titleCol     := firstCol(colIdx, "title", "product name", "item name", "itemtitles")
+	// Optional columns (Chrome extension)
+	orderURLCol  := firstCol(colIdx, "orderdetailsurl", "order details url", "order url")
+	statusCol    := firstCol(colIdx, "shipmentstatus", "shipment status")
 
 	if orderIDCol < 0 || orderDateCol < 0 || amountCol < 0 {
 		return nil, fmt.Errorf("required columns missing (need Order ID, Order Date, Total Charged/Order Total)")
@@ -165,13 +171,15 @@ func parseCSV(data string) ([]AmazonOrder, error) {
 
 	// Group rows by order ID
 	type orderAccum struct {
-		date   string
-		amount float64
-		titles []string
-		seen   bool
+		date     string
+		amount   float64
+		titles   []string
+		url      string
+		refunded bool
+		seen     bool
 	}
-	accum := make(map[string]*orderAccum)
-	orderSeq := []string{} // preserve order
+	accum    := make(map[string]*orderAccum)
+	orderSeq := []string{} // preserve original row order
 
 	for _, row := range records[1:] {
 		if len(row) <= orderIDCol {
@@ -183,13 +191,13 @@ func parseCSV(data string) ([]AmazonOrder, error) {
 		}
 
 		rawDate := ""
-		if orderDateCol >= 0 && orderDateCol < len(row) {
+		if orderDateCol < len(row) {
 			rawDate = strings.TrimSpace(row[orderDateCol])
 		}
 		date := normalizeDate(rawDate)
 
 		rawAmt := ""
-		if amountCol >= 0 && amountCol < len(row) {
+		if amountCol < len(row) {
 			rawAmt = strings.TrimSpace(row[amountCol])
 		}
 		amount := parseAmount(rawAmt)
@@ -197,6 +205,16 @@ func parseCSV(data string) ([]AmazonOrder, error) {
 		title := ""
 		if titleCol >= 0 && titleCol < len(row) {
 			title = strings.TrimSpace(row[titleCol])
+		}
+
+		rawURL := ""
+		if orderURLCol >= 0 && orderURLCol < len(row) {
+			rawURL = strings.TrimSpace(row[orderURLCol])
+		}
+
+		refunded := false
+		if statusCol >= 0 && statusCol < len(row) {
+			refunded = strings.Contains(strings.ToLower(row[statusCol]), "refund")
 		}
 
 		if _, exists := accum[orderID]; !exists {
@@ -207,14 +225,21 @@ func parseCSV(data string) ([]AmazonOrder, error) {
 		if !a.seen {
 			a.date = date
 			a.amount = amount
+			a.url = rawURL
+			a.refunded = refunded
 			a.seen = true
 		}
-		// If this row has a higher amount it's likely the "Total Charged" row
+		// If a later row has a higher amount it's likely the "Total Charged" row
 		if amount > a.amount {
 			a.amount = amount
 		}
+		// Split on "|" to handle Chrome extension format (all titles in one cell)
 		if title != "" {
-			a.titles = append(a.titles, title)
+			for _, part := range strings.Split(title, "|") {
+				if t := strings.TrimSpace(part); t != "" {
+					a.titles = append(a.titles, t)
+				}
+			}
 		}
 	}
 
@@ -224,12 +249,17 @@ func parseCSV(data string) ([]AmazonOrder, error) {
 		if a.amount <= 0 || a.date == "" {
 			continue
 		}
+		orderURL := a.url
+		if orderURL == "" {
+			orderURL = "https://www.amazon.com/gp/css/order-details?orderID=" + id
+		}
 		orders = append(orders, AmazonOrder{
 			OrderID:   id,
 			OrderDate: a.date,
 			Amount:    a.amount,
 			Titles:    a.titles,
-			OrderURL:  "https://www.amazon.com/gp/css/order-details?orderID=" + id,
+			OrderURL:  orderURL,
+			Refunded:  a.refunded,
 		})
 	}
 	return orders, nil

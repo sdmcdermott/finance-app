@@ -23,6 +23,12 @@ import {
   IAuthenticationCallback,
 } from 'amazon-cognito-identity-js';
 import { AUTH_DISABLED, userPool } from './cognitoPool';
+import {
+  clearActivity,
+  INACTIVITY_MS,
+  millisSinceActivity,
+  touchActivity,
+} from './sessionActivity';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -73,6 +79,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     if (!cognitoUser) { setLoading(false); return; }
     cognitoUser.getSession((err: Error | null, session: CognitoUserSession | null) => {
       if (err || !session?.isValid()) { setLoading(false); return; }
+      touchActivity();
       setIdToken(session.getIdToken().getJwtToken());
       setLoading(false);
     });
@@ -88,8 +95,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         const cognitoUser = new CognitoUser({ Username: email, Pool: userPool! });
         const authDetails = new AuthenticationDetails({ Username: email, Password: password });
 
-        const callbacks: IAuthenticationCallback = {
+        const         callbacks: IAuthenticationCallback = {
           onSuccess: (session: CognitoUserSession) => {
+            touchActivity();
             setIdToken(session.getIdToken().getJwtToken());
             setPendingUser(null);
             resolve({ type: 'success' });
@@ -135,6 +143,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         if (!pendingUser) { resolve({ type: 'error', message: 'No pending challenge' }); return; }
         pendingUser.completeNewPasswordChallenge(newPassword, {}, {
           onSuccess: (session: CognitoUserSession) => {
+            touchActivity();
             setIdToken(session.getIdToken().getJwtToken());
             setPendingUser(null);
             resolve({ type: 'success' });
@@ -164,6 +173,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         if (!pendingUser) { resolve({ type: 'error', message: 'No pending challenge' }); return; }
         pendingUser.sendMFACode(code, {
           onSuccess: (session: CognitoUserSession) => {
+            touchActivity();
             setIdToken(session.getIdToken().getJwtToken());
             setPendingUser(null);
             resolve({ type: 'success' });
@@ -197,9 +207,32 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       const cognitoUser = userPool!.getCurrentUser();
       cognitoUser?.signOut();
     }
+    clearActivity();
     setIdToken(null);
     setPendingUser(null);
   }, []);
+
+  // Inactivity guard: poll every 30 s while logged in. If the last successful
+  // API response was >1 hour ago (including across tab close/reopen via
+  // localStorage), force logout. The Axios response interceptor keeps
+  // touchActivity() current, so any API activity resets the clock.
+  useEffect(() => {
+    if (AUTH_DISABLED || !idToken) return;
+
+    // Immediate check on mount — catches stale sessions after tab reopen.
+    if (millisSinceActivity() > INACTIVITY_MS) {
+      logout();
+      return;
+    }
+
+    const timer = setInterval(() => {
+      if (millisSinceActivity() > INACTIVITY_MS) {
+        logout();
+      }
+    }, 30_000);
+
+    return () => clearInterval(timer);
+  }, [idToken, logout]);
 
   return (
     <AuthContext.Provider value={{ idToken, loading, login, completeNewPassword, verifyTotp, confirmTotpSetup, logout }}>

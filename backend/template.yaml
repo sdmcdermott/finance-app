@@ -84,13 +84,13 @@ Resources:
         - ALLOW_USER_PASSWORD_AUTH
         - ALLOW_REFRESH_TOKEN_AUTH
         - ALLOW_USER_SRP_AUTH
-      AccessTokenValidity: 60        # minutes
-      IdTokenValidity: 60
-      RefreshTokenValidity: 30       # days
+      AccessTokenValidity: 15         # minutes
+      IdTokenValidity: 15
+      RefreshTokenValidity: 1440       # minutes (= 1 day)
       TokenValidityUnits:
         AccessToken: minutes
         IdToken: minutes
-        RefreshToken: days
+        RefreshToken: minutes
       PreventUserExistenceErrors: ENABLED
 
   # ── API Gateway ────────────────────────────────────────────────────────────
@@ -375,6 +375,27 @@ Resources:
             Path: /transactions/{accountId}/{dateTransactionId}/reference
             Method: PATCH
 
+  UpdateTransactionNameFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-update-transaction-name"
+      CodeUri: .
+      Handler: bootstrap
+      Description: Sets or clears a user-supplied friendly display name for a transaction
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /transactions/{accountId}/{dateTransactionId}/name
+            Method: PATCH
+
+
   UpdateTransactionBudgetFunction:
     Type: AWS::Serverless::Function
     Metadata:
@@ -647,8 +668,12 @@ Resources:
       Handler: bootstrap
       Description: Computes estimated net pay for an income source using payrolltaxapi.com
       Policies:
-        - DynamoDBReadPolicy:
-            TableName: !Ref MainTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:UpdateItem
+              Resource: !GetAtt MainTable.Arn
       Events:
         Api:
           Type: HttpApi
@@ -676,6 +701,7 @@ Resources:
             ApiId: !Ref FinanceApi
             Path: /suggest-fixed-costs
             Method: GET
+
 
   GetMasterBudgetFunction:
     Type: AWS::Serverless::Function

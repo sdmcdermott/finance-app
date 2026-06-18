@@ -41,6 +41,9 @@ build-UpdateTransactionCategoryFunction:
 build-UpdateTransactionReferenceFunction:
 	$(GOENV) go build $(GOFLAGS) -o $(ARTIFACTS_DIR)/bootstrap ./functions/update-transaction-reference
 
+build-UpdateTransactionNameFunction:
+	$(GOENV) go build $(GOFLAGS) -o $(ARTIFACTS_DIR)/bootstrap ./functions/update-transaction-name
+
 build-UpdateTransactionBudgetFunction:
 	$(GOENV) go build $(GOFLAGS) -o $(ARTIFACTS_DIR)/bootstrap ./functions/update-transaction-budget
 

@@ -30,21 +30,27 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response,
 	// Strip access tokens before sending to the frontend
 	type safeAccount struct {
 		AccountID   string `json:"accountId"`
+		ItemID      string `json:"itemId"`
 		Institution string `json:"institution"`
 		Name        string `json:"name"`
+		NickName    string `json:"nickName,omitempty"`
 		Type        string `json:"type"`
 		Subtype     string `json:"subtype"`
 		LastSynced  string `json:"lastSynced"`
+		Enabled     *bool  `json:"enabled,omitempty"`
 	}
 	safe := make([]safeAccount, 0, len(accounts))
 	for _, a := range accounts {
 		safe = append(safe, safeAccount{
 			AccountID:   a.AccountID,
+			ItemID:      a.ItemID,
 			Institution: a.Institution,
 			Name:        a.Name,
+			NickName:    a.NickName,
 			Type:        a.Type,
 			Subtype:     a.Subtype,
 			LastSynced:  a.LastSynced.Format("2006-01-02T15:04:05Z"),
+			Enabled:     a.Enabled,
 		})
 	}
 

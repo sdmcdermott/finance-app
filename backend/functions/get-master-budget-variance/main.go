@@ -70,6 +70,10 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response,
 	if err != nil {
 		return errorResponse(http.StatusInternalServerError, err.Error()), nil
 	}
+	// Guard against no master budget being configured yet.
+	if mb == nil {
+		mb = &dbpkg.MasterBudget{}
+	}
 
 	// Load all accounts then fetch transactions for the month
 	accounts, err := dbClient.GetAccounts(ctx, userID)
@@ -116,7 +120,7 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response,
 		srcByID[s.IncomeSourceID] = s
 	}
 
-	var incomeVariances []IncomeVariance
+	incomeVariances := make([]IncomeVariance, 0)
 	for _, mbi := range mb.IncomeSources {
 		if !mbi.Enabled {
 			continue
@@ -148,38 +152,57 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response,
 	}
 
 	// ── Fixed cost variance ───────────────────────────────────────────────────
-	// Transactions assigned to __master_budget__ count as actual fixed cost spend
-	masterActuals := make(map[string]struct {
-		sum   float64
-		count int
-	})
+	// Collect transactions already assigned to __master_budget__
+	var masterTxns []dbpkg.Transaction
 	for _, txn := range allTxns {
 		if txn.BudgetID == dbpkg.MasterBudgetID {
-			// Match by rule pattern if available — for now bucket all into a single pool
-			// keyed by merchant name (lowercased) to match against fixed cost names
-			key := strings.ToLower(txn.MerchantName)
-			if key == "" {
-				key = strings.ToLower(txn.Name)
-			}
-			e := masterActuals[key]
-			e.sum += math.Abs(txn.Amount)
-			e.count++
-			masterActuals[key] = e
+			masterTxns = append(masterTxns, txn)
 		}
 	}
 
-	var fixedCostVariances []FixedCostVariance
+	// Load rules so we can match via rule pattern when a fixed cost has a ruleId.
+	rules, err := dbClient.GetRules(ctx, userID)
+	if err != nil {
+		return errorResponse(http.StatusInternalServerError, err.Error()), nil
+	}
+	ruleByID := make(map[string]dbpkg.Rule, len(rules))
+	for _, r := range rules {
+		ruleByID[r.RuleID] = r
+	}
+
+	fixedCostVariances := make([]FixedCostVariance, 0)
 	for _, fc := range mb.FixedCosts {
 		expected := monthlyAmount(fc.Amount, fc.Frequency)
-		key := strings.ToLower(fc.Name)
-		actual := masterActuals[key]
+		var actualSum float64
+		var actualCount int
+
+		for _, txn := range masterTxns {
+			merchant := strings.ToLower(txn.MerchantName)
+			if merchant == "" {
+				merchant = strings.ToLower(txn.Name)
+			}
+			var matched bool
+			if fc.RuleID != "" {
+				if rule, ok := ruleByID[fc.RuleID]; ok {
+					matched = strings.Contains(merchant, strings.ToLower(rule.Pattern))
+				}
+			} else {
+				// Legacy fallback: match by fixed cost name substring
+				matched = strings.Contains(merchant, strings.ToLower(fc.Name))
+			}
+			if matched {
+				actualSum += math.Abs(txn.Amount)
+				actualCount++
+			}
+		}
+
 		fixedCostVariances = append(fixedCostVariances, FixedCostVariance{
 			FixedCostID:     fc.ID,
 			Name:            fc.Name,
 			ExpectedMonthly: expected,
-			Actual:          actual.sum,
-			Variance:        actual.sum - expected,
-			MatchedCount:    actual.count,
+			Actual:          actualSum,
+			Variance:        actualSum - expected,
+			MatchedCount:    actualCount,
 		})
 	}
 

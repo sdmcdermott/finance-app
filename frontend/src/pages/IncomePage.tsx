@@ -213,6 +213,15 @@ export const IncomePage: React.FC = () => {
         if (editingId === 'new') delete next['new'];
         return next;
       });
+      // Sync lastNetPay back into DataContext so navigating away and returning
+      // still shows the calculated result (useEffect seeds netPayMap from this).
+      setIncomeSources(prev => {
+        const idx = prev.findIndex(s => s.incomeSourceId === saved.incomeSourceId);
+        if (idx < 0) return prev;
+        const next = [...prev];
+        next[idx] = { ...next[idx], lastNetPay: result };
+        return next;
+      });
       // Snapshot current form values as the base for dirty detection
       setCalcBase(finalFormData);
     } catch (e: any) {

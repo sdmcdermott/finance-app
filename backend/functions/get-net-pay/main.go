@@ -97,7 +97,9 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response,
 		AdditionalWithholding: result.AdditionalWithholding,
 		NetPay:                result.NetPay,
 	}
-	_ = dbClient.SaveIncomeSourceNetPay(ctx, plaidclient.UserID(), sourceID, stored)
+	if err := dbClient.SaveIncomeSourceNetPay(ctx, plaidclient.UserID(), sourceID, stored); err != nil {
+		return errorResponse(http.StatusInternalServerError, "failed to persist net pay: "+err.Error()), nil
+	}
 
 	body, _ := json.Marshal(result)
 	return response{StatusCode: http.StatusOK, Body: string(body), Headers: jsonHeaders()}, nil

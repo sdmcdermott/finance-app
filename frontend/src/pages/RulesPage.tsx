@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Rule, putRule, deleteRule, Category, Budget } from '../api/client';
+import { Rule, putRule, deleteRule, Category, Budget, MASTER_BUDGET_ID } from '../api/client';
 import { useData } from '../auth/DataContext';
 import { fmtCurrency } from '../utils/dates';
 
@@ -48,6 +48,7 @@ const RuleForm: React.FC<RuleFormProps> = ({
       <label style={styles.label}>Assign to Budget <span style={styles.optional}>(optional)</span></label>
       <select style={styles.select} value={formBudgetId} onChange={e => setFormBudgetId(e.target.value)}>
         <option value="">— None —</option>
+        <option value={MASTER_BUDGET_ID}>⬡ Master Budget</option>
         {budgets.map(b => <option key={b.budgetId} value={b.budgetId}>{b.name}</option>)}
       </select>
     </div>
@@ -211,7 +212,10 @@ const RulesPage: React.FC = () => {
 
   const categoryName = (id: string) => categories.find((c) => c.categoryId === id)?.name ?? '—';
   const categoryColor = (id: string) => categories.find((c) => c.categoryId === id)?.color ?? '#cbd5e0';
-  const budgetName = (id: string) => budgets.find((b) => b.budgetId === id)?.name ?? '—';
+  const budgetName = (id: string) => {
+    if (id === MASTER_BUDGET_ID) return 'Master Budget';
+    return budgets.find((b) => b.budgetId === id)?.name ?? '—';
+  };
   const sortedRules = rules.slice().sort((a, b) => a.priority - b.priority);
 
   const ruleConditionSummary = (rule: Rule): string => {

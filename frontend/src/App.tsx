@@ -4,7 +4,7 @@ import { DirtyGuardProvider, useDirtyGuard } from './auth/DirtyGuardContext';
 import {
   Account, Category, Rule, Transaction, Budget, IncomeSource,
   getTransactions, putTransaction, deleteTransaction,
-  updateTransactionCategory, updateTransactionBudget, updateTransactionReference, applyRules, syncTransactions,
+  updateTransactionCategory, updateTransactionBudget, updateTransactionReference, updateTransactionName, applyRules, syncTransactions,
   putCategory, putRule,
 } from './api/client';
 import { AuthProvider, useAuth } from './auth/AuthContext';
@@ -22,7 +22,7 @@ import MasterBudgetPage from './pages/MasterBudgetPage';
 import { IncomeSourceModal } from './components/IncomeSourceModal';
 import { fmtDate } from './utils/dates';
 import { fmtCurrency } from './utils/dates';
-import { INCOME_CATEGORY_ID } from './api/client';
+import { INCOME_CATEGORY_ID, MASTER_BUDGET_ID } from './api/client';
 
 // ── Nav ───────────────────────────────────────────────────────────────────────
 const Nav: React.FC = () => {
@@ -224,7 +224,7 @@ const PfcCategoryModal: React.FC<PfcModalProps> = ({
     c => c.name.toLowerCase() === pfcLabel.toLowerCase()
   );
 
-  const merchantName = txn.merchantName || txn.name;
+  const merchantName = txn.customName || txn.merchantName || txn.name;
 
   // Find first rule (by priority) whose pattern matches the merchant name
   const matchingRule = existing
@@ -483,6 +483,7 @@ const PfcCategoryModal: React.FC<PfcModalProps> = ({
                 <label style={modalStyles.inlineLabel}>Budget</label>
                 <select style={{ ...modalStyles.input, flex: 1 }} value={ruleBudgetId} onChange={e => setRuleBudgetId(e.target.value)}>
                   <option value="">— None —</option>
+                  <option value={MASTER_BUDGET_ID}>⬡ Master Budget</option>
                   {budgets.map(b => <option key={b.budgetId} value={b.budgetId}>{b.name}</option>)}
                 </select>
               </div>
@@ -526,6 +527,153 @@ const PfcCategoryModal: React.FC<PfcModalProps> = ({
           <button style={modalStyles.cancelBtn} onClick={onClose} disabled={saving}>Cancel</button>
           <button style={modalStyles.confirmBtn} onClick={handleConfirm} disabled={saving || (createCat && !catName.trim())}>
             {saving ? 'Saving…' : 'Confirm'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// ── MbRuleModal ───────────────────────────────────────────────────────────────
+interface MbRuleModalProps {
+  txn: Transaction;
+  rules: Rule[];
+  onClose: () => void;
+  onDone: (txn: Transaction, newRule?: Rule) => void;
+}
+
+const MbRuleModal: React.FC<MbRuleModalProps> = ({ txn, rules, onClose, onDone }) => {
+  const merchantName  = txn.customName || txn.merchantName || txn.name;
+  const txnAbsAmount  = Math.abs(txn.amount);
+  const txnDay        = txn.date ? parseInt(txn.date.slice(8, 10), 10) : 1;
+
+  // Check if there's already a master-budget rule whose pattern matches this merchant
+  const existingRule = [...rules]
+    .sort((a, b) => a.priority - b.priority)
+    .find(r => r.budgetId === MASTER_BUDGET_ID && merchantName.toLowerCase().includes(r.pattern.toLowerCase()));
+
+  const [createRule,   setCreateRule]   = useState(!existingRule);
+  const [pattern,      setPattern]      = useState(merchantName);
+  const [useAmount,    setUseAmount]    = useState(false);
+  const [amountMatch,  setAmountMatch]  = useState(String(txnAbsAmount.toFixed(2)));
+  const [amountTol,    setAmountTol]    = useState('5');
+  const [useDay,       setUseDay]       = useState(false);
+  const [dayOfMonth,   setDayOfMonth]   = useState(String(txnDay));
+  const [dayTol,       setDayTol]       = useState('3');
+  const [saving,       setSaving]       = useState(false);
+  const [error,        setError]        = useState<string | null>(null);
+
+  const handleConfirm = async () => {
+    setSaving(true); setError(null);
+    try {
+      await updateTransactionBudget(txn.accountId, txn.dateTransactionId, MASTER_BUDGET_ID);
+      const updatedTxn = { ...txn, budgetId: MASTER_BUDGET_ID, manualBudget: true };
+      let newRule: Rule | undefined;
+      if (createRule && pattern.trim()) {
+        newRule = await putRule({
+          ruleId:     '',
+          pattern:    pattern.trim(),
+          categoryId: '',
+          budgetId:   MASTER_BUDGET_ID,
+          priority:   50,
+          ...(useAmount && amountMatch ? {
+            amountMatch:     parseFloat(amountMatch),
+            amountTolerance: parseFloat(amountTol) || 0,
+          } : {}),
+          ...(useDay && dayOfMonth ? {
+            dayOfMonth:   parseInt(dayOfMonth, 10),
+            dayTolerance: parseInt(dayTol, 10) || 0,
+          } : {}),
+        });
+      }
+      onDone(updatedTxn, newRule);
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div style={modalStyles.overlay}>
+      <div style={modalStyles.box}>
+        <div style={modalStyles.header}>
+          <span style={modalStyles.title}>Assign to Master Budget</span>
+          <button style={modalStyles.closeBtn} onClick={onClose}>✕</button>
+        </div>
+        <div style={{ fontSize: '0.875rem', color: '#4a5568' }}>
+          <strong>{merchantName}</strong> — {fmtDate(txn.date)}
+        </div>
+
+        {error && <div style={modalStyles.error}>{error}</div>}
+
+        {existingRule && (
+          <div style={modalStyles.ruleMatchNote}>
+            <span>Rule already exists:</span>
+            <strong>"{existingRule.pattern}"</strong>
+          </div>
+        )}
+
+        <div style={modalStyles.divider} />
+
+        <label style={modalStyles.checkRow}>
+          <input type="checkbox" checked={createRule} onChange={e => setCreateRule(e.target.checked)} />
+          <span>Create a rule for future transactions like this</span>
+        </label>
+
+        {createRule && (
+          <div style={{ ...modalStyles.section, paddingLeft: '1.4rem', gap: '0.5rem' }}>
+            <div style={modalStyles.fieldRow}>
+              <label style={modalStyles.inlineLabel}>Description contains</label>
+              <input
+                style={{ ...modalStyles.input, flex: 1 }}
+                value={pattern}
+                onChange={e => setPattern(e.target.value)}
+                placeholder="e.g. netflix"
+              />
+            </div>
+            <label style={modalStyles.checkRow}>
+              <input type="checkbox" checked={useAmount} onChange={e => setUseAmount(e.target.checked)} />
+              <span style={{ fontSize: '0.82rem' }}>Match amount</span>
+            </label>
+            {useAmount && (
+              <div style={{ ...modalStyles.fieldRow, paddingLeft: '1.4rem', flexWrap: 'wrap', gap: '0.5rem' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
+                  <label style={modalStyles.inlineLabel}>Amount ($)</label>
+                  <input type="number" min="0.01" step="0.01" style={{ ...modalStyles.input, width: 90 }} value={amountMatch} onChange={e => setAmountMatch(e.target.value)} />
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
+                  <label style={modalStyles.inlineLabel}>±$</label>
+                  <input type="number" min="0" step="0.01" style={{ ...modalStyles.input, width: 70 }} value={amountTol} onChange={e => setAmountTol(e.target.value)} />
+                </div>
+              </div>
+            )}
+            <label style={modalStyles.checkRow}>
+              <input type="checkbox" checked={useDay} onChange={e => setUseDay(e.target.checked)} />
+              <span style={{ fontSize: '0.82rem' }}>Match day of month</span>
+            </label>
+            {useDay && (
+              <div style={{ ...modalStyles.fieldRow, paddingLeft: '1.4rem', flexWrap: 'wrap', gap: '0.5rem' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
+                  <label style={modalStyles.inlineLabel}>Day (1–31)</label>
+                  <input type="number" min="1" max="31" style={{ ...modalStyles.input, width: 70 }} value={dayOfMonth} onChange={e => setDayOfMonth(e.target.value)} />
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
+                  <label style={modalStyles.inlineLabel}>±days</label>
+                  <input type="number" min="0" max="15" style={{ ...modalStyles.input, width: 60 }} value={dayTol} onChange={e => setDayTol(e.target.value)} />
+                </div>
+              </div>
+            )}
+            <p style={{ ...modalStyles.hint, marginTop: '0.2rem' }}>
+              Matching transactions will automatically be assigned to Master Budget.
+            </p>
+          </div>
+        )}
+
+        <div style={modalStyles.actions}>
+          <button style={modalStyles.cancelBtn} onClick={onClose} disabled={saving}>Skip</button>
+          <button style={modalStyles.confirmBtn} onClick={handleConfirm} disabled={saving}>
+            {saving ? 'Saving…' : createRule ? 'Assign + Create Rule' : 'Assign'}
           </button>
         </div>
       </div>
@@ -590,45 +738,75 @@ const TxnDetail: React.FC<{
   onPfcClick: (label: string) => void;
 }> = ({ txn, accounts, onPfcClick }) => {
   const acct = accounts.find(a => a.accountId === txn.accountId);
-  const acctLabel = acct ? `${acct.institution} — ${acct.name}` : txn.accountId;
+  const acctLabel = acct ? `${acct.institution} — ${acct.nickName || acct.name}` : txn.accountId;
 
   const hasPrimary  = !!txn.personalFinancePrimary;
   const hasDetailed = !!txn.personalFinanceDetailed && txn.personalFinanceDetailed !== txn.personalFinancePrimary;
   const fmtPfcStr = (s: string) => toTitleCase(s);
 
+  // Build location block for right-side display
+  const locationBlock = (() => {
+    const loc = txn.location;
+    if (!loc) return null;
+    const line1 = loc.address || '';
+    const line2 = [loc.city, loc.region, loc.postalCode].filter(Boolean).join(', ');
+    const parts = [line1, line2].filter(Boolean);
+    if (parts.length === 0) return null;
+    let href: string;
+    if (loc.lat != null && loc.lon != null) {
+      href = `https://www.google.com/maps?q=${loc.lat},${loc.lon}`;
+    } else {
+      href = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(parts.join(', '))}`;
+    }
+    return (
+      <a href={href} target="_blank" rel="noopener noreferrer" style={detailStyles.locationLink}>
+        {line1 && <span style={{ display: 'block' }}>{line1}</span>}
+        {line2 && <span style={{ display: 'block' }}>{line2}</span>}
+      </a>
+    );
+  })();
+
   return (
     <div style={detailStyles.wrap}>
-      <div style={detailStyles.grid}>
-        <DetailRow label="Account"              value={acctLabel} />
-        <DetailRow label="Original Description" value={txn.originalDescription} />
-        <DetailRow label="Authorized Date"      value={fmtDate(txn.authorizedDate)} />
-        <DetailRow label="Payment Channel"      value={fmtChannel(txn.paymentChannel)} />
+      <div style={{ display: 'flex', gap: '1.5rem', alignItems: 'flex-start' }}>
+        <div style={{ flex: 1, ...detailStyles.grid }}>
+          <DetailRow label="Account"              value={acctLabel} />
+          <DetailRow label="Original Description" value={txn.originalDescription} />
+          <DetailRow label="Authorized Date"      value={fmtDate(txn.authorizedDate)} />
+          <DetailRow label="Payment Channel"      value={fmtChannel(txn.paymentChannel)} />
 
-        {/* Personal Finance Category — clickable levels */}
-        <div style={detailStyles.row}>
-          <span style={detailStyles.label}>Personal Finance Category</span>
-          <span style={detailStyles.value}>
-            {!hasPrimary && '—'}
-            {hasPrimary && (
-              <button style={detailStyles.pfcBtn} onClick={() => onPfcClick(fmtPfcStr(txn.personalFinancePrimary!))}>
-                {fmtPfcStr(txn.personalFinancePrimary!)}
-              </button>
-            )}
-            {hasPrimary && hasDetailed && (
-              <>
-                <span style={{ color: '#a0aec0', margin: '0 4px' }}>›</span>
-                <button style={detailStyles.pfcBtn} onClick={() => onPfcClick(fmtPfcStr(txn.personalFinanceDetailed!))}>
-                  {fmtPfcStr(txn.personalFinanceDetailed!)}
+          {/* Personal Finance Category — clickable levels */}
+          <div style={detailStyles.row}>
+            <span style={detailStyles.label}>Personal Finance Category</span>
+            <span style={detailStyles.value}>
+              {!hasPrimary && '—'}
+              {hasPrimary && (
+                <button style={detailStyles.pfcBtn} onClick={() => onPfcClick(fmtPfcStr(txn.personalFinancePrimary!))}>
+                  {fmtPfcStr(txn.personalFinancePrimary!)}
                 </button>
-              </>
-            )}
-          </span>
+              )}
+              {hasPrimary && hasDetailed && (
+                <>
+                  <span style={{ color: '#a0aec0', margin: '0 4px' }}>›</span>
+                  <button style={detailStyles.pfcBtn} onClick={() => onPfcClick(fmtPfcStr(txn.personalFinanceDetailed!))}>
+                    {fmtPfcStr(txn.personalFinanceDetailed!)}
+                  </button>
+                </>
+              )}
+            </span>
+          </div>
+
+          {txn.logoUrl && (
+            <div style={detailStyles.row}>
+              <span style={detailStyles.label}>Merchant Logo</span>
+              <img src={txn.logoUrl} alt="merchant logo" style={detailStyles.logo} />
+            </div>
+          )}
         </div>
 
-        {txn.logoUrl && (
-          <div style={detailStyles.row}>
-            <span style={detailStyles.label}>Merchant Logo</span>
-            <img src={txn.logoUrl} alt="merchant logo" style={detailStyles.logo} />
+        {locationBlock && (
+          <div style={detailStyles.locationCol}>
+            {locationBlock}
           </div>
         )}
       </div>
@@ -644,13 +822,15 @@ const DetailRow: React.FC<{ label: string; value?: string }> = ({ label, value }
 );
 
 const detailStyles: Record<string, React.CSSProperties> = {
-  wrap:   { background: '#f7f8fc', border: '1px solid #e2e8f0', borderRadius: 8, padding: '0.75rem 1rem', marginTop: 2 },
-  grid:   { display: 'flex', flexDirection: 'column', gap: '0.4rem' },
-  row:    { display: 'flex', gap: '0.75rem', alignItems: 'baseline', fontSize: '0.82rem' },
-  label:  { color: '#718096', minWidth: 180, flexShrink: 0, fontWeight: 500 },
-  value:  { color: '#2d3748' },
-  logo:   { height: 28, borderRadius: 4 },
-  pfcBtn: { background: 'none', border: 'none', padding: 0, cursor: 'pointer', color: '#0d7a6b', fontSize: 'inherit', fontFamily: 'inherit', textDecoration: 'underline', textDecorationStyle: 'dotted' },
+  wrap:        { background: '#f7f8fc', border: '1px solid #e2e8f0', borderRadius: 8, padding: '0.75rem 1rem', marginTop: 2 },
+  grid:        { display: 'flex', flexDirection: 'column', gap: '0.4rem' },
+  row:         { display: 'flex', gap: '0.75rem', alignItems: 'baseline', fontSize: '0.82rem' },
+  label:       { color: '#718096', minWidth: 180, flexShrink: 0, fontWeight: 500 },
+  value:       { color: '#2d3748' },
+  logo:        { height: 28, borderRadius: 4 },
+  pfcBtn:      { background: 'none', border: 'none', padding: 0, cursor: 'pointer', color: '#0d7a6b', fontSize: 'inherit', fontFamily: 'inherit', textDecoration: 'underline', textDecorationStyle: 'dotted' },
+  locationCol:  { flexShrink: 0, textAlign: 'right' },
+  locationLink: { color: '#0d7a6b', fontSize: '0.82rem', lineHeight: 1.6, textDecoration: 'none' },
 };
 
 // ── Account filter dropdown ───────────────────────────────────────────────────
@@ -751,7 +931,7 @@ const AccountFilterDropdown: React.FC<{
                     {!isCollapsed && accts.map(a => (
                       <label key={a.accountId} style={acctFilterStyles.leafLabel} onClick={() => toggleAccount(a.accountId)}>
                         <LeafCheckbox checked={selected.has(a.accountId)} />
-                        <span style={acctFilterStyles.leafName}>{a.name}</span>
+                        <span style={acctFilterStyles.leafName}>{a.nickName || a.name}</span>
                         <span style={acctFilterStyles.leafType}>{a.subtype || a.type}</span>
                       </label>
                     ))}
@@ -875,7 +1055,7 @@ const AddTransactionModal: React.FC<AddTxnModalProps> = ({
         <div style={addTxnStyles.field}>
           <label style={addTxnStyles.label}>Account</label>
           <select style={addTxnStyles.input} value={accountId} onChange={e => setAccountId(e.target.value)}>
-            {accounts.map(a => <option key={a.accountId} value={a.accountId}>{a.institution} — {a.name}</option>)}
+            {accounts.map(a => <option key={a.accountId} value={a.accountId}>{a.institution} — {a.nickName || a.name}</option>)}
           </select>
         </div>
         <div style={addTxnStyles.field}>
@@ -951,12 +1131,26 @@ const TransactionsPage: React.FC = () => {
   const [refUrl, setRefUrl] = useState('');
   const [refNote, setRefNote] = useState('');
   const [savingRef, setSavingRef] = useState(false);
+  const [editingNameId, setEditingNameId] = useState<string | null>(null);
+  const [nameDraft, setNameDraft] = useState('');
+  const [savingName, setSavingName] = useState(false);
+  const nameCancelRef = React.useRef(false);
   const [splitEditorId, setSplitEditorId] = useState<string | null>(null);
   const [detailId, setDetailId] = useState<string | null>(null);
   const [pfcModal, setPfcModal] = useState<{ txn: Transaction; label: string } | null>(null);
+  const [mbRuleModal, setMbRuleModal] = useState<Transaction | null>(null);
   const [addTxnModal, setAddTxnModal] = useState<{ txn?: Transaction } | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [incomeModal, setIncomeModal] = useState<Transaction | null>(null);
+
+  // Show pending toggle — off by default, remembered across sessions
+  const [showPending, setShowPending] = useState(
+    () => localStorage.getItem('finance_show_pending') === 'true'
+  );
+  const toggleShowPending = (val: boolean) => {
+    setShowPending(val);
+    localStorage.setItem('finance_show_pending', String(val));
+  };
 
   const toggleDetail = (id: string) =>
     setDetailId(prev => prev === id ? null : id);
@@ -1032,6 +1226,10 @@ const TransactionsPage: React.FC = () => {
   };
 
   const assignBudget = async (txn: Transaction, budgetId: string) => {
+    if (budgetId === MASTER_BUDGET_ID) {
+      setMbRuleModal(txn);
+      return;
+    }
     setAssigningBudgetId(txn.dateTransactionId);
     try {
       await updateTransactionBudget(txn.accountId, txn.dateTransactionId, budgetId);
@@ -1101,6 +1299,27 @@ const TransactionsPage: React.FC = () => {
     finally { setSavingRef(false); }
   };
 
+  const openNameEditor = (txn: Transaction) => {
+    setEditingNameId(txn.dateTransactionId);
+    setNameDraft(txn.customName || '');
+  };
+
+  const saveName = async (txn: Transaction) => {
+    if (nameCancelRef.current) { nameCancelRef.current = false; return; }
+    const trimmed = nameDraft.trim();
+    setEditingNameId(null);
+    if (trimmed === (txn.customName || '')) return;
+    setSavingName(true);
+    try {
+      await updateTransactionName(txn.accountId, txn.dateTransactionId, trimmed);
+      const custom = trimmed || undefined;
+      setTransactions(prev => prev.map(t =>
+        t.dateTransactionId === txn.dateTransactionId ? { ...t, customName: custom } : t
+      ));
+    } catch (e: any) { setError(e.message); }
+    finally { setSavingName(false); }
+  };
+
   const handleSplitSaved = (updated: Transaction) => {
     setTransactions(prev => prev.map(t =>
       t.dateTransactionId === updated.dateTransactionId ? updated : t
@@ -1115,6 +1334,14 @@ const TransactionsPage: React.FC = () => {
     if (newCategory) setCategories(prev => [...prev, newCategory]);
     if (newRule)     setRules(prev => [...prev, newRule]);
     setPfcModal(null);
+  };
+
+  const handleMbRuleDone = (updatedTxn: Transaction, newRule?: Rule) => {
+    setTransactions(prev => prev.map(t =>
+      t.dateTransactionId === updatedTxn.dateTransactionId ? updatedTxn : t
+    ));
+    if (newRule) setRules(prev => [...prev.filter(r => r.ruleId !== newRule.ruleId), newRule]);
+    setMbRuleModal(null);
   };
 
   const amtColor = (txn: Transaction) => txn.amount > 0 ? '#e53e3e' : '#38a169';
@@ -1134,11 +1361,14 @@ const TransactionsPage: React.FC = () => {
 
   const filtered = transactions
     .filter(t => selectedAccounts.has(t.accountId))
-    .filter(t => !showUncategorizedOnly || !t.customCategory);
+    .filter(t => !showUncategorizedOnly || !t.customCategory)
+    .filter(t => showPending || !t.pending);
   const visible = [...filtered].sort((a, b) => {
+    // Pending always floats above posted regardless of sort column
+    if (a.pending !== b.pending) return a.pending ? -1 : 1;
     let cmp = 0;
     if (txnSortKey === 'date')     cmp = a.date.localeCompare(b.date);
-    else if (txnSortKey === 'merchant') cmp = (a.merchantName || a.name).localeCompare(b.merchantName || b.name);
+    else if (txnSortKey === 'merchant') cmp = (a.customName || a.merchantName || a.name).localeCompare(b.customName || b.merchantName || b.name);
     else if (txnSortKey === 'amount')   cmp = a.amount - b.amount;
     return txnSortDir === 'asc' ? cmp : -cmp;
   });
@@ -1154,6 +1384,14 @@ const TransactionsPage: React.FC = () => {
           rules={rules}
           onClose={() => setPfcModal(null)}
           onDone={handlePfcDone}
+        />
+      )}
+      {mbRuleModal && (
+        <MbRuleModal
+          txn={mbRuleModal}
+          rules={rules}
+          onClose={() => setMbRuleModal(null)}
+          onDone={handleMbRuleDone}
         />
       )}
       {addTxnModal && (
@@ -1226,6 +1464,12 @@ const TransactionsPage: React.FC = () => {
             </span>
             Uncategorized only
           </label>
+          <label style={inlineStyles.checkLabel} onClick={() => toggleShowPending(!showPending)}>
+            <span style={txnToggleStyles.track(showPending)}>
+              <span style={txnToggleStyles.thumb(showPending)} />
+            </span>
+            Show pending
+          </label>
         </div>
         <div className="filter-right">
           <button style={inlineStyles.applyBtn} onClick={handleApplyRules} disabled={applyingRules}
@@ -1267,7 +1511,7 @@ const TransactionsPage: React.FC = () => {
             <tbody>
               {visible.map(txn => (
                 <React.Fragment key={txn.dateTransactionId}>
-                  <tr>
+                  <tr style={txn.pending ? { background: '#f1f5f9', color: '#718096' } : undefined}>
                     <td>
                       <button
                         style={inlineStyles.merchantBtn}
@@ -1279,11 +1523,33 @@ const TransactionsPage: React.FC = () => {
                       </button>
                     </td>
                     <td>
-                      {txn.merchantName || txn.name}
+                      {editingNameId === txn.dateTransactionId && !txn.pending ? (
+                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}>
+                          <input
+                            autoFocus
+                            type="text"
+                            value={nameDraft}
+                            onChange={e => setNameDraft(e.target.value)}
+                            onKeyDown={e => {
+                              if (e.key === 'Enter') { e.preventDefault(); (e.target as HTMLInputElement).blur(); }
+                              if (e.key === 'Escape') { nameCancelRef.current = true; setEditingNameId(null); }
+                            }}
+                            onBlur={() => saveName(txn)}
+                            placeholder={txn.merchantName || txn.name}
+                            style={inlineStyles.nickInput}
+                          />
+                        </span>
+                      ) : (
+                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}>
+                          <span>{txn.customName || txn.merchantName || txn.name}</span>
+                          {txn.customName && <span style={inlineStyles.origName}>({txn.merchantName || txn.name})</span>}
+                          {!txn.pending && <button style={inlineStyles.nickBtn} onClick={() => openNameEditor(txn)} title="Set friendly name">✎</button>}
+                        </span>
+                      )}
                     </td>
                     <td>
                       <div style={inlineStyles.catCell}>
-                        {txn.splits && txn.splits.length > 0 ? (
+                        {txn.pending ? null : txn.splits && txn.splits.length > 0 ? (
                           <span style={{ fontSize: '0.8rem', color: '#718096', fontStyle: 'italic' }}>
                             {txn.splits.length} splits
                           </span>
@@ -1296,7 +1562,7 @@ const TransactionsPage: React.FC = () => {
                     </td>
                     <td>
                       <div style={inlineStyles.catCell}>
-                        {txn.splits && txn.splits.length > 0 ? (
+                        {txn.pending ? null : txn.splits && txn.splits.length > 0 ? (
                           <span style={{ fontSize: '0.8rem', color: '#718096', fontStyle: 'italic' }}>per split</span>
                         ) : (
                           <BudgetSelect txn={txn} budgets={budgets} incomeSources={incomeSources} assigningId={assigningBudgetId} onAssign={assignBudget} />
@@ -1306,7 +1572,7 @@ const TransactionsPage: React.FC = () => {
                     <td style={{ textAlign: 'right', color: amtColor(txn) }}>{amtStr(txn)}</td>
                     <td>{txn.pending ? 'Pending' : 'Posted'}</td>
                     <td>
-                      {editingRefId === txn.dateTransactionId ? (
+                      {editingRefId === txn.dateTransactionId && !txn.pending ? (
                         <div style={inlineStyles.refEditor}>
                           <input type="url" placeholder="URL" value={refUrl} onChange={e => setRefUrl(e.target.value)} style={inlineStyles.refInput} />
                           <input type="text" placeholder="Note" value={refNote} onChange={e => setRefNote(e.target.value)} style={inlineStyles.refInput} />
@@ -1318,29 +1584,35 @@ const TransactionsPage: React.FC = () => {
                           {txn.referenceUrl && (
                             <a href={txn.referenceUrl} target="_blank" rel="noreferrer" style={inlineStyles.refLink} title={txn.referenceNote || txn.referenceUrl}>🔗</a>
                           )}
-                          <button style={inlineStyles.refEditBtn} onClick={() => openRefEditor(txn)} title="Edit reference">
-                            {txn.referenceUrl ? '✎' : '+'}
-                          </button>
+                          {!txn.pending && (
+                            <button style={inlineStyles.refEditBtn} onClick={() => openRefEditor(txn)} title="Edit reference">
+                              {txn.referenceUrl ? '✎' : '+'}
+                            </button>
+                          )}
                         </div>
                       )}
                     </td>
                      <td>
-                       <button
-                         className="split-badge"
-                         onClick={() => setSplitEditorId(
-                           splitEditorId === txn.dateTransactionId ? null : txn.dateTransactionId
-                         )}
-                         title={txn.splits && txn.splits.length > 0 ? 'Edit splits' : 'Split transaction'}
-                       >
-                         {txn.splits && txn.splits.length > 0 ? `⅔ ${txn.splits.length}` : '⅔ Split'}
-                       </button>
-                       {txn.transactionId.startsWith('manual-') && (
+                       {!txn.pending && (
                          <>
-                           <button style={inlineStyles.refEditBtn} title="Edit transaction"
-                             onClick={() => setAddTxnModal({ txn })}>✎</button>
-                           <button style={{ ...inlineStyles.refEditBtn, color: '#e53e3e' }} title="Delete transaction"
-                             disabled={deletingId === txn.dateTransactionId}
-                             onClick={() => handleDeleteManualTxn(txn)}>🗑</button>
+                           <button
+                             className="split-badge"
+                             onClick={() => setSplitEditorId(
+                               splitEditorId === txn.dateTransactionId ? null : txn.dateTransactionId
+                             )}
+                             title={txn.splits && txn.splits.length > 0 ? 'Edit splits' : 'Split transaction'}
+                           >
+                             {txn.splits && txn.splits.length > 0 ? `⅔ ${txn.splits.length}` : '⅔ Split'}
+                           </button>
+                           {txn.transactionId.startsWith('manual-') && (
+                             <>
+                               <button style={inlineStyles.refEditBtn} title="Edit transaction"
+                                 onClick={() => setAddTxnModal({ txn })}>✎</button>
+                               <button style={{ ...inlineStyles.refEditBtn, color: '#e53e3e' }} title="Delete transaction"
+                                 disabled={deletingId === txn.dateTransactionId}
+                                 onClick={() => handleDeleteManualTxn(txn)}>🗑</button>
+                             </>
+                           )}
                          </>
                        )}
                      </td>
@@ -1377,13 +1649,14 @@ const TransactionsPage: React.FC = () => {
           {/* ── Mobile cards ── */}
           <div className="txn-cards">
             {visible.map(txn => (
-              <div key={txn.dateTransactionId} className="txn-card">
-                <div className="txn-card-row">
-                  <span className="txn-card-merchant">
-                    {txn.merchantName || txn.name}
-                  </span>
-                  <span className="txn-card-amount" style={{ color: amtColor(txn) }}>{amtStr(txn)}</span>
-                </div>
+              <div key={txn.dateTransactionId} className="txn-card" style={txn.pending ? { background: '#f1f5f9', color: '#718096' } : undefined}>
+                 <div className="txn-card-row">
+                   <span className="txn-card-merchant">
+                     {txn.customName || txn.merchantName || txn.name}
+                     {txn.customName && <span style={inlineStyles.origName}> ({txn.merchantName || txn.name})</span>}
+                   </span>
+                   <span className="txn-card-amount" style={{ color: amtColor(txn) }}>{amtStr(txn)}</span>
+                 </div>
                 <div className="txn-card-meta">
                   <span className="txn-card-date">
                     <button
@@ -1400,7 +1673,7 @@ const TransactionsPage: React.FC = () => {
                   )}
                 </div>
                 <div className="txn-card-cat">
-                  {txn.splits && txn.splits.length > 0 ? (
+                  {txn.pending ? null : txn.splits && txn.splits.length > 0 ? (
                     <div className="split-summary-list">
                       {txn.splits.map((sp, i) => {
                         const cat = categories.find(c => c.categoryId === sp.customCategory);
@@ -1422,25 +1695,27 @@ const TransactionsPage: React.FC = () => {
                   )}
                 </div>
                 {/* Split button on mobile */}
-                <div style={{ marginTop: '0.4rem', display: 'flex', gap: '0.4rem', alignItems: 'center', flexWrap: 'wrap' }}>
-                  <button
-                    className="split-badge"
-                    onClick={() => setSplitEditorId(
-                      splitEditorId === txn.dateTransactionId ? null : txn.dateTransactionId
+                {!txn.pending && (
+                  <div style={{ marginTop: '0.4rem', display: 'flex', gap: '0.4rem', alignItems: 'center', flexWrap: 'wrap' }}>
+                    <button
+                      className="split-badge"
+                      onClick={() => setSplitEditorId(
+                        splitEditorId === txn.dateTransactionId ? null : txn.dateTransactionId
+                      )}
+                    >
+                      {txn.splits && txn.splits.length > 0 ? `⅔ Edit splits (${txn.splits.length})` : '⅔ Split'}
+                    </button>
+                    {txn.transactionId.startsWith('manual-') && (
+                      <>
+                        <button style={{ ...inlineStyles.refEditBtn, fontSize: '0.85rem' }} title="Edit"
+                          onClick={() => setAddTxnModal({ txn })}>✎ Edit</button>
+                        <button style={{ ...inlineStyles.refEditBtn, color: '#e53e3e', fontSize: '0.85rem' }} title="Delete"
+                          disabled={deletingId === txn.dateTransactionId}
+                          onClick={() => handleDeleteManualTxn(txn)}>🗑 Delete</button>
+                      </>
                     )}
-                  >
-                    {txn.splits && txn.splits.length > 0 ? `⅔ Edit splits (${txn.splits.length})` : '⅔ Split'}
-                  </button>
-                  {txn.transactionId.startsWith('manual-') && (
-                    <>
-                      <button style={{ ...inlineStyles.refEditBtn, fontSize: '0.85rem' }} title="Edit"
-                        onClick={() => setAddTxnModal({ txn })}>✎ Edit</button>
-                      <button style={{ ...inlineStyles.refEditBtn, color: '#e53e3e', fontSize: '0.85rem' }} title="Delete"
-                        disabled={deletingId === txn.dateTransactionId}
-                        onClick={() => handleDeleteManualTxn(txn)}>🗑 Delete</button>
-                    </>
-                  )}
-                </div>
+                  </div>
+                )}
                 {splitEditorId === txn.dateTransactionId && (
                    <SplitEditor
                      txn={txn}
@@ -1457,23 +1732,43 @@ const TransactionsPage: React.FC = () => {
                     onPfcClick={label => setPfcModal({ txn, label })}
                   />
                 )}
-                {/* Ref editor on mobile */}
-                <div className="txn-card-ref">
-                  {editingRefId === txn.dateTransactionId ? (
-                    <div className="ref-editor-mobile">
-                      <input type="url" placeholder="URL" value={refUrl} onChange={e => setRefUrl(e.target.value)} />
-                      <input type="text" placeholder="Note" value={refNote} onChange={e => setRefNote(e.target.value)} />
-                      <div className="ref-editor-mobile-btns">
-                        <button style={{ ...inlineStyles.refSaveBtn, flex: 1 }} onClick={() => saveRef(txn)} disabled={savingRef}>{savingRef ? '...' : 'Save'}</button>
-                        <button style={inlineStyles.refCancelBtn} onClick={() => setEditingRefId(null)}>Cancel</button>
+                {/* Name editor on mobile */}
+                {!txn.pending && (
+                  <div className="txn-card-ref">
+                    {editingNameId === txn.dateTransactionId ? (
+                      <div className="ref-editor-mobile">
+                        <input type="text" placeholder={txn.merchantName || txn.name} value={nameDraft} onChange={e => setNameDraft(e.target.value)} />
+                        <div className="ref-editor-mobile-btns">
+                          <button style={{ ...inlineStyles.refSaveBtn, flex: 1 }} onClick={() => saveName(txn)} disabled={savingName}>{savingName ? '...' : 'Save'}</button>
+                          <button style={inlineStyles.refCancelBtn} onClick={() => setEditingNameId(null)}>Cancel</button>
+                        </div>
                       </div>
-                    </div>
-                  ) : (
-                    <button style={{ ...inlineStyles.refEditBtn, fontSize: '0.8rem' }} onClick={() => openRefEditor(txn)}>
-                      {txn.referenceUrl ? '✎ Edit reference' : '+ Add reference'}
-                    </button>
-                  )}
-                </div>
+                    ) : (
+                      <button style={{ ...inlineStyles.refEditBtn, fontSize: '0.8rem' }} onClick={() => openNameEditor(txn)}>
+                        {txn.customName ? '✎ Edit friendly name' : '+ Add friendly name'}
+                      </button>
+                    )}
+                  </div>
+                )}
+                {/* Ref editor on mobile */}
+                {!txn.pending && (
+                  <div className="txn-card-ref">
+                    {editingRefId === txn.dateTransactionId ? (
+                      <div className="ref-editor-mobile">
+                        <input type="url" placeholder="URL" value={refUrl} onChange={e => setRefUrl(e.target.value)} />
+                        <input type="text" placeholder="Note" value={refNote} onChange={e => setRefNote(e.target.value)} />
+                        <div className="ref-editor-mobile-btns">
+                          <button style={{ ...inlineStyles.refSaveBtn, flex: 1 }} onClick={() => saveRef(txn)} disabled={savingRef}>{savingRef ? '...' : 'Save'}</button>
+                          <button style={inlineStyles.refCancelBtn} onClick={() => setEditingRefId(null)}>Cancel</button>
+                        </div>
+                      </div>
+                    ) : (
+                      <button style={{ ...inlineStyles.refEditBtn, fontSize: '0.8rem' }} onClick={() => openRefEditor(txn)}>
+                        {txn.referenceUrl ? '✎ Edit reference' : '+ Add reference'}
+                      </button>
+                    )}
+                  </div>
+                )}
               </div>
             ))}
           </div>
@@ -1578,6 +1873,9 @@ const inlineStyles: Record<string, React.CSSProperties> = {
   refSaveBtn: { background: '#0d7a6b', color: '#fff', border: 'none', borderRadius: 4, padding: '0.35rem 0.6rem', cursor: 'pointer', fontSize: '0.8rem' },
   refCancelBtn: { background: 'none', border: 'none', cursor: 'pointer', color: '#718096', fontSize: '0.85rem' },
   merchantBtn: { background: 'none', border: 'none', padding: 0, cursor: 'pointer', color: '#2d3748', fontSize: 'inherit', textAlign: 'left', fontFamily: 'inherit' },
+  origName:   { color: '#9ca3af', fontSize: '0.78rem' },
+  nickBtn:    { background: 'none', border: 'none', cursor: 'pointer', color: '#0d7a6b', padding: '0 2px', fontSize: '0.85rem', lineHeight: 1 },
+  nickInput:  { fontSize: '0.9rem', padding: '0.15rem 0.4rem', border: '1px solid #0d7a6b', borderRadius: 4, minWidth: 120, outline: 'none' },
 };
 
 const navBlockStyles: Record<string, React.CSSProperties> = {

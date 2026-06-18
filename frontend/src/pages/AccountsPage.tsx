@@ -56,6 +56,10 @@ const AccountsPage: React.FC = () => {
   const [toggling, setToggling] = useState<Set<string>>(new Set());
   // Track which institution groups are expanded (default: all expanded)
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  // Inline nickname editing
+  const [editingNickId, setEditingNickId] = useState<string | null>(null);
+  const [nickDraft, setNickDraft] = useState('');
+  const nickCancelRef = React.useRef(false);
 
   const { fetchLinkToken, open, ready, loading: linkLoading } = usePlaidConnect({
     onSuccess: (newAccounts) => {
@@ -96,6 +100,26 @@ const AccountsPage: React.FC = () => {
   };
 
   const isEnabled = (acct: Account) => acct.enabled !== false;
+
+  const openNickEdit = (acct: Account) => {
+    setNickDraft(acct.nickName || '');
+    setEditingNickId(acct.accountId);
+  };
+
+  const saveNickName = async (acct: Account) => {
+    if (nickCancelRef.current) { nickCancelRef.current = false; return; }
+    const trimmed = nickDraft.trim();
+    setEditingNickId(null);
+    if (trimmed === (acct.nickName || '')) return;
+    try {
+      await updateAccount(acct.accountId, { nickName: trimmed });
+      setAccounts(prev => prev.map(a =>
+        a.accountId === acct.accountId ? { ...a, nickName: trimmed || undefined } : a
+      ));
+    } catch (e: any) {
+      setError(e.message);
+    }
+  };
 
   const groups = groupByInstitution(accounts);
 
@@ -157,7 +181,29 @@ const AccountsPage: React.FC = () => {
                       <tbody>
                         {group.accounts.map(acct => (
                           <tr key={acct.accountId} style={{ ...s.tr, opacity: isEnabled(acct) ? 1 : 0.5 }}>
-                            <td style={s.td}>{acct.name}</td>
+                            <td style={s.td}>
+                              {editingNickId === acct.accountId ? (
+                                <input
+                                  autoFocus
+                                  type="text"
+                                  value={nickDraft}
+                                  onChange={e => setNickDraft(e.target.value)}
+                                  onKeyDown={e => {
+                                    if (e.key === 'Enter') { e.preventDefault(); (e.target as HTMLInputElement).blur(); }
+                                    if (e.key === 'Escape') { nickCancelRef.current = true; setEditingNickId(null); }
+                                  }}
+                                  onBlur={() => saveNickName(acct)}
+                                  placeholder={acct.name}
+                                  style={s.nickInput}
+                                />
+                              ) : (
+                                <span style={s.nameCell}>
+                                  <span>{acct.nickName || acct.name}</span>
+                                  {acct.nickName && <span style={s.origName}>({acct.name})</span>}
+                                  <button style={s.nickBtn} onClick={() => openNickEdit(acct)} title="Set friendly name">✎</button>
+                                </span>
+                              )}
+                            </td>
                             <td style={s.td}>{acct.type}</td>
                             <td style={s.td}>{acct.subtype}</td>
                             <td style={s.td}>{fmtDate(acct.lastSynced)}</td>
@@ -179,7 +225,27 @@ const AccountsPage: React.FC = () => {
                         <div key={acct.accountId} style={{ ...s.card, opacity: isEnabled(acct) ? 1 : 0.5 }}>
                           <div style={s.cardRow}>
                             <span style={s.cardLabel}>Name</span>
-                            <span>{acct.name}</span>
+                            {editingNickId === acct.accountId ? (
+                              <input
+                                autoFocus
+                                type="text"
+                                value={nickDraft}
+                                onChange={e => setNickDraft(e.target.value)}
+                                onKeyDown={e => {
+                                  if (e.key === 'Enter') { e.preventDefault(); (e.target as HTMLInputElement).blur(); }
+                                  if (e.key === 'Escape') { nickCancelRef.current = true; setEditingNickId(null); }
+                                }}
+                                onBlur={() => saveNickName(acct)}
+                                placeholder={acct.name}
+                                style={s.nickInput}
+                              />
+                            ) : (
+                              <span style={s.nameCell}>
+                                <span>{acct.nickName || acct.name}</span>
+                                {acct.nickName && <span style={s.origName}>({acct.name})</span>}
+                                <button style={s.nickBtn} onClick={() => openNickEdit(acct)} title="Set friendly name">✎</button>
+                              </span>
+                            )}
                           </div>
                           <div style={s.cardRow}>
                             <span style={s.cardLabel}>Type</span>
@@ -233,8 +299,12 @@ const s: Record<string, React.CSSProperties> = {
   tr:              { borderBottom: '1px solid #e2e8f0' },
   td:              { padding: '0.65rem 1rem', fontSize: '0.9rem', verticalAlign: 'middle', color: '#2d3748' },
   card:            { background: '#fff', borderTop: '1px solid #e2e8f0', padding: '0.875rem 1rem' },
-  cardRow:         { display: 'flex', justifyContent: 'space-between', padding: '0.2rem 0', fontSize: '0.9rem' },
+  cardRow:         { display: 'flex', justifyContent: 'space-between', padding: '0.2rem 0', fontSize: '0.9rem', alignItems: 'center' },
   cardLabel:       { color: '#6b7280', fontWeight: 600 },
+  nameCell:        { display: 'inline-flex', alignItems: 'center', gap: '0.35rem' },
+  origName:        { color: '#9ca3af', fontSize: '0.78rem' },
+  nickBtn:         { background: 'none', border: 'none', cursor: 'pointer', color: '#0d7a6b', padding: '0 2px', fontSize: '0.85rem', lineHeight: 1 },
+  nickInput:       { fontSize: '0.9rem', padding: '0.15rem 0.4rem', border: '1px solid #0d7a6b', borderRadius: 4, width: '100%', minWidth: 120, outline: 'none' },
 };
 
 export default AccountsPage;

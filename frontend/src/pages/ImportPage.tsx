@@ -2,15 +2,20 @@ import React, { useRef, useState } from 'react';
 import {
   importAmazonCsv,
   confirmAmazonImport,
+  updateTransactionCategory,
+  updateTransactionBudget,
   ImportReport,
   MatchResult,
   ConfirmedMatch,
   Transaction,
+  MASTER_BUDGET_ID,
 } from '../api/client';
+import { useData } from '../auth/DataContext';
 import { fmtDate } from '../utils/dates';
 import { fmtCurrency } from '../utils/dates';
 
 const ImportPage: React.FC = () => {
+  const { categories, budgets } = useData();
   const fileRef = useRef<HTMLInputElement>(null);
   const [report, setReport] = useState<ImportReport | null>(null);
   const [loading, setLoading] = useState(false);
@@ -22,6 +27,10 @@ const ImportPage: React.FC = () => {
   const [choices, setChoices] = useState<Record<string, string>>({});
   // Which orders are checked (by orderId)
   const [selected, setSelected] = useState<Set<string>>(new Set());
+
+  // Optional category / budget to apply to all confirmed transactions
+  const [applyCategory, setApplyCategory] = useState('');
+  const [applyBudget, setApplyBudget] = useState('');
 
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -63,7 +72,10 @@ const ImportPage: React.FC = () => {
     setError(null);
     setSuccessMsg(null);
     try {
+      // Collect confirmed transaction pairings
       const confirmed: ConfirmedMatch[] = [];
+      const matchedTxns: Transaction[] = [];
+
       report.results.forEach((m) => {
         if (!selected.has(m.order.orderId)) return;
 
@@ -82,14 +94,38 @@ const ImportPage: React.FC = () => {
           referenceUrl: m.order.orderUrl,
           referenceNote: `Amazon Order #${m.order.orderId}${m.order.titles.length ? ' \u2014 ' + m.order.titles[0] : ''}`,
         });
+        matchedTxns.push(txn);
       });
 
+      // 1. Save Amazon reference links
       const result = await confirmAmazonImport(confirmed);
+
+      // 2. Apply category and/or budget to all confirmed transactions (in parallel)
+      if ((applyCategory || applyBudget) && matchedTxns.length > 0) {
+        await Promise.all(
+          matchedTxns.flatMap((txn) => {
+            const ops = [];
+            if (applyCategory) {
+              ops.push(updateTransactionCategory(txn.accountId, txn.dateTransactionId, applyCategory));
+            }
+            if (applyBudget) {
+              ops.push(updateTransactionBudget(txn.accountId, txn.dateTransactionId, applyBudget));
+            }
+            return ops;
+          })
+        );
+      }
+
       setSuccessMsg(
         `${result.saved} transaction(s) updated with Amazon order references.` +
-        (result.errors.length ? ' Some errors: ' + result.errors.join(', ') : '')
+        (applyCategory || applyBudget
+          ? ` Category/budget applied to ${matchedTxns.length} transaction(s).`
+          : '') +
+        (result.errors?.length ? ' Some errors: ' + result.errors.join(', ') : '')
       );
       setReport(null);
+      setApplyCategory('');
+      setApplyBudget('');
     } catch (err: any) {
       setError(err.message);
     } finally {
@@ -184,6 +220,9 @@ const ImportPage: React.FC = () => {
                   </td>
                   <td style={styles.td}>
                     <span style={styles.titleText}>{m.order.titles.slice(0, 2).join('; ')}</span>
+                    {m.order.refunded && (
+                      <span style={styles.refundedBadge}>refunded</span>
+                    )}
                   </td>
                    <td style={{ ...styles.td, textAlign: 'right' }}>
                      {fmtCurrency(m.order.amount)}
@@ -222,6 +261,33 @@ const ImportPage: React.FC = () => {
           </div>
 
           <div style={styles.confirmRow}>
+            <div style={styles.confirmLeft}>
+              <label style={styles.assignLabel}>Category</label>
+              <select
+                style={styles.assignSelect}
+                value={applyCategory}
+                onChange={e => setApplyCategory(e.target.value)}
+                disabled={confirming || confirmableCount === 0}
+              >
+                <option value="">— None —</option>
+                {categories.map(c => (
+                  <option key={c.categoryId} value={c.categoryId}>{c.name}</option>
+                ))}
+              </select>
+              <label style={styles.assignLabel}>Budget</label>
+              <select
+                style={styles.assignSelect}
+                value={applyBudget}
+                onChange={e => setApplyBudget(e.target.value)}
+                disabled={confirming || confirmableCount === 0}
+              >
+                <option value="">— None —</option>
+                <option value={MASTER_BUDGET_ID}>⬡ Master Budget</option>
+                {budgets.map(b => (
+                  <option key={b.budgetId} value={b.budgetId}>{b.name}</option>
+                ))}
+              </select>
+            </div>
             <button
               style={styles.confirmBtn}
               onClick={handleConfirm}
@@ -256,10 +322,14 @@ const styles: Record<string, React.CSSProperties> = {
   badge: { color: '#fff', borderRadius: 12, padding: '0.15rem 0.6rem', fontSize: '0.75rem', whiteSpace: 'nowrap' },
   orderLink: { color: '#0d7a6b', fontSize: '0.8rem' },
   titleText: { fontSize: '0.8rem', color: '#4a5568' },
+  refundedBadge: { marginLeft: 6, fontSize: '0.7rem', background: '#fff5f5', color: '#c53030', border: '1px solid #feb2b2', borderRadius: 4, padding: '1px 5px', verticalAlign: 'middle', whiteSpace: 'nowrap' as const },
   txnInfo: { fontSize: '0.8rem', color: '#4a5568' },
   unmatchedText: { fontSize: '0.8rem', color: '#a0aec0', fontStyle: 'italic' },
   select: { maxWidth: 300 },
-  confirmRow: { marginTop: '1rem', display: 'flex', justifyContent: 'flex-end' },
+  confirmRow: { marginTop: '1rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap' as const, gap: '0.75rem' },
+  confirmLeft: { display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' as const },
+  assignLabel: { fontSize: '0.82rem', color: '#4a5568', fontWeight: 600, whiteSpace: 'nowrap' as const },
+  assignSelect: { fontSize: '0.82rem', border: '1px solid #cbd5e0', borderRadius: 5, padding: '0.3rem 0.5rem', color: '#2d3748' },
   confirmBtn: { background: '#38a169', color: '#fff', border: 'none', borderRadius: 6, padding: '0.5rem 1.5rem', cursor: 'pointer', fontSize: '0.875rem' },
   empty: { textAlign: 'center', color: '#718096', marginTop: '3rem' },
   error: { background: '#fff5f5', color: '#c53030', border: '1px solid #feb2b2', borderRadius: 6, padding: '0.75rem 1rem', marginBottom: '1rem' },

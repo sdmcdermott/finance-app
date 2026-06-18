@@ -11,10 +11,12 @@ frontend/out
 # Build artifacts
 frontend/build/
 backend/.aws-sam/
-backend.samconfig.*
+samconfig.toml
+samconfig.prod.toml
 
 # Environment / secrets — never commit these
 backend/local-env.json
+backend/local-env.json.remote
 .env.local
 .env.production
 .env*.local

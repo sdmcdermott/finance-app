@@ -47,7 +47,7 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response,
 	}
 
 	saved := 0
-	var errs []string
+	errs := make([]string, 0) // non-nil so JSON marshals as [] not null
 	for _, m := range body.Matches {
 		if m.AccountID == "" || m.DateTransactionID == "" {
 			continue

@@ -1,5 +1,6 @@
 import axios from 'axios';
 import { AUTH_DISABLED, userPool } from '../auth/cognitoPool';
+import { touchActivity } from '../auth/sessionActivity';
 
 const api = axios.create({
   baseURL: process.env.REACT_APP_API_URL || undefined,
@@ -23,15 +24,33 @@ api.interceptors.request.use((config) => {
   });
 });
 
+// Touch activity timestamp on every successful response so the inactivity
+// timer in AuthContext resets with each API call.
+api.interceptors.response.use((response) => {
+  touchActivity();
+  return response;
+});
+
 export interface Account {
   accountId: string;
   itemId: string;
   institution: string;
   name: string;
+  nickName?: string;  // user-supplied friendly name; overrides name when present
   type: string;
   subtype: string;
   lastSynced: string;
   enabled?: boolean;  // absent == true (legacy records)
+}
+
+export interface TransactionLocation {
+  address?: string;
+  city?: string;
+  region?: string;
+  postalCode?: string;
+  country?: string;
+  lat?: number;
+  lon?: number;
 }
 
 export interface Transaction {
@@ -49,6 +68,7 @@ export interface Transaction {
   merchantName: string;
   referenceUrl: string;
   referenceNote: string;
+  customName?: string;  // user-supplied friendly name; overrides merchantName/name when present
   // Plaid enrichment fields
   originalDescription?: string;
   authorizedDate?: string;
@@ -56,6 +76,7 @@ export interface Transaction {
   personalFinancePrimary?: string;
   personalFinanceDetailed?: string;
   logoUrl?: string;
+  location?: TransactionLocation;
   splits?: TransactionSplit[];
 }
 
@@ -103,7 +124,10 @@ export const deleteAccount = async (accountId: string): Promise<void> => {
   await api.delete(`/accounts/${encodeURIComponent(accountId)}`);
 };
 
-export const updateAccount = async (accountId: string, patch: { enabled: boolean }): Promise<void> => {
+export const updateAccount = async (
+  accountId: string,
+  patch: { enabled?: boolean; nickName?: string }
+): Promise<void> => {
   await api.patch(`/accounts/${encodeURIComponent(accountId)}`, patch);
 };
 
@@ -308,6 +332,17 @@ export const updateTransactionReference = async (
   );
 };
 
+export const updateTransactionName = async (
+  accountId: string,
+  dateTransactionId: string,
+  customName: string
+): Promise<void> => {
+  await api.patch(
+    `/transactions/${encodeURIComponent(accountId)}/${encodeURIComponent(dateTransactionId)}/name`,
+    { customName }
+  );
+};
+
 // ── Amazon CSV import ─────────────────────────────────────────────────────────
 
 export interface AmazonOrder {
@@ -316,6 +351,7 @@ export interface AmazonOrder {
   amount: number;
   titles: string[];
   orderUrl: string;
+  refunded?: boolean;
 }
 
 export type MatchStatus = 'confident' | 'ambiguous' | 'unmatched';

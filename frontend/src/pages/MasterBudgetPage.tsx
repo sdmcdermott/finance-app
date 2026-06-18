@@ -3,10 +3,10 @@ import { useData } from '../auth/DataContext';
 import { useDirtyGuard } from '../auth/DirtyGuardContext';
 import {
   MasterBudget, MBIncomeSource, MBFixedCost, MBBucket,
-  getMasterBudget, putMasterBudget, getTransactions, Transaction,
+  getMasterBudget, putMasterBudget,
   putRule, applyRules,
   INCOME_BUDGET_PREFIX, INCOME_CATEGORY_ID,
-  getMasterBudgetVariance, MasterBudgetVariance,
+  getMasterBudgetVariance, MasterBudgetVariance, MASTER_BUDGET_ID,
 } from '../api/client';
 import { fmtCurrency } from '../utils/dates';
 import { MoneyInput } from '../components/MoneyInput';
@@ -71,55 +71,6 @@ const BucketPercentInput: React.FC<{ value: number; onCommit: (v: number) => voi
 
 const uuidv4 = () => crypto.randomUUID();
 
-// ── Cluster master-budget transactions into inferred fixed costs ───────────────
-
-interface TxnFixedCost {
-  merchant: string;
-  meanAmount: number;
-  frequency: string;
-  occurrences: number;
-}
-
-function clusterMasterBudgetTxns(txns: Transaction[]): TxnFixedCost[] {
-  const mb = txns.filter(t => t.budgetId === '__master_budget__' && t.amount > 0);
-  type Cluster = { merchant: string; txns: Transaction[] };
-  const assigned = new Array(mb.length).fill(false);
-  const clusters: Cluster[] = [];
-
-  for (let i = 0; i < mb.length; i++) {
-    if (assigned[i]) continue;
-    const t = mb[i];
-    const merchant = t.merchantName || t.name || '';
-    if (!merchant) continue;
-    const cl: Cluster = { merchant, txns: [t] };
-    assigned[i] = true;
-
-    for (let j = i + 1; j < mb.length; j++) {
-      if (assigned[j]) continue;
-      const u = mb[j];
-      const uMerchant = u.merchantName || u.name || '';
-      if (merchant.toLowerCase() !== uMerchant.toLowerCase()) continue;
-      const di = new Date(t.date).getDate();
-      const dj = new Date(u.date).getDate();
-      let dd = Math.abs(di - dj);
-      if (dd > 15) dd = 30 - dd;
-      if (dd > 1) continue;
-      if (Math.abs(Math.abs(t.amount) - Math.abs(u.amount)) > 5) continue;
-      cl.txns.push(u);
-      assigned[j] = true;
-    }
-    clusters.push(cl);
-  }
-
-  return clusters.map(cl => {
-    const n = cl.txns.length;
-    const meanAmt = Math.round(cl.txns.reduce((s, t) => s + Math.abs(t.amount), 0) / n * 100) / 100;
-    const freq = n >= 24 ? 'weekly' : n >= 11 ? 'biweekly' : n >= 10 ? 'semimonthly'
-      : n >= 3 ? 'monthly' : n === 2 ? 'quarterly' : 'annually';
-    return { merchant: cl.merchant, meanAmount: meanAmt, frequency: freq, occurrences: n };
-  });
-}
-
 // ── Frequency helpers ──────────────────────────────────────────────────────────
 
 const FREQ_LABELS: Record<string, string> = {
@@ -166,7 +117,7 @@ const Toggle: React.FC<{ on: boolean; onChange: (v: boolean) => void }> = ({ on,
 // ── Main component ─────────────────────────────────────────────────────────────
 
 const MasterBudgetPage: React.FC = () => {
-  const { incomeSources, budgets, refreshAll, rules } = useData();
+  const { incomeSources, budgets, refreshAll, rules, categories } = useData();
 
   const [mb, setMb] = useState<MasterBudget | null>(null);
   const [versions, setVersions] = useState<MasterBudget[]>([]);
@@ -182,8 +133,6 @@ const MasterBudgetPage: React.FC = () => {
   const [error, setError] = useState('');
   const [dirty, setDirty] = useState(false);
   const [showSuggest, setShowSuggest] = useState(false);
-  const [txnFixedCosts, setTxnFixedCosts] = useState<TxnFixedCost[]>([]);
-  const [showTxnCosts, setShowTxnCosts] = useState(false);
   const [variance, setVariance] = useState<MasterBudgetVariance | null>(null);
 
   // Register dirty check with nav guard; unregister on unmount
@@ -210,6 +159,20 @@ const MasterBudgetPage: React.FC = () => {
     pattern: string; amountMatch: number; amountTolerance: number;
   }>>({});
   const [incomeRuleSaving, setIncomeRuleSaving] = useState<Set<string>>(new Set());
+
+  // Fixed cost rule config: which rows are expanded, and local draft state
+  const [expandedFcRule, setExpandedFcRule] = useState<Set<string>>(new Set());
+  const [fcRuleDraft, setFcRuleDraft] = useState<Record<string, {
+    pattern: string;
+    categoryId: string;
+    useAmount: boolean;
+    amountMatch: number;
+    amountTolerance: number;
+    useDay: boolean;
+    dayOfMonth: number;
+    dayTolerance: number;
+  }>>({});
+  const [fcRuleSaving, setFcRuleSaving] = useState<Set<string>>(new Set());
 
   const toggleIncomeRuleExpand = (sourceId: string) => {
     setExpandedIncomeRule(prev => {
@@ -264,6 +227,70 @@ const MasterBudgetPage: React.FC = () => {
     }
   };
 
+  const toggleFcRuleExpand = (fcId: string) => {
+    setExpandedFcRule(prev => {
+      const s = new Set(prev);
+      if (s.has(fcId)) { s.delete(fcId); return s; }
+      s.add(fcId);
+      // Seed draft from existing rule if fc has one, otherwise from fc defaults
+      if (!fcRuleDraft[fcId]) {
+        const fc = mb?.fixedCosts.find(f => f.id === fcId);
+        const existing = fc?.ruleId ? rules.find(r => r.ruleId === fc.ruleId) : undefined;
+        const hasExistingAmount = (existing?.amountMatch ?? 0) > 0;
+        const hasExistingDay    = (existing?.dayOfMonth  ?? 0) > 0;
+        setFcRuleDraft(d => ({
+          ...d,
+          [fcId]: {
+            pattern:         existing?.pattern         ?? fc?.name ?? '',
+            categoryId:      existing?.categoryId      ?? '',
+            useAmount:       hasExistingAmount || (!existing && (fc?.amount ?? 0) > 0),
+            amountMatch:     existing?.amountMatch     ?? fc?.amount ?? 0,
+            amountTolerance: existing?.amountTolerance ?? 5,
+            useDay:          hasExistingDay,
+            dayOfMonth:      existing?.dayOfMonth      ?? 0,
+            dayTolerance:    existing?.dayTolerance    ?? 3,
+          },
+        }));
+      }
+      return s;
+    });
+  };
+
+  const patchFcRuleDraft = (fcId: string, patch: Partial<typeof fcRuleDraft[string]>) => {
+    setFcRuleDraft(d => ({ ...d, [fcId]: { ...d[fcId], ...patch } }));
+  };
+
+  const saveFcRule = async (fc: MBFixedCost) => {
+    const draft = fcRuleDraft[fc.id];
+    if (!draft?.pattern) return;
+    setFcRuleSaving(prev => new Set(prev).add(fc.id));
+    try {
+      const ruleId = fc.ruleId || crypto.randomUUID();
+      await putRule({
+        ruleId,
+        pattern:    draft.pattern,
+        categoryId: draft.categoryId,
+        budgetId:   MASTER_BUDGET_ID,
+        priority:   50,
+        ...(draft.useAmount && draft.amountMatch > 0 ? {
+          amountMatch:     draft.amountMatch,
+          amountTolerance: draft.amountTolerance,
+        } : {}),
+        ...(draft.useDay && draft.dayOfMonth > 0 ? {
+          dayOfMonth:  draft.dayOfMonth,
+          dayTolerance: draft.dayTolerance,
+        } : {}),
+      });
+      updateFixedCost(fc.id, { ruleId });
+      try { await applyRules(); } catch { /* non-fatal */ }
+      setExpandedFcRule(prev => { const s = new Set(prev); s.delete(fc.id); return s; });
+    } catch (e: any) {
+      alert('Failed to save rule: ' + e.message);
+    } finally {
+      setFcRuleSaving(prev => { const s = new Set(prev); s.delete(fc.id); return s; });
+    }
+  };
+
   // Load once on mount
   useEffect(() => {
     getMasterBudget()
@@ -298,24 +325,6 @@ const MasterBudgetPage: React.FC = () => {
         ));
       })
       .finally(() => setLoading(false));
-
-    // Fetch last 6 months of transactions to find master-budget-assigned ones
-    const end = new Date();
-    const start = new Date(); start.setMonth(start.getMonth() - 6);
-    getTransactions({
-      startDate: start.toISOString().slice(0, 10),
-      endDate:   end.toISOString().slice(0, 10),
-    }).then(txns => {
-      const clusters = clusterMasterBudgetTxns(txns);
-      setTxnFixedCosts(clusters);
-      // Auto-expand if there are clusters not yet added as managed fixed costs
-      setMb(prev => {
-        if (prev && clusters.some(tc => !prev.fixedCosts.some(fc => fc.name.toLowerCase() === tc.merchant.toLowerCase()))) {
-          setShowTxnCosts(true);
-        }
-        return prev;
-      });
-    }).catch(() => {}); // non-fatal
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -784,12 +793,18 @@ const MasterBudgetPage: React.FC = () => {
               <th style={{ ...s.th, textAlign: 'right' }}>Amount</th>
               <th style={{ ...s.th, textAlign: 'right' }}>Monthly</th>
               <th style={s.th}>Variance budget</th>
+              <th style={s.th}>Match rule</th>
               <th style={s.th}></th>
             </tr>
           </thead>
           <tbody>
-            {mb.fixedCosts.map(fc => (
-              <tr key={fc.id} style={s.tr}>
+            {mb.fixedCosts.map(fc => {
+              const isExpanded = expandedFcRule.has(fc.id);
+              const draft = fcRuleDraft[fc.id];
+              const hasRule = !!fc.ruleId;
+              return (
+              <React.Fragment key={fc.id}>
+              <tr style={s.tr}>
                 <td style={s.td}>
                   <input
                     style={s.nameInput}
@@ -831,83 +846,130 @@ const MasterBudgetPage: React.FC = () => {
                     ))}
                   </select>
                 </td>
+                <td style={s.td}>
+                  <button
+                    style={{ ...s.suggestLink, fontSize: '0.78rem' }}
+                    onClick={() => toggleFcRuleExpand(fc.id)}
+                  >
+                    {hasRule ? '✓ rule' : '+ match rule'}{isExpanded ? ' ▲' : ' ▼'}
+                  </button>
+                </td>
                 <td style={{ ...s.td, textAlign: 'right' }}>
                   <button style={s.removeBtn} onClick={() => removeFixedCost(fc.id)} title="Remove">✕</button>
                 </td>
               </tr>
-            ))}
+              {isExpanded && (
+                <tr style={{ background: '#f7fafc' }}>
+                  <td colSpan={7} style={{ padding: '0.75rem 1rem', borderBottom: '1px solid #e2e8f0' }}>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.75rem', alignItems: 'flex-end' }}>
+                      <label style={s.ruleLabel}>
+                        Description contains
+                        <input
+                          style={s.ruleInput}
+                          placeholder={`e.g. ${fc.name || 'netflix'}`}
+                          value={draft?.pattern ?? ''}
+                          onChange={e => patchFcRuleDraft(fc.id, { pattern: e.target.value })}
+                        />
+                      </label>
+                      <label style={s.ruleLabel}>
+                        Category <span style={{ fontWeight: 400, color: '#a0aec0' }}>(optional)</span>
+                        <select
+                          style={{ ...s.ruleInput, minWidth: 160 }}
+                          value={draft?.categoryId ?? ''}
+                          onChange={e => patchFcRuleDraft(fc.id, { categoryId: e.target.value })}
+                        >
+                          <option value="">— None —</option>
+                          {categories.map(c => (
+                            <option key={c.categoryId} value={c.categoryId}>{c.name}</option>
+                          ))}
+                        </select>
+                      </label>
+                    </div>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.75rem', alignItems: 'flex-end', marginTop: '0.5rem' }}>
+                      <label style={{ ...s.ruleLabel, flexDirection: 'row', alignItems: 'center', gap: '0.35rem' }}>
+                        <input
+                          type="checkbox"
+                          checked={draft?.useAmount ?? false}
+                          onChange={e => patchFcRuleDraft(fc.id, { useAmount: e.target.checked })}
+                        />
+                        Match amount
+                      </label>
+                      {draft?.useAmount && (
+                        <>
+                          <label style={s.ruleLabel}>
+                            Amount ($)
+                            <input
+                              style={{ ...s.ruleInput, maxWidth: 100 }}
+                              type="number" min="0" step="0.01"
+                              value={draft?.amountMatch || ''}
+                              onChange={e => patchFcRuleDraft(fc.id, { amountMatch: parseFloat(e.target.value) || 0 })}
+                            />
+                          </label>
+                          <label style={s.ruleLabel}>
+                            ±$ tolerance
+                            <input
+                              style={{ ...s.ruleInput, maxWidth: 70 }}
+                              type="number" min="0" step="0.01"
+                              value={draft?.amountTolerance ?? 5}
+                              onChange={e => patchFcRuleDraft(fc.id, { amountTolerance: parseFloat(e.target.value) || 0 })}
+                            />
+                          </label>
+                        </>
+                      )}
+                    </div>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.75rem', alignItems: 'flex-end', marginTop: '0.5rem' }}>
+                      <label style={{ ...s.ruleLabel, flexDirection: 'row', alignItems: 'center', gap: '0.35rem' }}>
+                        <input
+                          type="checkbox"
+                          checked={draft?.useDay ?? false}
+                          onChange={e => patchFcRuleDraft(fc.id, { useDay: e.target.checked })}
+                        />
+                        Match day of month
+                      </label>
+                      {draft?.useDay && (
+                        <>
+                          <label style={s.ruleLabel}>
+                            Day (1–31)
+                            <input
+                              style={{ ...s.ruleInput, maxWidth: 70 }}
+                              type="number" min="1" max="31"
+                              value={draft?.dayOfMonth || ''}
+                              onChange={e => patchFcRuleDraft(fc.id, { dayOfMonth: parseInt(e.target.value) || 0 })}
+                            />
+                          </label>
+                          <label style={s.ruleLabel}>
+                            ±days tolerance
+                            <input
+                              style={{ ...s.ruleInput, maxWidth: 70 }}
+                              type="number" min="0" max="15"
+                              value={draft?.dayTolerance ?? 3}
+                              onChange={e => patchFcRuleDraft(fc.id, { dayTolerance: parseInt(e.target.value) || 0 })}
+                            />
+                          </label>
+                        </>
+                      )}
+                    </div>
+                    <div style={{ marginTop: '0.6rem' }}>
+                      <button
+                        style={draft?.pattern ? s.addBtn : { ...s.addBtn, opacity: 0.5 }}
+                        disabled={!draft?.pattern || fcRuleSaving.has(fc.id)}
+                        onClick={() => saveFcRule(fc)}
+                      >
+                        {fcRuleSaving.has(fc.id) ? 'Saving…' : 'Save rule'}
+                      </button>
+                    </div>
+                    <p style={{ ...s.muted, marginTop: '0.4rem', fontSize: '0.78rem' }}>
+                      Matching transactions will be assigned to Master Budget and tracked against this cost.
+                    </p>
+                  </td>
+                </tr>
+              )}
+              </React.Fragment>
+              );
+            })}
           </tbody>
         </table>
         <button style={s.addBtn} onClick={addFixedCost}>+ Add cost</button>
-
-        {/* Txn-assigned master budget costs — read-only inferred rows */}
-        {txnFixedCosts.length > 0 && (
-          <div style={{ marginTop: '1rem' }}>
-            <button
-              style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 0, color: '#0d7a6b', fontWeight: 600, fontSize: '0.9rem', display: 'flex', alignItems: 'center', gap: '0.3rem' }}
-              onClick={() => setShowTxnCosts(v => !v)}
-            >
-              <span style={{ fontSize: '0.75rem' }}>{showTxnCosts ? '▼' : '▶'}</span>
-              From transactions
-              {!showTxnCosts && txnFixedCosts.some(tc => !mb.fixedCosts.some(fc => fc.name.toLowerCase() === tc.merchant.toLowerCase())) && (
-                <span style={{ background: '#0d7a6b', color: '#fff', borderRadius: '999px', fontSize: '0.7rem', padding: '1px 7px', marginLeft: '0.25rem' }}>
-                  {txnFixedCosts.filter(tc => !mb.fixedCosts.some(fc => fc.name.toLowerCase() === tc.merchant.toLowerCase())).length} new
-                </span>
-              )}
-            </button>
-            {showTxnCosts && (
-              <>
-                <p style={{ ...s.sectionNote, margin: '0.4rem 0' }}>
-                  These merchants have transactions assigned to Master Budget. Click <em>Add</em> to convert to a managed fixed cost.
-                </p>
-                <table style={s.table}>
-                  <thead>
-                    <tr>
-                      <th style={s.th}>Merchant</th>
-                      <th style={{ ...s.th, textAlign: 'right' }}>Avg amount</th>
-                      <th style={s.th}>Inferred frequency</th>
-                      <th style={{ ...s.th, textAlign: 'center' }}>Seen</th>
-                      <th style={s.th}></th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {txnFixedCosts.map((tc, i) => {
-                      const alreadyAdded = mb.fixedCosts.some(
-                        fc => fc.name.toLowerCase() === tc.merchant.toLowerCase()
-                      );
-                      return (
-                        <tr key={i} style={{ ...s.tr, opacity: alreadyAdded ? 0.45 : 1 }}>
-                          <td style={s.td}>{tc.merchant}</td>
-                          <td style={{ ...s.td, textAlign: 'right' }}>{fmtCurrency(tc.meanAmount)}</td>
-                          <td style={s.td}>{FREQ_LABELS[tc.frequency] ?? tc.frequency}</td>
-                          <td style={{ ...s.td, textAlign: 'center' }}>{tc.occurrences}×</td>
-                          <td style={s.td}>
-                            {alreadyAdded ? (
-                              <span style={s.muted}>added</span>
-                            ) : (
-                              <button
-                                style={s.addBtn}
-                                onClick={() => patch_mb({
-                                  fixedCosts: [...mb.fixedCosts, {
-                                    id:        uuidv4(),
-                                    name:      tc.merchant,
-                                    amount:    tc.meanAmount,
-                                    frequency: tc.frequency as MBFixedCost['frequency'],
-                                    fromTxn:   true,
-                                  }],
-                                })}
-                              >Add</button>
-                            )}
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </>
-            )}
-          </div>
-        )}
       </Section>
 
       {/* ── Variance Summary ────────────────────────────────────────────── */}
@@ -1145,6 +1207,9 @@ const MasterBudgetPage: React.FC = () => {
             patch_mb({ fixedCosts: [...mb.fixedCosts, ...added] });
           }
           setShowSuggest(false);
+          // Reload rules into DataContext so the inline rule form seeds
+          // correctly without requiring a page leave-and-return.
+          refreshAll();
         }}
       />
     )}

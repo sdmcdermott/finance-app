@@ -15,7 +15,8 @@ import (
 type response = events.APIGatewayV2HTTPResponse
 
 type updateRequest struct {
-	Enabled *bool `json:"enabled"`
+	Enabled  *bool   `json:"enabled"`
+	NickName *string `json:"nickName"`
 }
 
 func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response, error) {
@@ -32,8 +33,8 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response,
 	if err := json.Unmarshal([]byte(req.Body), &body); err != nil {
 		return errorResponse(http.StatusBadRequest, "invalid request body"), nil
 	}
-	if body.Enabled == nil {
-		return errorResponse(http.StatusBadRequest, "enabled field is required"), nil
+	if body.Enabled == nil && body.NickName == nil {
+		return errorResponse(http.StatusBadRequest, "at least one of enabled or nickName is required"), nil
 	}
 
 	dbClient, err := dbpkg.New(ctx)
@@ -42,14 +43,26 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response,
 	}
 
 	userID := plaidclient.UserID()
-	if err := dbClient.UpdateAccountEnabled(ctx, userID, accountID, *body.Enabled); err != nil {
-		return errorResponse(http.StatusInternalServerError, err.Error()), nil
+
+	if body.Enabled != nil {
+		if err := dbClient.UpdateAccountEnabled(ctx, userID, accountID, *body.Enabled); err != nil {
+			return errorResponse(http.StatusInternalServerError, err.Error()), nil
+		}
+	}
+	if body.NickName != nil {
+		if err := dbClient.UpdateAccountNickName(ctx, userID, accountID, *body.NickName); err != nil {
+			return errorResponse(http.StatusInternalServerError, err.Error()), nil
+		}
 	}
 
-	out, _ := json.Marshal(map[string]interface{}{
-		"accountId": accountID,
-		"enabled":   *body.Enabled,
-	})
+	resp := map[string]interface{}{"accountId": accountID}
+	if body.Enabled != nil {
+		resp["enabled"] = *body.Enabled
+	}
+	if body.NickName != nil {
+		resp["nickName"] = *body.NickName
+	}
+	out, _ := json.Marshal(resp)
 	return response{StatusCode: http.StatusOK, Body: string(out), Headers: jsonHeaders()}, nil
 }
 

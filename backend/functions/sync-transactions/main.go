@@ -187,6 +187,26 @@ func runSync(ctx context.Context) (*syncResult, error) {
 				txn.PersonalFinancePrimary = pfc.GetPrimary()
 				txn.PersonalFinanceDetailed = pfc.GetDetailed()
 			}
+			// Extract location — only store when at least one address field is non-empty
+			// (Plaid always returns a Location struct, even for online transactions).
+			loc := t.GetLocation()
+			locAddr    := nullableStr(loc.Address)
+			locCity    := nullableStr(loc.City)
+			locRegion  := nullableStr(loc.Region)
+			locZip     := nullableStr(loc.PostalCode)
+			locCountry := nullableStr(loc.Country)
+			if locAddr != "" || locCity != "" || locRegion != "" || locZip != "" {
+				tLoc := &dbpkg.TransactionLocation{
+					Address:    locAddr,
+					City:       locCity,
+					Region:     locRegion,
+					PostalCode: locZip,
+					Country:    locCountry,
+					Lat:        loc.Lat.Get(),
+					Lon:        loc.Lon.Get(),
+				}
+				txn.Location = tLoc
+			}
 			toWrite = append(toWrite, txn)
 		}
 		if len(toWrite) > 0 {
@@ -208,6 +228,30 @@ func runSync(ctx context.Context) (*syncResult, error) {
 				allWritten = append(allWritten, updated...)
 			} else {
 				allWritten = append(allWritten, toWrite...)
+			}
+		}
+
+		// Delete orphaned pending records that Plaid has reported as removed.
+		// When a pending transaction settles, Plaid puts the pending ID in
+		// removed[] and the posted transaction in added[]. Without this step
+		// both records appear in the transaction list.
+		if len(removed) > 0 {
+			plaidIDs := make(map[string]bool, len(removed))
+			for _, r := range removed {
+				if id := r.GetTransactionId(); id != "" {
+					plaidIDs[id] = true
+				}
+			}
+			accountIDs := make([]string, 0, len(group.accounts))
+			for _, acct := range group.accounts {
+				accountIDs = append(accountIDs, acct.AccountID)
+			}
+			deleted, err := dbClient.DeleteTransactionsByPlaidIDs(ctx, accountIDs, plaidIDs)
+			if err != nil {
+				log.Printf("error deleting removed transactions for item %s: %v", itemID, err)
+				result.Errors++
+			} else if deleted > 0 {
+				log.Printf("item %s: purged %d orphaned pending record(s)", itemID, deleted)
 			}
 		}
 
