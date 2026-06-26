@@ -28,9 +28,9 @@ const ImportPage: React.FC = () => {
   // Which orders are checked (by orderId)
   const [selected, setSelected] = useState<Set<string>>(new Set());
 
-  // Optional category / budget to apply to all confirmed transactions
-  const [applyCategory, setApplyCategory] = useState('');
-  const [applyBudget, setApplyBudget] = useState('');
+  // Per-item category / budget assignments (keyed by orderId)
+  const [itemCategories, setItemCategories] = useState<Record<string, string>>({});
+  const [itemBudgets, setItemBudgets] = useState<Record<string, string>>({});
 
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -41,6 +41,8 @@ const ImportPage: React.FC = () => {
     setSuccessMsg(null);
     setChoices({});
     setSelected(new Set());
+    setItemCategories({});
+    setItemBudgets({});
     try {
       const csvText = await file.text();
       const result = await importAmazonCsv(csvText);
@@ -74,7 +76,7 @@ const ImportPage: React.FC = () => {
     try {
       // Collect confirmed transaction pairings
       const confirmed: ConfirmedMatch[] = [];
-      const matchedTxns: Transaction[] = [];
+      const matchedTxns: Array<{ txn: Transaction; orderId: string }> = [];
 
       report.results.forEach((m) => {
         if (!selected.has(m.order.orderId)) return;
@@ -94,38 +96,32 @@ const ImportPage: React.FC = () => {
           referenceUrl: m.order.orderUrl,
           referenceNote: `Amazon Order #${m.order.orderId}${m.order.titles.length ? ' \u2014 ' + m.order.titles[0] : ''}`,
         });
-        matchedTxns.push(txn);
+        matchedTxns.push({ txn, orderId: m.order.orderId });
       });
 
       // 1. Save Amazon reference links
       const result = await confirmAmazonImport(confirmed);
 
-      // 2. Apply category and/or budget to all confirmed transactions (in parallel)
-      if ((applyCategory || applyBudget) && matchedTxns.length > 0) {
-        await Promise.all(
-          matchedTxns.flatMap((txn) => {
-            const ops = [];
-            if (applyCategory) {
-              ops.push(updateTransactionCategory(txn.accountId, txn.dateTransactionId, applyCategory));
-            }
-            if (applyBudget) {
-              ops.push(updateTransactionBudget(txn.accountId, txn.dateTransactionId, applyBudget));
-            }
-            return ops;
-          })
-        );
-      }
+      // 2. Apply per-item category and/or budget assignments (in parallel)
+      const categoryBudgetOps = matchedTxns.flatMap(({ txn, orderId }) => {
+        const ops = [];
+        const cat = itemCategories[orderId];
+        const bud = itemBudgets[orderId];
+        if (cat) ops.push(updateTransactionCategory(txn.accountId, txn.dateTransactionId, cat));
+        if (bud) ops.push(updateTransactionBudget(txn.accountId, txn.dateTransactionId, bud));
+        return ops;
+      });
+      if (categoryBudgetOps.length > 0) await Promise.all(categoryBudgetOps);
 
+      const assignedCount = matchedTxns.filter(({ orderId }) => itemCategories[orderId] || itemBudgets[orderId]).length;
       setSuccessMsg(
         `${result.saved} transaction(s) updated with Amazon order references.` +
-        (applyCategory || applyBudget
-          ? ` Category/budget applied to ${matchedTxns.length} transaction(s).`
-          : '') +
+        (assignedCount > 0 ? ` Category/budget applied to ${assignedCount} transaction(s).` : '') +
         (result.errors?.length ? ' Some errors: ' + result.errors.join(', ') : '')
       );
       setReport(null);
-      setApplyCategory('');
-      setApplyBudget('');
+      setItemCategories({});
+      setItemBudgets({});
     } catch (err: any) {
       setError(err.message);
     } finally {
@@ -197,6 +193,8 @@ const ImportPage: React.FC = () => {
                 <th style={styles.th}>Title</th>
                 <th style={{ ...styles.th, textAlign: 'right' }}>Amount</th>
                 <th style={styles.th}>Transaction Match</th>
+                <th style={styles.th}>Category</th>
+                <th style={styles.th}>Budget</th>
               </tr>
             </thead>
             <tbody>
@@ -254,6 +252,41 @@ const ImportPage: React.FC = () => {
                       <span style={styles.unmatchedText}>No matching transaction</span>
                     )}
                   </td>
+                  <td style={styles.td}>
+                    {m.status !== 'unmatched' && (
+                      <select
+                        style={styles.inlineSelect}
+                        value={itemCategories[m.order.orderId] || ''}
+                        onChange={(e) =>
+                          setItemCategories((prev) => ({ ...prev, [m.order.orderId]: e.target.value }))
+                        }
+                        disabled={confirming}
+                      >
+                        <option value="">— None —</option>
+                        {categories.map((c) => (
+                          <option key={c.categoryId} value={c.categoryId}>{c.name}</option>
+                        ))}
+                      </select>
+                    )}
+                  </td>
+                  <td style={styles.td}>
+                    {m.status !== 'unmatched' && (
+                      <select
+                        style={styles.inlineSelect}
+                        value={itemBudgets[m.order.orderId] || ''}
+                        onChange={(e) =>
+                          setItemBudgets((prev) => ({ ...prev, [m.order.orderId]: e.target.value }))
+                        }
+                        disabled={confirming}
+                      >
+                        <option value="">— None —</option>
+                        <option value={MASTER_BUDGET_ID}>⬡ Master Budget</option>
+                        {budgets.map((b) => (
+                          <option key={b.budgetId} value={b.budgetId}>{b.name}</option>
+                        ))}
+                      </select>
+                    )}
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -261,33 +294,6 @@ const ImportPage: React.FC = () => {
           </div>
 
           <div style={styles.confirmRow}>
-            <div style={styles.confirmLeft}>
-              <label style={styles.assignLabel}>Category</label>
-              <select
-                style={styles.assignSelect}
-                value={applyCategory}
-                onChange={e => setApplyCategory(e.target.value)}
-                disabled={confirming || confirmableCount === 0}
-              >
-                <option value="">— None —</option>
-                {categories.map(c => (
-                  <option key={c.categoryId} value={c.categoryId}>{c.name}</option>
-                ))}
-              </select>
-              <label style={styles.assignLabel}>Budget</label>
-              <select
-                style={styles.assignSelect}
-                value={applyBudget}
-                onChange={e => setApplyBudget(e.target.value)}
-                disabled={confirming || confirmableCount === 0}
-              >
-                <option value="">— None —</option>
-                <option value={MASTER_BUDGET_ID}>⬡ Master Budget</option>
-                {budgets.map(b => (
-                  <option key={b.budgetId} value={b.budgetId}>{b.name}</option>
-                ))}
-              </select>
-            </div>
             <button
               style={styles.confirmBtn}
               onClick={handleConfirm}
@@ -326,10 +332,8 @@ const styles: Record<string, React.CSSProperties> = {
   txnInfo: { fontSize: '0.8rem', color: '#4a5568' },
   unmatchedText: { fontSize: '0.8rem', color: '#a0aec0', fontStyle: 'italic' },
   select: { maxWidth: 300 },
-  confirmRow: { marginTop: '1rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap' as const, gap: '0.75rem' },
-  confirmLeft: { display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' as const },
-  assignLabel: { fontSize: '0.82rem', color: '#4a5568', fontWeight: 600, whiteSpace: 'nowrap' as const },
-  assignSelect: { fontSize: '0.82rem', border: '1px solid #cbd5e0', borderRadius: 5, padding: '0.3rem 0.5rem', color: '#2d3748' },
+  inlineSelect: { fontSize: '0.78rem', border: '1px solid #cbd5e0', borderRadius: 4, padding: '0.2rem 0.4rem', color: '#2d3748', maxWidth: 160 },
+  confirmRow: { marginTop: '1rem', display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: '0.75rem' },
   confirmBtn: { background: '#38a169', color: '#fff', border: 'none', borderRadius: 6, padding: '0.5rem 1.5rem', cursor: 'pointer', fontSize: '0.875rem' },
   empty: { textAlign: 'center', color: '#718096', marginTop: '3rem' },
   error: { background: '#fff5f5', color: '#c53030', border: '1px solid #feb2b2', borderRadius: 6, padding: '0.75rem 1rem', marginBottom: '1rem' },
