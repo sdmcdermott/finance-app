@@ -24,6 +24,10 @@ interface DataState {
   setTxnSortKey: React.Dispatch<React.SetStateAction<TxnSortKey>>;
   txnSortDir: TxnSortDir;
   setTxnSortDir: React.Dispatch<React.SetStateAction<TxnSortDir>>;
+  txnPage: number;
+  setTxnPage: React.Dispatch<React.SetStateAction<number>>;
+  txnPageSize: number;
+  setTxnPageSize: React.Dispatch<React.SetStateAction<number>>;
 
   // Mutators — call after a successful API write to keep the cache in sync.
   setAccounts: React.Dispatch<React.SetStateAction<Account[]>>;
@@ -50,6 +54,8 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [txnRange, setTxnRange] = useState<TxnRangeKey>('currentMonth');
   const [txnSortKey, setTxnSortKey] = useState<TxnSortKey>('date');
   const [txnSortDir, setTxnSortDir] = useState<TxnSortDir>('desc');
+  const [txnPage, setTxnPage] = useState<number>(1);
+  const [txnPageSize, setTxnPageSize] = useState<number>(25);
 
   const refreshAll = useCallback(async () => {
     if (!idToken) return;
@@ -83,6 +89,8 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
       txnRange, setTxnRange,
       txnSortKey, setTxnSortKey,
       txnSortDir, setTxnSortDir,
+      txnPage, setTxnPage,
+      txnPageSize, setTxnPageSize,
       setAccounts, setCategories, setBudgets, setRules, setIncomeSources,
       refreshAll,
     }}>

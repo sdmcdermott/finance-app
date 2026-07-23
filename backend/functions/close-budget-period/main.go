@@ -74,11 +74,16 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response,
 	var delta float64 // positive = surplus, negative = shortfall
 	switch budget.BudgetType {
 	case "goal":
-		effectiveGoal := budget.GoalAmount + period.RolledOverAmount
+		periodGoal := budget.GoalAmount
+		if period.MasterBudgetGoal > 0 {
+			periodGoal = period.MasterBudgetGoal
+		}
+		effectiveGoal := periodGoal + period.RolledOverAmount
+		netSpent := debits - credits
 		if budget.GoalDirection == "limit" {
-			delta = effectiveGoal - debits
+			delta = effectiveGoal - netSpent
 		} else {
-			delta = debits - effectiveGoal
+			delta = netSpent - effectiveGoal
 		}
 	case "checkbook":
 		delta = budget.OpeningBalance + period.RolledOverAmount + credits - debits
@@ -169,7 +174,10 @@ func computeTotals(
 	budget *dbpkg.Budget,
 	startDate, endDate string,
 ) (debits, credits float64) {
-	for _, acct := range accounts {
+	// Include the system account for synthetic variance transactions,
+	// matching the logic in get-budget-period so deltas are consistent.
+	acctList := append(accounts, dbpkg.Account{AccountID: dbpkg.SystemAccountID})
+	for _, acct := range acctList {
 		txns, err := dbClient.GetTransactions(ctx, acct.AccountID, startDate, endDate)
 		if err != nil {
 			continue

@@ -25,6 +25,8 @@ type ConfirmedMatch struct {
 	// Reference data to write
 	ReferenceURL  string `json:"referenceUrl"`
 	ReferenceNote string `json:"referenceNote"`
+	// Note is a free-text annotation (item titles from Amazon) written to the transaction.
+	Note string `json:"note,omitempty"`
 }
 
 type confirmRequest struct {
@@ -32,7 +34,9 @@ type confirmRequest struct {
 }
 
 func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response, error) {
-	if deny := auth.Check(req); deny != nil { return *deny, nil }
+	if deny := auth.Check(req); deny != nil {
+		return *deny, nil
+	}
 	var body confirmRequest
 	if err := json.Unmarshal([]byte(req.Body), &body); err != nil {
 		return errorResponse(http.StatusBadRequest, "invalid request body"), nil
@@ -60,6 +64,12 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response,
 		if err := dbClient.UpdateTransactionReference(ctx, m.AccountID, date, txnID, m.ReferenceURL, m.ReferenceNote); err != nil {
 			errs = append(errs, err.Error())
 			continue
+		}
+		if m.Note != "" {
+			if err := dbClient.UpdateTransactionNote(ctx, m.AccountID, date, txnID, m.Note); err != nil {
+				errs = append(errs, err.Error())
+				continue
+			}
 		}
 		saved++
 	}

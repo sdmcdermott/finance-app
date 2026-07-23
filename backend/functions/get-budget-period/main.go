@@ -31,16 +31,18 @@ type BudgetTxn struct {
 	AccountID         string  `json:"accountId"`
 	DateTransactionID string  `json:"dateTransactionId"`
 	IsSplit           bool    `json:"isSplit,omitempty"`
+	Synthetic         bool    `json:"synthetic,omitempty"`
+	Note              string  `json:"note,omitempty"`
 }
 
 type periodWithTotals struct {
 	dbpkg.BudgetPeriod
-	DebitTotal  float64     `json:"debitTotal"`
-	CreditTotal float64     `json:"creditTotal"`
+	DebitTotal  float64 `json:"debitTotal"`
+	CreditTotal float64 `json:"creditTotal"`
 	// For goal budgets: effectiveGoal = GoalAmount + carry-in RolledOverAmount
-	EffectiveGoal float64    `json:"effectiveGoal"`
+	EffectiveGoal float64 `json:"effectiveGoal"`
 	// For checkbook budgets: balance = openingBalance + carry-in + credits - debits
-	Balance      float64     `json:"balance"`
+	Balance float64 `json:"balance"`
 	// LiveDelta is the live-computed surplus/shortfall for this period.
 	// For goal/limit:  effectiveGoal - debits  (positive = under, negative = over)
 	// For goal/target: debits - effectiveGoal  (positive = met/exceeded)
@@ -129,10 +131,11 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response,
 			}
 			effectiveGoal := periodGoal + p.RolledOverAmount
 			pw.EffectiveGoal = effectiveGoal
+			netSpent := debits - credits // credits reduce how much has been spent
 			if budget.GoalDirection == "limit" {
-				pw.LiveDelta = effectiveGoal - debits
+				pw.LiveDelta = effectiveGoal - netSpent
 			} else {
-				pw.LiveDelta = debits - effectiveGoal
+				pw.LiveDelta = netSpent - effectiveGoal
 			}
 		} else {
 			pw.Balance = budget.OpeningBalance + p.RolledOverAmount + credits - debits
@@ -151,6 +154,8 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response,
 // computeTotals sums debits and credits for transactions in [startDate, endDate]
 // that are directly assigned to this budget (txn.BudgetID == budget.BudgetID).
 // When a transaction has splits, each split is evaluated independently.
+// The system account (synthetic variance transactions) is always included
+// alongside real accounts so variance rows appear naturally in the totals.
 // Returns debits, credits, and the individual rows that contributed.
 func computeTotals(
 	ctx context.Context,
@@ -159,7 +164,10 @@ func computeTotals(
 	budget *dbpkg.Budget,
 	startDate, endDate string,
 ) (debits, credits float64, rows []BudgetTxn) {
-	for _, acct := range accounts {
+	// Include the system account for synthetic variance transactions.
+	acctList := append(accounts, dbpkg.Account{AccountID: dbpkg.SystemAccountID})
+
+	for _, acct := range acctList {
 		txns, err := dbClient.GetTransactions(ctx, acct.AccountID, startDate, endDate)
 		if err != nil {
 			continue
@@ -182,18 +190,26 @@ func computeTotals(
 					if sp.BudgetID != budget.BudgetID {
 						continue
 					}
-					if sp.Amount > 0 {
-						debits += sp.Amount
+					// Split amounts are always stored positive; use the parent
+					// transaction's sign to determine debit vs. credit.
+					if t.Amount < 0 {
+						credits += sp.Amount
 					} else {
-						credits += -sp.Amount
+						debits += sp.Amount
+					}
+					// Carry the parent's sign on the row so the frontend renders it correctly.
+					displayAmount := sp.Amount
+					if t.Amount < 0 {
+						displayAmount = -sp.Amount
 					}
 					rows = append(rows, BudgetTxn{
 						Date:              t.Date,
 						Name:              t.Name,
-						Amount:            sp.Amount,
+						Amount:            displayAmount,
 						AccountID:         acct.AccountID,
 						DateTransactionID: t.DateTransactionID,
 						IsSplit:           true,
+						Note:              t.Note,
 					})
 				}
 			} else {
@@ -211,6 +227,8 @@ func computeTotals(
 					Amount:            t.Amount,
 					AccountID:         acct.AccountID,
 					DateTransactionID: t.DateTransactionID,
+					Synthetic:         t.Synthetic,
+					Note:              t.Note,
 				})
 			}
 		}
@@ -230,7 +248,10 @@ func ensurePeriodsForTransactions(
 	// Collect every unique period start-date that has at least one matching transaction.
 	needed := map[string]string{} // startDate → endDate
 
-	for _, acct := range accounts {
+	// Include the system account so synthetic variance transactions trigger period creation.
+	acctList := append(accounts, dbpkg.Account{AccountID: dbpkg.SystemAccountID})
+
+	for _, acct := range acctList {
 		txns, err := dbClient.GetTransactions(ctx, acct.AccountID, "2000-01-01", "2999-12-31")
 		if err != nil {
 			continue

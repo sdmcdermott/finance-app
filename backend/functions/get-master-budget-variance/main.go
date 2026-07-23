@@ -37,9 +37,9 @@ type FixedCostVariance struct {
 }
 
 type varianceResponse struct {
-	Month          string              `json:"month"` // YYYY-MM
-	Income         []IncomeVariance    `json:"income"`
-	FixedCosts     []FixedCostVariance `json:"fixedCosts"`
+	Month      string              `json:"month"` // YYYY-MM
+	Income     []IncomeVariance    `json:"income"`
+	FixedCosts []FixedCostVariance `json:"fixedCosts"`
 }
 
 func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response, error) {
@@ -185,6 +185,30 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response,
 			if fc.RuleID != "" {
 				if rule, ok := ruleByID[fc.RuleID]; ok {
 					matched = strings.Contains(merchant, strings.ToLower(rule.Pattern))
+					// Apply optional amount filter — mirrors ApplyRulesToTransactions
+					if matched && rule.AmountMatch > 0 {
+						diff := math.Abs(math.Abs(txn.Amount) - rule.AmountMatch)
+						if diff > rule.AmountTolerance {
+							matched = false
+						}
+					}
+					// Apply optional day-of-month filter — mirrors ApplyRulesToTransactions
+					if matched && rule.DayOfMonth > 0 {
+						if t, err := time.Parse("2006-01-02", txn.Date); err == nil {
+							day := t.Day()
+							daysInMonth := time.Date(t.Year(), t.Month()+1, 0, 0, 0, 0, 0, time.UTC).Day()
+							diff := day - rule.DayOfMonth
+							if diff < 0 {
+								diff = -diff
+							}
+							if diff > daysInMonth/2 {
+								diff = daysInMonth - diff
+							}
+							if diff > rule.DayTolerance {
+								matched = false
+							}
+						}
+					}
 				}
 			} else {
 				// Legacy fallback: match by fixed cost name substring
@@ -227,6 +251,8 @@ func monthlyAmount(amount float64, frequency string) float64 {
 		return amount
 	case "quarterly":
 		return amount / 3
+	case "semiannually":
+		return amount / 6
 	case "annually":
 		return amount / 12
 	default:

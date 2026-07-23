@@ -3,6 +3,7 @@ import { useParams, useNavigate } from 'react-router-dom';
 import {
   Budget, BudgetPeriod, BudgetTxn,
   getBudgetPeriods, closeBudgetPeriod,
+  VarianceDetail, getVarianceDetail,
 } from '../api/client';
 import { fmtDate } from '../utils/dates';
 import { fmtCurrency } from '../utils/dates';
@@ -111,6 +112,65 @@ const ReClosePeriodModal: React.FC<{
   </div>
 );
 
+const VarianceDetailModal: React.FC<{
+  detail: VarianceDetail;
+  onClose: () => void;
+}> = ({ detail, onClose }) => {
+  const sign = detail.isCredit ? '+' : '-';
+  const color = detail.isCredit ? '#2f855a' : '#e53e3e';
+  const label = detail.isCredit ? 'under budget' : 'over budget';
+  return (
+    <div style={cm.overlay}>
+      <div style={cm.box}>
+        <div style={cm.header}>
+          <span style={cm.title}>{detail.label}</span>
+          <button style={cm.closeBtn} onClick={onClose}>✕</button>
+        </div>
+        <div style={vd.row}>
+          <span style={vd.rowLabel}>Expected</span>
+          <span style={vd.rowValue}>{fmt(detail.expected)}</span>
+        </div>
+        <div style={vd.section}>
+          <div style={vd.sectionLabel}>Matched transactions</div>
+          {detail.matched.length === 0 ? (
+            <div style={vd.empty}>No matched transactions found.</div>
+          ) : (
+            <table style={vd.table}>
+              <tbody>
+                {detail.matched.map((m, i) => (
+                  <tr key={i}>
+                    <td style={vd.td}>{fmtDate(m.date)}</td>
+                    <td style={vd.td}>{m.name}</td>
+                    <td style={{ ...vd.td, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{fmt(m.amount)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+        <div style={{ ...vd.row, borderTop: '2px solid #e2e8f0', paddingTop: '0.6rem', marginTop: '0.1rem' }}>
+          <span style={vd.rowLabel}>Variance</span>
+          <span style={{ ...vd.rowValue, color, fontWeight: 700 }}>
+            {sign}{fmt(detail.varianceAmount)}
+            <span style={{ color: '#718096', fontWeight: 400, fontSize: '0.8rem', marginLeft: 6 }}>({label})</span>
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const vd: Record<string, React.CSSProperties> = {
+  row:          { display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', padding: '0.35rem 0' },
+  rowLabel:     { fontSize: '0.85rem', color: '#718096' },
+  rowValue:     { fontSize: '0.95rem', color: '#2d3748', fontVariantNumeric: 'tabular-nums' },
+  section:      { margin: '0.4rem 0' },
+  sectionLabel: { fontSize: '0.72rem', fontWeight: 600, color: '#718096', textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: '0.35rem' },
+  table:        { width: '100%', borderCollapse: 'collapse', fontSize: '0.85rem' },
+  td:           { padding: '0.3rem 0.4rem', borderBottom: '1px solid #f0f0f0' },
+  empty:        { fontSize: '0.85rem', color: '#718096', fontStyle: 'italic' },
+};
+
 
 type SortKey = 'date' | 'amount';
 type SortDir = 'asc' | 'desc';
@@ -120,7 +180,10 @@ const TransactionTable: React.FC<{
   isGoal: boolean;
   effectiveGoal: number;
   goalDirection: string;
-}> = ({ txns, isGoal, effectiveGoal, goalDirection }) => {
+  isCheckbook?: boolean;
+  onVarianceClick?: (txnId: string) => void;
+  varianceLoading?: string | null;
+}> = ({ txns, isGoal, effectiveGoal, goalDirection, isCheckbook, onVarianceClick, varianceLoading }) => {
   const [sortKey, setSortKey] = useState<SortKey>('date');
   const [sortDir, setSortDir] = useState<SortDir>('asc');
 
@@ -133,7 +196,7 @@ const TransactionTable: React.FC<{
     });
   }, [txns, sortKey, sortDir]);
 
-  // Running total in date-asc order (always), regardless of current sort
+  // Running total / balance in date-asc order (always), regardless of current sort
   const dateSorted = useMemo(() =>
     txns.slice().sort((a, b) => a.date.localeCompare(b.date)),
     [txns]
@@ -142,8 +205,19 @@ const TransactionTable: React.FC<{
     const map: Record<string, number> = {};
     let running = 0;
     dateSorted.forEach((t) => {
-      running += t.amount > 0 ? t.amount : 0; // only debits toward goal
+      running += t.amount; // debits increase, credits decrease net spent
       map[t.dateTransactionId + t.date + t.amount] = running;
+    });
+    return map;
+  }, [dateSorted]);
+
+  // Classic bank balance: credits increase, debits decrease
+  const runningBalances = useMemo(() => {
+    const map: Record<string, number> = {};
+    let balance = 0;
+    dateSorted.forEach((t) => {
+      balance -= t.amount; // positive amount = debit = decrease; negative = credit = increase
+      map[t.dateTransactionId + t.date + t.amount] = balance;
     });
     return map;
   }, [dateSorted]);
@@ -154,6 +228,9 @@ const TransactionTable: React.FC<{
   };
 
   const arrow = (key: SortKey) => sortKey === key ? (sortDir === 'asc' ? ' ↑' : ' ↓') : '';
+
+  const isSyntheticBadgeless = (t: BudgetTxn) =>
+    t.dateTransactionId.startsWith('carryover-') || t.dateTransactionId.startsWith('master-');
 
   if (txns.length === 0) return <div style={ts.empty}>No transactions in this period.</div>;
 
@@ -171,21 +248,39 @@ const TransactionTable: React.FC<{
             </th>
             {isGoal && <th style={{ ...ts.th, textAlign: 'right' }}>Running Total</th>}
             {isGoal && <th style={{ ...ts.th, textAlign: 'right' }}>Remaining</th>}
+            {isCheckbook && <th style={{ ...ts.th, textAlign: 'right' }}>Balance</th>}
           </tr>
         </thead>
         <tbody>
           {sorted.map((t, i) => {
             const key = t.dateTransactionId + t.date + t.amount;
             const running = runningTotals[key] ?? 0;
-            const remaining = effectiveGoal > 0 ? effectiveGoal - running : 0;
-            const remainPct = effectiveGoal > 0 ? (remaining / effectiveGoal) * 100 : 0;
+            const remaining = effectiveGoal - running;
+            const remainPct = effectiveGoal > 0 ? (remaining / effectiveGoal) * 100 : null;
+            const balance = runningBalances[key] ?? 0;
             const isDebit = t.amount > 0;
             return (
               <tr key={i} style={i % 2 === 0 ? ts.rowEven : ts.rowOdd}>
                 <td style={ts.td}>{fmtDate(t.date)}</td>
                 <td style={ts.td}>
-                  {t.name}
+                  <span style={t.synthetic ? { fontStyle: 'italic' } : undefined}>{t.name}</span>
                   {t.isSplit && <span style={ts.splitBadge}>split</span>}
+                  {t.synthetic && !isSyntheticBadgeless(t) && (
+                    <button
+                      style={{
+                        ...ts.varianceBadge,
+                        cursor: 'pointer',
+                        border: 'none',
+                        opacity: varianceLoading === t.dateTransactionId ? 0.5 : 1,
+                      }}
+                      onClick={() => onVarianceClick?.(t.dateTransactionId)}
+                      disabled={varianceLoading === t.dateTransactionId}
+                      title="Click to see variance breakdown"
+                    >
+                      {varianceLoading === t.dateTransactionId ? 'loading…' : 'variance'}
+                    </button>
+                  )}
+                  {t.note && <span title={t.note} style={{ marginLeft: '0.3rem', fontSize: '0.85rem', cursor: 'default' }}>💬</span>}
                 </td>
                 <td style={{ ...ts.td, textAlign: 'right', color: isDebit ? '#e53e3e' : '#38a169', fontVariantNumeric: 'tabular-nums' }}>
                   {isDebit ? '' : '+'}{fmt(t.amount)}
@@ -200,11 +295,18 @@ const TransactionTable: React.FC<{
                     <span style={{ color: remaining <= 0 ? '#e53e3e' : '#38a169' }}>
                       {remaining <= 0 ? `-${fmtCurrency(Math.abs(remaining))}` : fmt(remaining)}
                     </span>
-                    {effectiveGoal > 0 && (
+                    {effectiveGoal > 0 && remainPct !== null && (
                       <span style={{ color: '#718096', fontSize: '0.78rem', marginLeft: 4 }}>
                         ({remainPct.toFixed(0)}%)
                       </span>
                     )}
+                  </td>
+                )}
+                {isCheckbook && (
+                  <td style={{ ...ts.td, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>
+                    <span style={{ color: balance >= 0 ? '#38a169' : '#e53e3e' }}>
+                      {balance < 0 ? `-${fmt(Math.abs(balance))}` : fmt(balance)}
+                    </span>
                   </td>
                 )}
               </tr>
@@ -224,13 +326,63 @@ const ts: Record<string, React.CSSProperties> = {
   rowEven: { background: '#fff' },
   rowOdd: { background: '#f9fafb' },
   splitBadge: { background: '#e9d8fd', color: '#553c9a', borderRadius: 8, padding: '0 5px', fontSize: '0.7rem', marginLeft: 5, verticalAlign: 'middle' },
+  varianceBadge: { background: '#e2e8f0', color: '#4a5568', borderRadius: 8, padding: '0 5px', fontSize: '0.7rem', marginLeft: 5, verticalAlign: 'middle' },
   empty: { color: '#718096', fontSize: '0.875rem', marginTop: '0.75rem' },
 };
 
-const GoalBar: React.FC<{ debits: number; goal: number; direction: string }> = ({ debits, goal, direction }) => {
-  if (goal <= 0) return null;
-  const pct = Math.min((debits / goal) * 100, 100);
-  const over = debits > goal;
+const GoalBar: React.FC<{ debits: number; credits: number; goal: number; direction: string }> = ({ debits, credits, goal, direction }) => {
+  const net = debits - credits;
+
+  // Effective goal is zero or negative — period started already over budget due to carry-in shortfall.
+  if (goal <= 0) {
+    return (
+      <div style={bar.wrap}>
+        <div style={bar.track}>
+          <div style={{ ...bar.fill, width: '100%', background: '#e53e3e' }} />
+        </div>
+        <div style={bar.labels}>
+          <span style={{ color: '#e53e3e', fontWeight: 600 }}>
+            {net > 0 ? fmt(net) + ' spent' : 'No spending'}
+          </span>
+          <span style={{ color: '#e53e3e' }}>
+            effective goal: {goal < 0 ? '-' : ''}{fmt(goal)}
+          </span>
+        </div>
+      </div>
+    );
+  }
+
+  const netIsNegative = net < 0; // credits exceed debits
+
+  if (netIsNegative) {
+    // Credits exceed debits: show a $0 marker and a bar extending left into negative territory.
+    const negativeAmount = credits - debits; // positive magnitude
+    const negativePct = Math.min((negativeAmount / goal) * 100, 100);
+    return (
+      <div style={bar.wrap}>
+        <div style={{ ...bar.track, position: 'relative' }}>
+          {/* $0 marker at center-ish: the zero point is at the right edge of the negative fill */}
+          <div style={{ position: 'absolute', left: `${50}%`, top: 0, bottom: 0, width: 2, background: '#718096', zIndex: 1 }} />
+          {/* Negative fill: starts from the zero marker and extends left */}
+          <div style={{
+            position: 'absolute',
+            right: `${50}%`,
+            width: `${(negativePct / 100) * 50}%`,
+            height: '100%',
+            background: '#2f855a',
+            borderRadius: 5,
+          }} />
+        </div>
+        <div style={bar.labels}>
+          <span style={{ color: '#2f855a', fontWeight: 600 }}>-{fmt(negativeAmount)} net</span>
+          <span style={{ color: '#718096' }}>goal: {fmt(goal)}</span>
+        </div>
+      </div>
+    );
+  }
+
+  const pct = Math.min((net / goal) * 100, 100);
+  const over = net > goal;
   const barColor = direction === 'limit'
     ? (over ? '#e53e3e' : pct > 80 ? '#dd6b20' : '#38a169')
     : (over ? '#38a169' : '#0d7a6b');
@@ -241,7 +393,7 @@ const GoalBar: React.FC<{ debits: number; goal: number; direction: string }> = (
         <div style={{ ...bar.fill, width: `${pct}%`, background: barColor }} />
       </div>
       <div style={bar.labels}>
-        <span style={{ color: barColor, fontWeight: 600 }}>{fmt(debits)} spent</span>
+        <span style={{ color: barColor, fontWeight: 600 }}>{fmt(net)} spent</span>
         <span style={{ color: '#718096' }}>goal: {fmt(goal)}</span>
       </div>
     </div>
@@ -267,6 +419,8 @@ const BudgetPeriodPage: React.FC = () => {
   const [closeMsg, setCloseMsg] = useState<string | null>(null);
   const [confirmingClose, setConfirmingClose] = useState<BudgetPeriod | null>(null);
   const [reCloseTarget, setReCloseTarget] = useState<BudgetPeriod | null>(null);
+  const [varianceModal, setVarianceModal] = useState<VarianceDetail | null>(null);
+  const [varianceLoading, setVarianceLoading] = useState<string | null>(null);
 
   useEffect(() => {
     if (budgetId) load();
@@ -315,6 +469,21 @@ const BudgetPeriodPage: React.FC = () => {
     }
   };
 
+  const handleVarianceClick = async (txnId: string) => {
+    if (!budgetId || varianceLoading) return;
+    // Parse the raw txnId from dateTransactionId (format: "YYYY-MM-DD#variance-...")
+    const rawTxnId = txnId.includes('#') ? txnId.split('#').slice(1).join('#') : txnId;
+    setVarianceLoading(txnId);
+    try {
+      const detail = await getVarianceDetail(budgetId, rawTxnId);
+      setVarianceModal(detail);
+    } catch (e: any) {
+      setError(e.message ?? 'Failed to load variance detail');
+    } finally {
+      setVarianceLoading(null);
+    }
+  };
+
   if (loading) return <div className="page"><div style={s.empty}>Loading...</div></div>;
   if (!budget) return <div className="page"><div style={s.empty}>Budget not found.</div></div>;
 
@@ -335,6 +504,12 @@ const BudgetPeriodPage: React.FC = () => {
           onCancel={() => setReCloseTarget(null)}
           onConfirm={() => executeClose(true)}
           closing={closing === reCloseTarget.startDate}
+        />
+      )}
+      {varianceModal && (
+        <VarianceDetailModal
+          detail={varianceModal}
+          onClose={() => setVarianceModal(null)}
         />
       )}
       <div style={s.breadcrumb}>
@@ -396,32 +571,64 @@ const BudgetPeriodPage: React.FC = () => {
                       <button style={s.staleReCloseBtn} onClick={() => handleReClose(p)}>Re-close now</button>
                     </div>
                   )}
-                  <GoalBar debits={p.debitTotal} goal={p.effectiveGoal} direction={budget.goalDirection} />
-                  <div className="stat-row">
-                    <StatBox label="Debits" value={fmt(p.debitTotal)} color="#e53e3e" />
-                    <StatBox label="Effective Goal" value={fmt(p.effectiveGoal)} color="#0d7a6b" />
-                    {p.rolledOverAmount !== 0 && (
-                      <StatBox
-                        label="Carried In"
-                        value={(p.rolledOverAmount >= 0 ? '+' : '') + fmt(p.rolledOverAmount)}
-                        color="#0d7a6b"
-                      />
-                    )}
-                    {p.closed && budget.surplusHandling === 'rollover' && (
-                      <StatBox
-                        label="Rolled Out"
-                        value={(p.liveDelta >= 0 ? '+' : '-') + fmt(p.liveDelta)}
-                        color={p.liveDelta >= 0 ? '#38a169' : '#e53e3e'}
-                      />
-                    )}
-                    {p.transferredOut !== 0 && <StatBox label="Transferred Out" value={fmt(p.transferredOut)} color="#718096" />}
-                  </div>
-                  <TransactionTable
-                    txns={p.transactions ?? []}
-                    isGoal={true}
-                    effectiveGoal={p.effectiveGoal}
-                    goalDirection={budget.goalDirection}
-                  />
+                  {(() => {
+                    const prevPeriod = periods[periods.indexOf(p) + 1];
+                    const carryoverTxn: BudgetTxn | null = p.rolledOverAmount !== 0 ? {
+                      dateTransactionId: `carryover-${p.startDate}`,
+                      date: p.startDate,
+                      name: `Previous ${prevPeriod?.label ?? 'Period'} Carryover`,
+                      amount: -p.rolledOverAmount,
+                      accountId: '',
+                      isSplit: false,
+                      synthetic: true,
+                    } : null;
+                    const txns = carryoverTxn
+                      ? [carryoverTxn, ...(p.transactions ?? [])]
+                      : (p.transactions ?? []);
+
+                    // Adjust totals to include the carryover for GoalBar
+                    const adjDebits = p.rolledOverAmount < 0
+                      ? p.debitTotal + Math.abs(p.rolledOverAmount)
+                      : p.debitTotal;
+                    const adjCredits = p.rolledOverAmount > 0
+                      ? p.creditTotal + p.rolledOverAmount
+                      : p.creditTotal;
+
+                    const remaining = budget.goalAmount - (adjDebits - adjCredits);
+
+                    return (
+                      <>
+                        <GoalBar debits={adjDebits} credits={adjCredits} goal={budget.goalAmount} direction={budget.goalDirection} />
+                        <div className="stat-row">
+                          <StatBox label="Debits" value={fmt(p.debitTotal)} color="#e53e3e" />
+                          {p.creditTotal > 0 && <StatBox label="Credits" value={fmt(p.creditTotal)} color="#2f855a" />}
+                          {p.creditTotal > 0 && (() => {
+                            const net = p.debitTotal - p.creditTotal;
+                            return net > 0
+                              ? <StatBox label="Net Debits" value={fmt(net)} color="#e53e3e" />
+                              : <StatBox label="Net Credits" value={fmt(-net)} color="#2f855a" />;
+                          })()}
+                          <StatBox label="Remaining" value={(remaining < 0 ? '-' : '') + fmt(remaining)} color={remaining >= 0 ? '#2f855a' : '#e53e3e'} />
+                          {p.closed && budget.surplusHandling === 'rollover' && (
+                            <StatBox
+                              label="Rolled Out"
+                              value={(p.liveDelta >= 0 ? '+' : '-') + fmt(p.liveDelta)}
+                              color={p.liveDelta >= 0 ? '#38a169' : '#e53e3e'}
+                            />
+                          )}
+                          {p.transferredOut !== 0 && <StatBox label="Transferred Out" value={fmt(p.transferredOut)} color="#718096" />}
+                        </div>
+                        <TransactionTable
+                          txns={txns}
+                          isGoal={true}
+                          effectiveGoal={budget.goalAmount}
+                          goalDirection={budget.goalDirection}
+                          onVarianceClick={handleVarianceClick}
+                          varianceLoading={varianceLoading}
+                        />
+                      </>
+                    );
+                  })()}
                 </div>
               ) : (
                 <div style={s.stats}>
@@ -437,31 +644,57 @@ const BudgetPeriodPage: React.FC = () => {
                     </span>
                     <span style={{ color: '#718096', fontSize: '0.85rem', marginLeft: 8 }}>balance</span>
                   </div>
-                  <div className="stat-row">
-                    <StatBox label="Credits" value={fmt(p.creditTotal)} color="#38a169" />
-                    <StatBox label="Debits" value={fmt(p.debitTotal)} color="#e53e3e" />
-                    {p.rolledOverAmount !== 0 && (
-                      <StatBox
-                        label="Carried In"
-                        value={(p.rolledOverAmount >= 0 ? '+' : '') + fmt(p.rolledOverAmount)}
-                        color="#0d7a6b"
-                      />
-                    )}
-                    {p.closed && budget.surplusHandling === 'rollover' && (
-                      <StatBox
-                        label="Rolled Out"
-                        value={(p.liveDelta >= 0 ? '+' : '-') + fmt(p.liveDelta)}
-                        color={p.liveDelta >= 0 ? '#38a169' : '#e53e3e'}
-                      />
-                    )}
-                    {p.transferredOut !== 0 && <StatBox label="Transferred Out" value={fmt(p.transferredOut)} color="#718096" />}
-                  </div>
-                  <TransactionTable
-                    txns={p.transactions ?? []}
-                    isGoal={false}
-                    effectiveGoal={0}
-                    goalDirection=""
-                  />
+                  {(() => {
+                    const prevPeriod = periods[periods.indexOf(p) + 1];
+                    const masterTxn: BudgetTxn | null = (budget.masterBudgetAmount ?? 0) > 0 ? {
+                      dateTransactionId: `master-${p.startDate}`,
+                      date: p.startDate,
+                      name: 'From Master Budget',
+                      amount: -(budget.masterBudgetAmount!),
+                      accountId: '',
+                      isSplit: false,
+                      synthetic: true,
+                    } : null;
+                    const carryoverTxn: BudgetTxn | null = p.rolledOverAmount !== 0 ? {
+                      dateTransactionId: `carryover-${p.startDate}`,
+                      date: p.startDate,
+                      name: `Previous ${prevPeriod?.label ?? 'Period'} Carryover`,
+                      amount: -p.rolledOverAmount,
+                      accountId: '',
+                      isSplit: false,
+                      synthetic: true,
+                    } : null;
+                    const txns: BudgetTxn[] = [
+                      ...(masterTxn ? [masterTxn] : []),
+                      ...(carryoverTxn ? [carryoverTxn] : []),
+                      ...(p.transactions ?? []),
+                    ];
+                    return (
+                      <>
+                        {(p.closed && budget.surplusHandling === 'rollover' || p.transferredOut !== 0) && (
+                          <div className="stat-row">
+                            {p.closed && budget.surplusHandling === 'rollover' && (
+                              <StatBox
+                                label="Rolled Out"
+                                value={(p.liveDelta >= 0 ? '+' : '-') + fmt(p.liveDelta)}
+                                color={p.liveDelta >= 0 ? '#38a169' : '#e53e3e'}
+                              />
+                            )}
+                            {p.transferredOut !== 0 && <StatBox label="Transferred Out" value={fmt(p.transferredOut)} color="#718096" />}
+                          </div>
+                        )}
+                        <TransactionTable
+                          txns={txns}
+                          isGoal={false}
+                          effectiveGoal={0}
+                          goalDirection=""
+                          isCheckbook={true}
+                          onVarianceClick={handleVarianceClick}
+                          varianceLoading={varianceLoading}
+                        />
+                      </>
+                    );
+                  })()}
                 </div>
               )}
             </div>

@@ -3,7 +3,7 @@
 # All targets compile from the backend root where go.mod lives.
 
 GOFLAGS ?= -trimpath
-GOENV   = GOOS=linux CGO_ENABLED=0
+GOENV   = GOOS=linux GOARCH=arm64 CGO_ENABLED=0
 
 build-CreateLinkTokenFunction:
 	$(GOENV) go build $(GOFLAGS) -o $(ARTIFACTS_DIR)/bootstrap ./functions/create-link-token
@@ -43,6 +43,12 @@ build-UpdateTransactionReferenceFunction:
 
 build-UpdateTransactionNameFunction:
 	$(GOENV) go build $(GOFLAGS) -o $(ARTIFACTS_DIR)/bootstrap ./functions/update-transaction-name
+
+build-UpdateTransactionNoteFunction:
+	$(GOENV) go build $(GOFLAGS) -o $(ARTIFACTS_DIR)/bootstrap ./functions/update-transaction-note
+
+build-UpdateTransactionIgnoredFunction:
+	$(GOENV) go build $(GOFLAGS) -o $(ARTIFACTS_DIR)/bootstrap ./functions/update-transaction-ignored
 
 build-UpdateTransactionBudgetFunction:
 	$(GOENV) go build $(GOFLAGS) -o $(ARTIFACTS_DIR)/bootstrap ./functions/update-transaction-budget
@@ -104,6 +110,9 @@ build-GetBudgetPeriodFunction:
 build-CloseBudgetPeriodFunction:
 	$(GOENV) go build $(GOFLAGS) -o $(ARTIFACTS_DIR)/bootstrap ./functions/close-budget-period
 
+build-GetVarianceDetailFunction:
+	$(GOENV) go build $(GOFLAGS) -o $(ARTIFACTS_DIR)/bootstrap ./functions/get-variance-detail
+
 build-PutSplitsFunction:
 	$(GOENV) go build $(GOFLAGS) -o $(ARTIFACTS_DIR)/bootstrap ./functions/put-splits
 
@@ -115,3 +124,9 @@ build-PutTransactionFunction:
 
 build-DeleteTransactionFunction:
 	$(GOENV) go build $(GOFLAGS) -o $(ARTIFACTS_DIR)/bootstrap ./functions/delete-transaction
+
+build-FindRefundsFunction:
+	$(GOENV) go build $(GOFLAGS) -o $(ARTIFACTS_DIR)/bootstrap ./functions/find-refunds
+
+build-ConfirmRefundsFunction:
+	$(GOENV) go build $(GOFLAGS) -o $(ARTIFACTS_DIR)/bootstrap ./functions/confirm-refunds

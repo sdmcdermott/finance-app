@@ -78,6 +78,11 @@ export interface Transaction {
   logoUrl?: string;
   location?: TransactionLocation;
   splits?: TransactionSplit[];
+  linkedRefundIds?: string[];  // set on debit; all confirmed refund credit DTIDs (supports multiple partial refunds)
+  linkedRefundId?: string;     // legacy 1:1 field; populated at read time into linkedRefundIds if absent
+  linkedOriginalId?: string;   // set on credit when it has been confirmed as a refund
+  note?: string;               // user-supplied free-text annotation (populated from Amazon item titles on import)
+  ignored?: boolean;           // user has marked this transaction as intentionally hidden
 }
 
 export interface TransactionSplit {
@@ -258,6 +263,8 @@ export interface BudgetTxn {
   accountId: string;
   dateTransactionId: string;
   isSplit?: boolean;
+  synthetic?: boolean;
+  note?: string;
 }
 
 export interface BudgetPeriod {
@@ -306,6 +313,19 @@ export const getBudgetPeriods = async (budgetId: string): Promise<BudgetPeriodRe
   return data;
 };
 
+export interface VarianceDetail {
+  label: string;
+  expected: number;
+  matched: { date: string; name: string; amount: number }[];
+  varianceAmount: number;
+  isCredit: boolean; // true = under budget (green), false = over budget (red)
+}
+
+export const getVarianceDetail = async (budgetId: string, txnId: string): Promise<VarianceDetail> => {
+  const { data } = await api.get<VarianceDetail>(`/budgets/${budgetId}/variance/${encodeURIComponent(txnId)}`);
+  return data;
+};
+
 export const closeBudgetPeriod = async (
   budgetId: string,
   startDate: string,
@@ -332,6 +352,28 @@ export const updateTransactionReference = async (
   );
 };
 
+export const updateTransactionNote = async (
+  accountId: string,
+  dateTransactionId: string,
+  note: string
+): Promise<void> => {
+  await api.patch(
+    `/transactions/${encodeURIComponent(accountId)}/${encodeURIComponent(dateTransactionId)}/note`,
+    { note }
+  );
+};
+
+export const updateTransactionIgnored = async (
+  accountId: string,
+  dateTransactionId: string,
+  ignored: boolean
+): Promise<void> => {
+  await api.patch(
+    `/transactions/${encodeURIComponent(accountId)}/${encodeURIComponent(dateTransactionId)}/ignored`,
+    { ignored }
+  );
+};
+
 export const updateTransactionName = async (
   accountId: string,
   dateTransactionId: string,
@@ -354,7 +396,19 @@ export interface AmazonOrder {
   refunded?: boolean;
 }
 
-export type MatchStatus = 'confident' | 'ambiguous' | 'unmatched';
+export type MatchStatus = 'confident' | 'ambiguous' | 'unmatched' | 'linked';
+
+export interface TxnCandidate {
+  dateTransactionId: string;
+  accountId: string;
+  date: string;
+  amount: number;
+  merchantName?: string;
+  name?: string;
+  customName?: string;
+  customCategory?: string;
+  budgetId?: string;
+}
 
 export interface MatchResult {
   order: AmazonOrder;
@@ -367,6 +421,7 @@ export interface ImportReport {
   results: MatchResult[];
   orderCount: number;
   txnPool: number;
+  transactions: TxnCandidate[];
 }
 
 export const importAmazonCsv = async (csvText: string): Promise<ImportReport> => {
@@ -381,12 +436,62 @@ export interface ConfirmedMatch {
   dateTransactionId: string;
   referenceUrl: string;
   referenceNote: string;
+  note?: string;  // item titles from Amazon, written as the transaction note
 }
 
 export const confirmAmazonImport = async (
   matches: ConfirmedMatch[]
 ): Promise<{ saved: number; errors: string[] }> => {
   const { data } = await api.post('/import/amazon-csv/confirm', { matches });
+  return data;
+};
+
+// ── Refund matching ───────────────────────────────────────────────────────────
+
+export type RefundMatchStatus = 'confident' | 'ambiguous' | 'partial' | 'multi';
+
+export interface RefundCandidate {
+  dateTransactionId: string;
+  accountId: string;
+  date: string;
+  name?: string;
+  merchantName?: string;
+  customName?: string;
+  amount: number;
+  customCategory?: string;
+  budgetId?: string;
+  note?: string;
+}
+
+export interface RefundMatch {
+  credit: Transaction;
+  candidates: RefundCandidate[];
+  status: RefundMatchStatus;
+  note?: string;
+}
+
+export interface FindRefundsResponse {
+  matches: RefundMatch[];
+  total: number;
+}
+
+export const findRefunds = async (creditId?: string): Promise<FindRefundsResponse> => {
+  const params = creditId ? `?creditId=${encodeURIComponent(creditId)}` : '';
+  const { data } = await api.get<FindRefundsResponse>(`/refunds/find${params}`);
+  return data;
+};
+
+export interface RefundPair {
+  creditDateTransactionId: string;
+  debitDateTransactionId: string;
+  categoryOverride?: string;
+  budgetOverride?: string;
+}
+
+export const confirmRefunds = async (
+  pairs: RefundPair[]
+): Promise<{ confirmed: number }> => {
+  const { data } = await api.post('/refunds/confirm', { pairs });
   return data;
 };
 
@@ -434,7 +539,7 @@ export interface MBFixedCost {
   id: string;
   name: string;
   amount: number;
-  frequency: 'weekly' | 'biweekly' | 'semimonthly' | 'monthly' | 'quarterly' | 'annually';
+  frequency: 'weekly' | 'biweekly' | 'semimonthly' | 'monthly' | 'quarterly' | 'semiannually' | 'annually';
   ruleId?: string;
   fromTxn?: boolean;
   linkedBudgetId?: string;  // optional checkbook budget tracking actual spend vs. expected
@@ -444,7 +549,7 @@ export interface SuggestFixedCost {
   merchant: string;
   meanDay: number;
   meanAmount: number;
-  frequency: 'weekly' | 'biweekly' | 'semimonthly' | 'monthly' | 'quarterly' | 'annually';
+  frequency: 'weekly' | 'biweekly' | 'semimonthly' | 'monthly' | 'quarterly' | 'semiannually' | 'annually';
   confidence: 'high' | 'low';
   occurrences: number;
   sampleDates: string[];

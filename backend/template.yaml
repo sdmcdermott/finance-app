@@ -6,7 +6,7 @@ Globals:
   Function:
     Runtime: provided.al2023
     Architectures:
-      - x86_64
+      - arm64
     Timeout: 30
     MemorySize: 128
     Environment:
@@ -375,6 +375,46 @@ Resources:
             Path: /transactions/{accountId}/{dateTransactionId}/reference
             Method: PATCH
 
+  UpdateTransactionNoteFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-update-transaction-note"
+      CodeUri: .
+      Handler: bootstrap
+      Description: Sets or clears a user-supplied free-text note on a transaction
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /transactions/{accountId}/{dateTransactionId}/note
+            Method: PATCH
+
+  UpdateTransactionIgnoredFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-update-transaction-ignored"
+      CodeUri: .
+      Handler: bootstrap
+      Description: Sets or clears the ignored flag on a transaction
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /transactions/{accountId}/{dateTransactionId}/ignored
+            Method: PATCH
+
   UpdateTransactionNameFunction:
     Type: AWS::Serverless::Function
     Metadata:
@@ -455,6 +495,47 @@ Resources:
           Properties:
             ApiId: !Ref FinanceApi
             Path: /import/amazon-csv/confirm
+            Method: POST
+
+  FindRefundsFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-find-refunds"
+      CodeUri: .
+      Handler: bootstrap
+      Description: Scans transactions and returns probable refund pairs (read-only)
+      Timeout: 60
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /refunds/find
+            Method: GET
+
+  ConfirmRefundsFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-confirm-refunds"
+      CodeUri: .
+      Handler: bootstrap
+      Description: Persists confirmed refund pairs, linking credit and debit transactions
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /refunds/confirm
             Method: POST
 
   GetRulesFunction:
@@ -803,6 +884,26 @@ Resources:
             ApiId: !Ref FinanceApi
             Path: /budgets/{budgetId}/periods/{startDate}/close
             Method: POST
+
+  GetVarianceDetailFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-get-variance-detail"
+      CodeUri: .
+      Handler: bootstrap
+      Description: Returns the breakdown (expected, matched txns, variance) for a synthetic variance transaction
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /budgets/{budgetId}/variance/{txnId}
+            Method: GET
 
   PutSplitsFunction:
     Type: AWS::Serverless::Function

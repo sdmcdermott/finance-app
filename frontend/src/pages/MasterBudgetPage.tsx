@@ -74,21 +74,23 @@ const uuidv4 = () => crypto.randomUUID();
 // ── Frequency helpers ──────────────────────────────────────────────────────────
 
 const FREQ_LABELS: Record<string, string> = {
-  weekly:      'Weekly',
-  biweekly:    'Bi-weekly',
-  semimonthly: 'Semi-monthly',
-  monthly:     'Monthly',
-  quarterly:   'Quarterly',
-  annually:    'Annually',
+  weekly:       'Weekly',
+  biweekly:     'Bi-weekly',
+  semimonthly:  'Semi-monthly',
+  monthly:      'Monthly',
+  quarterly:    'Quarterly',
+  semiannually: 'Semi-annually',
+  annually:     'Annually',
 };
 
 const PERIODS_PER_MONTH: Record<string, number> = {
-  weekly:      52 / 12,
-  biweekly:    26 / 12,
-  semimonthly: 2,
-  monthly:     1,
-  quarterly:   1 / 3,
-  annually:    1 / 12,
+  weekly:       52 / 12,
+  biweekly:     26 / 12,
+  semimonthly:  2,
+  monthly:      1,
+  quarterly:    1 / 3,
+  semiannually: 1 / 6,
+  annually:     1 / 12,
 };
 
 function toMonthly(amount: number, freq: string): number {
@@ -173,6 +175,25 @@ const MasterBudgetPage: React.FC = () => {
     dayTolerance: number;
   }>>({});
   const [fcRuleSaving, setFcRuleSaving] = useState<Set<string>>(new Set());
+
+  // Fixed cost edit / drag state
+  const [editingFcIds, setEditingFcIds]     = useState<Set<string>>(new Set());
+  const [dragFcId, setDragFcId]             = useState<string | null>(null);
+  const [dragOverFcId, setDragOverFcId]     = useState<string | null>(null);
+
+  const toggleFcEdit = (id: string) =>
+    setEditingFcIds(prev => { const s = new Set(prev); s.has(id) ? s.delete(id) : s.add(id); return s; });
+
+  const reorderFixedCosts = (dragId: string, overId: string) => {
+    if (!mb || dragId === overId) return;
+    const costs = [...mb.fixedCosts];
+    const from  = costs.findIndex(fc => fc.id === dragId);
+    const to    = costs.findIndex(fc => fc.id === overId);
+    if (from < 0 || to < 0) return;
+    const [moved] = costs.splice(from, 1);
+    costs.splice(to, 0, moved);
+    patch_mb({ fixedCosts: costs });
+  };
 
   const toggleIncomeRuleExpand = (sourceId: string) => {
     setExpandedIncomeRule(prev => {
@@ -788,6 +809,7 @@ const MasterBudgetPage: React.FC = () => {
         <table style={s.table}>
           <thead>
             <tr>
+              <th style={{ ...s.th, width: 18 }}></th>
               <th style={s.th}>Name</th>
               <th style={s.th}>Frequency</th>
               <th style={{ ...s.th, textAlign: 'right' }}>Amount</th>
@@ -799,68 +821,103 @@ const MasterBudgetPage: React.FC = () => {
           </thead>
           <tbody>
             {mb.fixedCosts.map(fc => {
+              const isEditing  = editingFcIds.has(fc.id);
               const isExpanded = expandedFcRule.has(fc.id);
+              const isDragOver = dragOverFcId === fc.id;
               const draft = fcRuleDraft[fc.id];
               const hasRule = !!fc.ruleId;
+              const linkedBudgetName = budgets.find(b => b.budgetId === fc.linkedBudgetId)?.name;
               return (
               <React.Fragment key={fc.id}>
-              <tr style={s.tr}>
-                <td style={s.td}>
-                  <input
-                    style={s.nameInput}
-                    value={fc.name}
-                    onChange={e => updateFixedCost(fc.id, { name: e.target.value })}
-                    placeholder="e.g. Mortgage"
-                  />
+              <tr
+                style={{ ...s.tr, ...(isDragOver ? { borderTop: '2px solid #0d7a6b' } : {}) }}
+                draggable={!isEditing}
+                onDragStart={() => { setDragFcId(fc.id); }}
+                onDragOver={e  => { e.preventDefault(); setDragOverFcId(fc.id); }}
+                onDragLeave={() => { if (dragOverFcId === fc.id) setDragOverFcId(null); }}
+                onDrop={e      => { e.preventDefault(); if (dragFcId) reorderFixedCosts(dragFcId, fc.id); setDragFcId(null); setDragOverFcId(null); }}
+                onDragEnd={() => { setDragFcId(null); setDragOverFcId(null); }}
+              >
+                {/* drag handle — only meaningful when not editing */}
+                <td style={{ ...s.td, width: 18, color: '#cbd5e0', cursor: isEditing ? 'default' : 'grab', userSelect: 'none', paddingRight: 0 }}>
+                  {!isEditing && '⠿'}
                 </td>
-                <td style={s.td}>
-                  <select
-                    style={s.freqSelect}
-                    value={fc.frequency}
-                    onChange={e => updateFixedCost(fc.id, { frequency: e.target.value as MBFixedCost['frequency'] })}
-                  >
-                    {Object.entries(FREQ_LABELS).map(([v, l]) => (
-                      <option key={v} value={v}>{l}</option>
-                    ))}
-                  </select>
-                </td>
-                <td style={{ ...s.td, textAlign: 'right' }}>
-                  <MoneyInput
-                    value={fc.amount}
-                    onChange={v => updateFixedCost(fc.id, { amount: v })}
-                    style={{ maxWidth: 130, textAlign: 'right' }}
-                  />
-                </td>
-                <td style={{ ...s.td, textAlign: 'right', color: '#dc2626' }}>
-                  {fmtCurrency(toMonthly(fc.amount, fc.frequency))}
-                </td>
-                <td style={s.td}>
-                  <select
-                    style={s.freqSelect}
-                    value={fc.linkedBudgetId ?? ''}
-                    onChange={e => updateFixedCost(fc.id, { linkedBudgetId: e.target.value || undefined })}
-                  >
-                    <option value="">— none —</option>
-                    {budgets.map(b => (
-                      <option key={b.budgetId} value={b.budgetId}>{b.name}</option>
-                    ))}
-                  </select>
-                </td>
-                <td style={s.td}>
+
+                {isEditing ? (
+                  <>
+                    <td style={s.td}>
+                      <input
+                        style={s.nameInput}
+                        value={fc.name}
+                        onChange={e => updateFixedCost(fc.id, { name: e.target.value })}
+                        placeholder="e.g. Mortgage"
+                      />
+                    </td>
+                    <td style={s.td}>
+                      <select
+                        style={s.freqSelect}
+                        value={fc.frequency}
+                        onChange={e => updateFixedCost(fc.id, { frequency: e.target.value as MBFixedCost['frequency'] })}
+                      >
+                        {Object.entries(FREQ_LABELS).map(([v, l]) => (
+                          <option key={v} value={v}>{l}</option>
+                        ))}
+                      </select>
+                    </td>
+                    <td style={{ ...s.td, textAlign: 'right' }}>
+                      <MoneyInput
+                        value={fc.amount}
+                        onChange={v => updateFixedCost(fc.id, { amount: v })}
+                        style={{ maxWidth: 130, textAlign: 'right' }}
+                      />
+                    </td>
+                    <td style={{ ...s.td, textAlign: 'right', color: '#dc2626' }}>
+                      {fmtCurrency(toMonthly(fc.amount, fc.frequency))}
+                    </td>
+                    <td style={s.td}>
+                      <select
+                        style={s.freqSelect}
+                        value={fc.linkedBudgetId ?? ''}
+                        onChange={e => updateFixedCost(fc.id, { linkedBudgetId: e.target.value || undefined })}
+                      >
+                        <option value="">— none —</option>
+                        {budgets.map(b => (
+                          <option key={b.budgetId} value={b.budgetId}>{b.name}</option>
+                        ))}
+                      </select>
+                    </td>
+                    <td style={s.td}>
+                      <button
+                        style={{ ...s.suggestLink, fontSize: '0.78rem' }}
+                        onClick={() => toggleFcRuleExpand(fc.id)}
+                      >
+                        {hasRule ? '✓ rule' : '+ match rule'}{isExpanded ? ' ▲' : ' ▼'}
+                      </button>
+                    </td>
+                  </>
+                ) : (
+                  <>
+                    <td style={s.td}>{fc.name || <span style={{ color: '#a0aec0', fontStyle: 'italic' }}>unnamed</span>}</td>
+                    <td style={s.td}>{FREQ_LABELS[fc.frequency] ?? fc.frequency}</td>
+                    <td style={{ ...s.td, textAlign: 'right' }}>{fmtCurrency(fc.amount)}</td>
+                    <td style={{ ...s.td, textAlign: 'right', color: '#dc2626' }}>{fmtCurrency(toMonthly(fc.amount, fc.frequency))}</td>
+                    <td style={{ ...s.td, color: linkedBudgetName ? '#2d3748' : '#a0aec0' }}>{linkedBudgetName ?? '—'}</td>
+                    <td style={{ ...s.td, color: hasRule ? '#059669' : '#a0aec0' }}>{hasRule ? '✓ rule' : '—'}</td>
+                  </>
+                )}
+
+                <td style={{ ...s.td, textAlign: 'right', whiteSpace: 'nowrap' }}>
                   <button
-                    style={{ ...s.suggestLink, fontSize: '0.78rem' }}
-                    onClick={() => toggleFcRuleExpand(fc.id)}
-                  >
-                    {hasRule ? '✓ rule' : '+ match rule'}{isExpanded ? ' ▲' : ' ▼'}
-                  </button>
-                </td>
-                <td style={{ ...s.td, textAlign: 'right' }}>
-                  <button style={s.removeBtn} onClick={() => removeFixedCost(fc.id)} title="Remove">✕</button>
+                    style={{ ...s.removeBtn, color: isEditing ? '#0d7a6b' : '#9ca3af' }}
+                    onClick={() => toggleFcEdit(fc.id)}
+                    title={isEditing ? 'Done editing' : 'Edit'}
+                  >✏</button>
+                  <button style={{ ...s.removeBtn, marginLeft: 4 }} onClick={() => removeFixedCost(fc.id)} title="Remove">✕</button>
                 </td>
               </tr>
-              {isExpanded && (
+              {isEditing && isExpanded && (
                 <tr style={{ background: '#f7fafc' }}>
-                  <td colSpan={7} style={{ padding: '0.75rem 1rem', borderBottom: '1px solid #e2e8f0' }}>
+                  <td colSpan={8} style={{ padding: '0.75rem 1rem', borderBottom: '1px solid #e2e8f0' }}>
                     <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.75rem', alignItems: 'flex-end' }}>
                       <label style={s.ruleLabel}>
                         Description contains
@@ -1015,42 +1072,95 @@ const MasterBudgetPage: React.FC = () => {
             <p style={s.muted}>No income sources with match rules yet. Configure a match rule on each income source above.</p>
           )}
 
-          {/* Fixed cost variance */}
-          {variance.fixedCosts.length > 0 && (
-            <>
-              <p style={{ ...s.sectionNote, marginTop: '1rem', marginBottom: '0.4rem' }}>Fixed / Recurring Costs</p>
-              <table style={s.table}>
-                <thead>
-                  <tr>
-                    <th style={s.th}>Cost</th>
-                    <th style={{ ...s.th, textAlign: 'right' }}>Expected</th>
-                    <th style={{ ...s.th, textAlign: 'right' }}>Actual</th>
-                    <th style={{ ...s.th, textAlign: 'right' }}>Variance</th>
-                    <th style={{ ...s.th, textAlign: 'center' }}>Matched</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {variance.fixedCosts.map(v => {
-                    // Positive variance = spent more than expected (bad for costs)
-                    const varColor = v.variance > 0 ? '#dc2626' : v.variance < 0 ? '#16a34a' : '#2d3748';
-                    return (
-                      <tr key={v.fixedCostId} style={s.tr}>
-                        <td style={s.td}>{v.name}</td>
-                        <td style={{ ...s.td, textAlign: 'right' }}>{fmtCurrency(v.expectedMonthly)}</td>
-                        <td style={{ ...s.td, textAlign: 'right' }}>{fmtCurrency(v.actual)}</td>
-                        <td style={{ ...s.td, textAlign: 'right', color: varColor, fontWeight: 600 }}>
-                          {v.variance > 0 ? '+' : ''}{fmtCurrency(v.variance)}
-                        </td>
-                        <td style={{ ...s.td, textAlign: 'center', color: v.matchedCount === 0 ? '#9ca3af' : '#2d3748' }}>
-                          {v.matchedCount === 0 ? '—' : `${v.matchedCount}×`}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </>
-          )}
+          {/* Fixed cost variance — split by frequency */}
+          {(() => {
+            // Derive period labels from variance.month (e.g. "2026-06")
+            const [vyStr, vmStr] = variance.month.split('-');
+            const vy = parseInt(vyStr, 10);
+            const vm = parseInt(vmStr, 10); // 1-based
+            const monthLabel = new Date(vy, vm - 1, 1).toLocaleString('en-US', { month: 'short' });
+            const quarterNum  = Math.ceil(vm / 3);
+            const halfNum    = vm <= 6 ? 1 : 2;
+            const periodLabel: Record<string, string> = {
+              regular:      `Monthly — ${monthLabel} ${vy}`,
+              quarterly:    `Quarterly — Q${quarterNum} ${vy}`,
+              semiannually: `Semi-Annually — H${halfNum} ${vy}`,
+              annually:     `Annually — ${vy}`,
+            };
+
+            // Multiplier converts expectedMonthly → expected for the actual period
+            const expectedMultiplier: Record<string, number> = {
+              regular:      1,
+              quarterly:    3,
+              semiannually: 6,
+              annually:     12,
+            };
+
+            const freqGroup = (freq: string | undefined): 'quarterly' | 'semiannually' | 'annually' | 'regular' =>
+              freq === 'quarterly'    ? 'quarterly'    :
+              freq === 'semiannually' ? 'semiannually' :
+              freq === 'annually'     ? 'annually'     : 'regular';
+
+            const groups: Record<string, typeof variance.fixedCosts> = { regular: [], quarterly: [], semiannually: [], annually: [] };
+            for (const v of variance.fixedCosts) {
+              const freq = mb?.fixedCosts.find(f => f.id === v.fixedCostId)?.frequency;
+              groups[freqGroup(freq)].push(v);
+            }
+
+            // Sort each group to match the user-defined order in mb.fixedCosts
+            const fcOrder = new Map(mb?.fixedCosts.map((fc, i) => [fc.id, i]) ?? []);
+            for (const g of Object.values(groups)) {
+              g.sort((a, b) => (fcOrder.get(a.fixedCostId) ?? 999) - (fcOrder.get(b.fixedCostId) ?? 999));
+            }
+
+            const renderCostTable = (rows: typeof variance.fixedCosts, group: string) => rows.length > 0 && (
+              <>
+                <p style={{ ...s.sectionNote, marginTop: '1rem', marginBottom: '0.4rem' }}>{periodLabel[group]}</p>
+                <table style={s.table}>
+                  <thead>
+                    <tr>
+                      <th style={s.th}>Cost</th>
+                      <th style={{ ...s.th, textAlign: 'right' }}>Expected</th>
+                      <th style={{ ...s.th, textAlign: 'right' }}>Actual</th>
+                      <th style={{ ...s.th, textAlign: 'right' }}>Variance</th>
+                      <th style={{ ...s.th, textAlign: 'center' }}>Matched</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {rows.map(v => {
+                      const multiplier = expectedMultiplier[group];
+                      const expected   = v.expectedMonthly * multiplier;
+                      const variance_  = v.actual - expected;
+                      // Positive variance = spent more than expected (bad for costs)
+                      const varColor = variance_ > 0 ? '#dc2626' : variance_ < 0 ? '#16a34a' : '#2d3748';
+                      return (
+                        <tr key={v.fixedCostId} style={s.tr}>
+                          <td style={s.td}>{v.name}</td>
+                          <td style={{ ...s.td, textAlign: 'right' }}>{fmtCurrency(expected)}</td>
+                          <td style={{ ...s.td, textAlign: 'right' }}>{fmtCurrency(v.actual)}</td>
+                          <td style={{ ...s.td, textAlign: 'right', color: varColor, fontWeight: 600 }}>
+                            {variance_ > 0 ? '+' : ''}{fmtCurrency(variance_)}
+                          </td>
+                          <td style={{ ...s.td, textAlign: 'center', color: v.matchedCount === 0 ? '#9ca3af' : '#2d3748' }}>
+                            {v.matchedCount === 0 ? '—' : `${v.matchedCount}×`}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </>
+            );
+
+            return (
+              <>
+                {renderCostTable(groups.regular,      'regular')}
+                {renderCostTable(groups.quarterly,    'quarterly')}
+                {renderCostTable(groups.semiannually, 'semiannually')}
+                {renderCostTable(groups.annually,     'annually')}
+              </>
+            );
+          })()}
         </Section>
       )}
 

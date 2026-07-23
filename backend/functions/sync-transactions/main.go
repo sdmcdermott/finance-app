@@ -13,10 +13,10 @@ import (
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/google/uuid"
+	plaid "github.com/plaid/plaid-go/v42/plaid"
 	auth "github.com/smcdermott/finance-app/internal/auth"
 	dbpkg "github.com/smcdermott/finance-app/internal/db"
 	plaidclient "github.com/smcdermott/finance-app/internal/plaid"
-	plaid "github.com/plaid/plaid-go/v42/plaid"
 )
 
 // dualEvent is the raw Lambda event payload. We inspect it to decide whether
@@ -169,15 +169,15 @@ func runSync(ctx context.Context) (*syncResult, error) {
 		var toWrite []dbpkg.Transaction
 		for _, t := range append(added, modified...) {
 			txn := dbpkg.Transaction{
-				AccountID:         t.GetAccountId(),
-				DateTransactionID: fmt.Sprintf("%s#%s", t.GetDate(), t.GetTransactionId()),
-				TransactionID:     t.GetTransactionId(),
-				Date:              t.GetDate(),
-				Name:              t.GetName(),
-				Amount:            float64(t.GetAmount()),
-				Category:          firstCategory(t.GetCategory()),
-				Pending:           t.GetPending(),
-				MerchantName:      t.GetMerchantName(),
+				AccountID:           t.GetAccountId(),
+				DateTransactionID:   fmt.Sprintf("%s#%s", t.GetDate(), t.GetTransactionId()),
+				TransactionID:       t.GetTransactionId(),
+				Date:                t.GetDate(),
+				Name:                t.GetName(),
+				Amount:              float64(t.GetAmount()),
+				Category:            firstCategory(t.GetCategory()),
+				Pending:             t.GetPending(),
+				MerchantName:        t.GetMerchantName(),
 				OriginalDescription: nullableStr(t.OriginalDescription),
 				AuthorizedDate:      nullableStr(t.AuthorizedDate),
 				PaymentChannel:      t.GetPaymentChannel(),
@@ -190,10 +190,10 @@ func runSync(ctx context.Context) (*syncResult, error) {
 			// Extract location — only store when at least one address field is non-empty
 			// (Plaid always returns a Location struct, even for online transactions).
 			loc := t.GetLocation()
-			locAddr    := nullableStr(loc.Address)
-			locCity    := nullableStr(loc.City)
-			locRegion  := nullableStr(loc.Region)
-			locZip     := nullableStr(loc.PostalCode)
+			locAddr := nullableStr(loc.Address)
+			locCity := nullableStr(loc.City)
+			locRegion := nullableStr(loc.Region)
+			locZip := nullableStr(loc.PostalCode)
 			locCountry := nullableStr(loc.Country)
 			if locAddr != "" || locCity != "" || locRegion != "" || locZip != "" {
 				tLoc := &dbpkg.TransactionLocation{
@@ -374,11 +374,16 @@ func reClosePeriod(
 	var delta float64
 	switch budget.BudgetType {
 	case "goal":
-		effectiveGoal := budget.GoalAmount + period.RolledOverAmount
+		periodGoal := budget.GoalAmount
+		if period.MasterBudgetGoal > 0 {
+			periodGoal = period.MasterBudgetGoal
+		}
+		effectiveGoal := periodGoal + period.RolledOverAmount
+		netSpent := debits - credits
 		if budget.GoalDirection == "limit" {
-			delta = effectiveGoal - debits
+			delta = effectiveGoal - netSpent
 		} else {
-			delta = debits - effectiveGoal
+			delta = netSpent - effectiveGoal
 		}
 	case "checkbook":
 		delta = budget.OpeningBalance + period.RolledOverAmount + credits - debits

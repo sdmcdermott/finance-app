@@ -4,8 +4,9 @@ import { DirtyGuardProvider, useDirtyGuard } from './auth/DirtyGuardContext';
 import {
   Account, Category, Rule, Transaction, Budget, IncomeSource,
   getTransactions, putTransaction, deleteTransaction,
-  updateTransactionCategory, updateTransactionBudget, updateTransactionReference, updateTransactionName, applyRules, syncTransactions,
+  updateTransactionCategory, updateTransactionBudget, updateTransactionReference, updateTransactionName, updateTransactionNote, updateTransactionIgnored, applyRules, syncTransactions,
   putCategory, putRule,
+  findRefunds, confirmRefunds, FindRefundsResponse, RefundMatch, RefundCandidate, RefundPair,
 } from './api/client';
 import { AuthProvider, useAuth } from './auth/AuthContext';
 import { DataProvider, useData } from './auth/DataContext';
@@ -681,6 +682,148 @@ const MbRuleModal: React.FC<MbRuleModalProps> = ({ txn, rules, onClose, onDone }
   );
 };
 
+// ── Refund candidate picker modal ─────────────────────────────────────────────
+
+const RefundCandidateModal: React.FC<{
+  credit: Transaction;
+  candidates: RefundCandidate[];
+  selected?: string;
+  match?: RefundMatch;
+  onSelect: (id: string) => void;
+  onClose: () => void;
+}> = ({ credit, candidates, selected, match, onSelect, onClose }) => {
+  const [filter, setFilter] = React.useState('');
+  // Local selection: start from explicit prop, then fall back to first candidate (best match).
+  const [localSelected, setLocalSelected] = React.useState<string | undefined>(
+    selected ?? candidates[0]?.dateTransactionId
+  );
+
+  const sorted = [...candidates].sort((a, b) => {
+    const dateCmp = b.date.localeCompare(a.date);
+    if (dateCmp !== 0) return dateCmp;
+    return b.amount - a.amount;
+  });
+
+  const filterLower = filter.toLowerCase();
+  const visible = filter
+    ? sorted.filter(c =>
+        c.note?.toLowerCase().includes(filterLower) ||
+        c.merchantName?.toLowerCase().includes(filterLower) ||
+        c.name?.toLowerCase().includes(filterLower) ||
+        c.amount.toFixed(2).includes(filterLower)
+      )
+    : sorted;
+
+  const handleConfirm = () => {
+    if (localSelected) { onSelect(localSelected); onClose(); }
+  };
+
+  return (
+    <div style={modalStyles.overlay} onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div style={{ ...modalStyles.box, maxWidth: 640, maxHeight: '80vh', display: 'flex', flexDirection: 'column', gap: 0 }}>
+        {/* Header */}
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '0.75rem' }}>
+          <div>
+            <div style={{ fontWeight: 700, fontSize: '1rem', color: '#2d3748' }}>Pick Original Charge</div>
+            <div style={{ fontSize: '0.8rem', color: '#718096', marginTop: '0.2rem' }}>
+              Refund {fmtDate(credit.date)} &mdash; {fmtCurrency(Math.abs(credit.amount))} &mdash; {credit.customName || credit.merchantName || credit.name}
+            </div>
+            {match && (() => {
+              const s = match.status;
+              const bg = s === 'confident' ? '#c6f6d5' : s === 'ambiguous' ? '#fef3c7' : s === 'partial' ? '#feebcb' : '#e9d8fd';
+              const fg = s === 'confident' ? '#276749' : s === 'ambiguous' ? '#92400e' : s === 'partial' ? '#7b341e' : '#553c9a';
+              return (
+                <div style={{ marginTop: '0.5rem', display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
+                  <span style={{ display: 'inline-block', background: bg, color: fg, borderRadius: 10, padding: '0.15rem 0.6rem', fontSize: '0.75rem', fontWeight: 600, textTransform: 'capitalize', alignSelf: 'flex-start' }}>
+                    {s}
+                  </span>
+                  {match.note && (
+                    <span style={{ fontSize: '0.78rem', color: '#4a5568' }}>{match.note}</span>
+                  )}
+                </div>
+              );
+            })()}
+          </div>
+          <button style={modalStyles.closeBtn} onClick={onClose}>✕</button>
+        </div>
+
+        {/* Filter */}
+        <div style={{ marginBottom: '0.6rem' }}>
+          <input
+            autoFocus
+            type="text"
+            placeholder="Filter by merchant, item title, or amount…"
+            value={filter}
+            onChange={e => setFilter(e.target.value)}
+            style={{ width: '100%', boxSizing: 'border-box', border: '1px solid #cbd5e0', borderRadius: 5, padding: '0.3rem 0.5rem', fontSize: '0.85rem' }}
+          />
+        </div>
+
+        {/* Candidate list — click to select, Confirm button to commit */}
+        <div style={{ overflowY: 'auto', flex: 1, border: '1px solid #e2e8f0', borderRadius: 6 }}>
+          {visible.length === 0 && (
+            <div style={{ padding: '1rem', textAlign: 'center', color: '#a0aec0', fontSize: '0.85rem' }}>No matches</div>
+          )}
+          {visible.map(c => {
+            const isSelected = c.dateTransactionId === localSelected;
+            return (
+              <div
+                key={c.dateTransactionId}
+                onClick={() => setLocalSelected(c.dateTransactionId)}
+                style={{
+                  padding: '0.55rem 0.75rem',
+                  borderBottom: '1px solid #edf2f7',
+                  cursor: 'pointer',
+                  background: isSelected ? '#ebf8ff' : '#fff',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '0.15rem',
+                }}
+                onMouseEnter={e => { if (!isSelected) (e.currentTarget as HTMLElement).style.background = '#f7fafc'; }}
+                onMouseLeave={e => { (e.currentTarget as HTMLElement).style.background = isSelected ? '#ebf8ff' : '#fff'; }}
+              >
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: '0.5rem' }}>
+                  <span style={{ fontWeight: isSelected ? 600 : 400, fontSize: '0.85rem', color: '#2d3748' }}>
+                    {fmtDate(c.date)} &mdash; {c.merchantName || c.name}
+                  </span>
+                  <span style={{ fontSize: '0.85rem', fontWeight: 600, color: '#2b6cb0', whiteSpace: 'nowrap' }}>
+                    {fmtCurrency(c.amount)}
+                  </span>
+                </div>
+                {c.note && (
+                  <div style={{ fontSize: '0.75rem', color: '#718096' }}>{c.note}</div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Footer */}
+        <div style={{ marginTop: '0.75rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <span style={{ fontSize: '0.75rem', color: '#a0aec0' }}>
+            {visible.length} of {candidates.length} shown
+          </span>
+          <div style={{ display: 'flex', gap: '0.5rem' }}>
+            <button
+              onClick={onClose}
+              style={{ background: 'none', border: '1px solid #cbd5e0', borderRadius: 6, padding: '0.35rem 0.85rem', cursor: 'pointer', fontSize: '0.85rem', color: '#4a5568' }}
+            >
+              Cancel
+            </button>
+            <button
+              onClick={handleConfirm}
+              disabled={!localSelected}
+              style={{ background: localSelected ? '#2b6cb0' : '#a0aec0', border: 'none', borderRadius: 6, padding: '0.35rem 0.85rem', cursor: localSelected ? 'pointer' : 'default', fontSize: '0.85rem', color: '#fff', fontWeight: 600 }}
+            >
+              Confirm
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 const modalStyles: Record<string, React.CSSProperties> = {
   overlay:    { position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '1rem' },
   box:        { background: '#fff', borderRadius: 10, padding: '1.25rem 1.5rem', width: '100%', maxWidth: 460, boxShadow: '0 8px 32px rgba(0,0,0,0.18)', display: 'flex', flexDirection: 'column', gap: '0.75rem' },
@@ -736,7 +879,25 @@ const TxnDetail: React.FC<{
   txn: Transaction;
   accounts: Account[];
   onPfcClick: (label: string) => void;
-}> = ({ txn, accounts, onPfcClick }) => {
+  editingNoteId: string | null;
+  noteDraft: string;
+  savingNote: boolean;
+  onEditNote: (txn: Transaction) => void;
+  onNoteChange: (v: string) => void;
+  onSaveNote: (txn: Transaction, note: string) => void;
+  onCancelNote: () => void;
+  editingNameId: string | null;
+  nameDraft: string;
+  savingName: boolean;
+  onEditName: (txn: Transaction) => void;
+  onNameChange: (v: string) => void;
+  onSaveName: (txn: Transaction) => void;
+  onCancelName: () => void;
+  onLinkRefund?: (txn: Transaction) => void;
+  linkingRefund?: boolean;
+  onIgnore?: (txn: Transaction, ignored: boolean) => void;
+  ignoringId?: string | null;
+}> = ({ txn, accounts, onPfcClick, editingNoteId, noteDraft, savingNote, onEditNote, onNoteChange, onSaveNote, onCancelNote, editingNameId, nameDraft, savingName, onEditName, onNameChange, onSaveName, onCancelName, onLinkRefund, linkingRefund, onIgnore, ignoringId }) => {
   const acct = accounts.find(a => a.accountId === txn.accountId);
   const acctLabel = acct ? `${acct.institution} — ${acct.nickName || acct.name}` : txn.accountId;
 
@@ -775,6 +936,85 @@ const TxnDetail: React.FC<{
           <DetailRow label="Authorized Date"      value={fmtDate(txn.authorizedDate)} />
           <DetailRow label="Payment Channel"      value={fmtChannel(txn.paymentChannel)} />
 
+          {/* Friendly Name — user-editable display name */}
+          {!txn.pending && (
+            <div style={detailStyles.row}>
+              <span style={detailStyles.label}>Friendly Name</span>
+              <span style={detailStyles.value}>
+                {editingNameId === txn.dateTransactionId ? (
+                  <span style={{ display: 'inline-flex', gap: '0.35rem', alignItems: 'center' }}>
+                    <input
+                      autoFocus
+                      type="text"
+                      value={nameDraft}
+                      placeholder={txn.merchantName || txn.name}
+                      onChange={e => onNameChange(e.target.value)}
+                      onKeyDown={e => {
+                        if (e.key === 'Enter') onSaveName(txn);
+                        if (e.key === 'Escape') onCancelName();
+                      }}
+                      style={{ fontSize: '0.82rem', padding: '0.15rem 0.35rem', border: '1px solid #cbd5e0', borderRadius: 4, width: 240 }}
+                    />
+                    <button style={inlineStyles.refSaveBtn} onClick={() => onSaveName(txn)} disabled={savingName}>{savingName ? '...' : 'Save'}</button>
+                    <button style={inlineStyles.refCancelBtn} onClick={onCancelName}>✕</button>
+                  </span>
+                ) : (
+                  <span style={{ display: 'inline-flex', gap: '0.5rem', alignItems: 'center' }}>
+                    <span>{txn.customName || '—'}</span>
+                    <button style={inlineStyles.nickBtn} onClick={() => onEditName(txn)} title="Edit friendly name">✎</button>
+                  </span>
+                )}
+              </span>
+            </div>
+          )}
+
+          {/* Note — user-editable free-text annotation */}
+          <div style={detailStyles.row}>
+            <span style={detailStyles.label}>Note</span>
+            <span style={detailStyles.value}>
+              {editingNoteId === txn.dateTransactionId ? (
+                <span style={{ display: 'inline-flex', gap: '0.35rem', alignItems: 'center' }}>
+                  <input
+                    autoFocus
+                    type="text"
+                    value={noteDraft}
+                    onChange={e => onNoteChange(e.target.value)}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter') onSaveNote(txn, noteDraft);
+                      if (e.key === 'Escape') onCancelNote();
+                    }}
+                    style={{ fontSize: '0.82rem', padding: '0.15rem 0.35rem', border: '1px solid #cbd5e0', borderRadius: 4, width: 240 }}
+                  />
+                  <button style={inlineStyles.refSaveBtn} onClick={() => onSaveNote(txn, noteDraft)} disabled={savingNote}>{savingNote ? '...' : 'Save'}</button>
+                  <button style={inlineStyles.refCancelBtn} onClick={onCancelNote}>✕</button>
+                </span>
+              ) : (
+                <span style={{ display: 'inline-flex', gap: '0.5rem', alignItems: 'center' }}>
+                  <span>{txn.note || '—'}</span>
+                  {!txn.pending && (
+                    <button style={inlineStyles.nickBtn} onClick={() => onEditNote(txn)} title="Edit note">✎</button>
+                  )}
+                </span>
+              )}
+            </span>
+          </div>
+
+          {/* Link refund — shown for categorized+budgeted credits without an existing link */}
+          {onLinkRefund && txn.amount < 0 && !txn.linkedOriginalId && !txn.pending && (
+            <div style={detailStyles.row}>
+              <span style={detailStyles.label}>Refund</span>
+              <span style={detailStyles.value}>
+                <button
+                  style={inlineStyles.nickBtn}
+                  disabled={linkingRefund}
+                  onClick={() => onLinkRefund(txn)}
+                >
+                  {linkingRefund ? '…' : 'Link refund'}
+                </button>
+              </span>
+            </div>
+          )}
+
           {/* Personal Finance Category — clickable levels */}
           <div style={detailStyles.row}>
             <span style={detailStyles.label}>Personal Finance Category</span>
@@ -810,6 +1050,29 @@ const TxnDetail: React.FC<{
           </div>
         )}
       </div>
+
+      {/* Ignore / Unignore — bottom-right of panel */}
+      {onIgnore && !txn.pending && (
+        <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '0.5rem' }}>
+          <button
+            style={{
+              background: txn.ignored ? '#fff' : 'none',
+              border: `1px solid ${txn.ignored ? '#0d7a6b' : '#cbd5e0'}`,
+              borderRadius: 6,
+              padding: '0.3rem 0.75rem',
+              cursor: ignoringId === txn.dateTransactionId ? 'default' : 'pointer',
+              fontSize: '0.8rem',
+              color: txn.ignored ? '#0d7a6b' : '#718096',
+              fontWeight: txn.ignored ? 600 : 400,
+              opacity: ignoringId === txn.dateTransactionId ? 0.6 : 1,
+            }}
+            disabled={ignoringId === txn.dateTransactionId}
+            onClick={() => onIgnore(txn, !txn.ignored)}
+          >
+            {ignoringId === txn.dateTransactionId ? '…' : txn.ignored ? 'Unignore' : 'Ignore'}
+          </button>
+        </div>
+      )}
     </div>
   );
 };
@@ -1108,7 +1371,8 @@ const addTxnStyles: Record<string, React.CSSProperties> = {
 // ── Transactions page ─────────────────────────────────────────────────────────
 const TransactionsPage: React.FC = () => {
   const { accounts, categories, setCategories, budgets, rules, setRules, incomeSources,
-          txnRange, setTxnRange, txnSortKey, setTxnSortKey, txnSortDir, setTxnSortDir } = useData();
+          txnRange, setTxnRange, txnSortKey, setTxnSortKey, txnSortDir, setTxnSortDir,
+          txnPage, setTxnPage, txnPageSize, setTxnPageSize } = useData();
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [selectedAccounts, setSelectedAccounts] = useState<Set<string>>(new Set());
   const [filterAccountsOpen, setFilterAccountsOpen] = useState(false);
@@ -1123,7 +1387,7 @@ const TransactionsPage: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [assigningId, setAssigningId] = useState<string | null>(null);
   const [assigningBudgetId, setAssigningBudgetId] = useState<string | null>(null);
-  const [showUncategorizedOnly, setShowUncategorizedOnly] = useState(false);
+  const [showUncatUnbudgetedOnly, setShowUncatUnbudgetedOnly] = useState(false);
   const [applyingRules, setApplyingRules] = useState(false);
   const [applyMsg, setApplyMsg] = useState<string | null>(null);
   const [syncing, setSyncing] = useState(false);
@@ -1131,6 +1395,9 @@ const TransactionsPage: React.FC = () => {
   const [refUrl, setRefUrl] = useState('');
   const [refNote, setRefNote] = useState('');
   const [savingRef, setSavingRef] = useState(false);
+  const [editingNoteId, setEditingNoteId] = useState<string | null>(null);
+  const [noteDraft, setNoteDraft] = useState('');
+  const [savingNote, setSavingNote] = useState(false);
   const [editingNameId, setEditingNameId] = useState<string | null>(null);
   const [nameDraft, setNameDraft] = useState('');
   const [savingName, setSavingName] = useState(false);
@@ -1142,6 +1409,22 @@ const TransactionsPage: React.FC = () => {
   const [addTxnModal, setAddTxnModal] = useState<{ txn?: Transaction } | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [incomeModal, setIncomeModal] = useState<Transaction | null>(null);
+  const [refundReport, setRefundReport] = useState<FindRefundsResponse | null>(null);
+  const [findingRefunds, setFindingRefunds] = useState(false);
+  const [confirmingRefunds, setConfirmingRefunds] = useState(false);
+  const [refundSelections, setRefundSelections] = useState<Record<string, string>>({});
+  const [refundChecked, setRefundChecked] = useState<Record<string, boolean>>({});
+  const [refundCategoryOverrides, setRefundCategoryOverrides] = useState<Record<string, string>>({});
+  const [candidateModalCreditId, setCandidateModalCreditId] = useState<string | null>(null);
+  const [refundBudgetOverrides, setRefundBudgetOverrides] = useState<Record<string, string>>({});
+  const [refundMsg, setRefundMsg] = useState<string | null>(null);
+  const [refundStatusFilter, setRefundStatusFilter] = useState<Set<string>>(new Set(['confident', 'ambiguous', 'partial', 'multi']));
+  // Inline "Link refund" flow — initiated directly from a credit transaction row.
+  const [inlineCreditTxn, setInlineCreditTxn] = useState<Transaction | null>(null);
+  const [inlineCandidates, setInlineCandidates] = useState<RefundCandidate[] | null>(null);
+  const [inlineMatch, setInlineMatch] = useState<RefundMatch | null>(null);
+  const [inlineLinking, setInlineLinking] = useState<string | null>(null); // dateTransactionId being linked
+  const [linkedNavModal, setLinkedNavModal] = useState<{ dtids: string[]; direction: 'refund' | 'original'; allTxns: Transaction[]; selectedDtid: string; loading: boolean } | null>(null);
 
   // Show pending toggle — off by default, remembered across sessions
   const [showPending, setShowPending] = useState(
@@ -1150,6 +1433,51 @@ const TransactionsPage: React.FC = () => {
   const toggleShowPending = (val: boolean) => {
     setShowPending(val);
     localStorage.setItem('finance_show_pending', String(val));
+  };
+
+  // Show ignored toggle — off by default, remembered across sessions
+  const [showIgnored, setShowIgnored] = useState(
+    () => localStorage.getItem('finance_show_ignored') === 'true'
+  );
+  const toggleShowIgnored = (val: boolean) => {
+    setShowIgnored(val);
+    localStorage.setItem('finance_show_ignored', String(val));
+  };
+
+  const [ignoringId, setIgnoringId] = useState<string | null>(null);
+
+  // If a txn has category/budget, show a warning before ignoring
+  const [pendingIgnoreTxn, setPendingIgnoreTxn] = useState<Transaction | null>(null);
+
+  const handleToggleIgnored = async (txn: Transaction, ignored: boolean) => {
+    // When ignoring: if the txn has a category or budget, show warning modal first
+    if (ignored && (txn.customCategory || txn.budgetId)) {
+      setPendingIgnoreTxn(txn);
+      return;
+    }
+    await _doIgnore(txn, ignored);
+  };
+
+  const _doIgnore = async (txn: Transaction, ignored: boolean) => {
+    setIgnoringId(txn.dateTransactionId);
+    try {
+      const promises: Promise<any>[] = [
+        updateTransactionIgnored(txn.accountId, txn.dateTransactionId, ignored),
+      ];
+      if (ignored && txn.customCategory) {
+        promises.push(updateTransactionCategory(txn.accountId, txn.dateTransactionId, ''));
+      }
+      if (ignored && txn.budgetId) {
+        promises.push(updateTransactionBudget(txn.accountId, txn.dateTransactionId, ''));
+      }
+      await Promise.all(promises);
+      setTransactions(prev => prev.map(t =>
+        t.dateTransactionId === txn.dateTransactionId
+          ? { ...t, ignored, ...(ignored ? { customCategory: undefined, budgetId: undefined } : {}) }
+          : t
+      ));
+    } catch (e: any) { setError(e.message); }
+    finally { setIgnoringId(null); }
   };
 
   const toggleDetail = (id: string) =>
@@ -1262,6 +1590,109 @@ const TransactionsPage: React.FC = () => {
     finally { setSyncing(false); }
   };
 
+  // Show the linked transaction in a modal (works regardless of current page/date range).
+  const navigateToLinked = async (dtids: string | string[], direction: 'refund' | 'original') => {
+    const dtidList = Array.isArray(dtids) ? dtids : [dtids];
+    setLinkedNavModal({ dtids: dtidList, direction, allTxns: [], selectedDtid: dtidList[0] ?? '', loading: true });
+    try {
+      const results = await Promise.all(dtidList.map(async dtid => {
+        const date = dtid.split('#')[0] ?? '';
+        const txns = await getTransactions({ startDate: date, endDate: date });
+        return txns.find(t => t.dateTransactionId === dtid) ?? null;
+      }));
+      const allTxns = results.filter((t): t is Transaction => t !== null);
+      setLinkedNavModal(prev => prev ? { ...prev, allTxns, selectedDtid: allTxns[0]?.dateTransactionId ?? dtidList[0] ?? '', loading: false } : null);
+    } catch {
+      setLinkedNavModal(prev => prev ? { ...prev, loading: false } : null);
+    }
+  };
+
+  const handleFindRefunds = async () => {
+    setFindingRefunds(true); setRefundMsg(null);
+    try {
+      const report = await findRefunds();
+      setRefundReport(report);
+      // Pre-select single candidates automatically
+      const sel: Record<string, string> = {};
+      const checked: Record<string, boolean> = {};
+      report.matches.forEach((m: RefundMatch) => {
+        // Pre-select the first candidate for all non-multi statuses
+        // (backend always puts the best match first).
+        if (m.status !== 'multi' && m.candidates.length > 0) {
+          sel[m.credit.dateTransactionId] = m.candidates[0].dateTransactionId;
+        }
+        // Pre-check confident, ambiguous, and partial; leave multi unchecked until user picks
+        if (m.status === 'confident' || m.status === 'ambiguous' || m.status === 'partial') {
+          checked[m.credit.dateTransactionId] = true;
+        }
+      });
+      setRefundSelections(sel);
+      setRefundChecked(checked);
+      setRefundCategoryOverrides({});
+      setRefundBudgetOverrides({});
+      setRefundStatusFilter(new Set(['confident', 'ambiguous', 'partial', 'multi']));
+    } catch (e: any) { setRefundMsg('Error: ' + (e.message || String(e))); }
+    finally { setFindingRefunds(false); }
+  };
+
+   const handleConfirmRefunds = async () => {
+    if (!refundReport) return;
+    const pairs: RefundPair[] = refundReport.matches
+      .filter((m: RefundMatch) => refundStatusFilter.has(m.status) && refundChecked[m.credit.dateTransactionId] && refundSelections[m.credit.dateTransactionId])
+      .map((m: RefundMatch) => ({
+        creditDateTransactionId: m.credit.dateTransactionId,
+        debitDateTransactionId: refundSelections[m.credit.dateTransactionId],
+        categoryOverride: refundCategoryOverrides[m.credit.dateTransactionId] || undefined,
+        budgetOverride: refundBudgetOverrides[m.credit.dateTransactionId] || undefined,
+      }));
+    if (pairs.length === 0) { setRefundMsg('No matches selected.'); return; }
+
+    setConfirmingRefunds(true); setRefundMsg(null);
+    try {
+      const result = await confirmRefunds(pairs);
+      setRefundMsg(`Saved ${result.confirmed} link${result.confirmed !== 1 ? 's' : ''}.`);
+      setRefundReport(null);
+      await load();
+    } catch (e: any) { setRefundMsg('Error: ' + (e.message || String(e))); }
+    finally { setConfirmingRefunds(false); }
+  };
+
+  const handleInlineLinkRefund = async (txn: Transaction) => {
+    setInlineLinking(txn.dateTransactionId);
+    try {
+      const report = await findRefunds(txn.dateTransactionId);
+      const match = report.matches.find(m => m.credit.dateTransactionId === txn.dateTransactionId);
+      if (!match || match.candidates.length === 0) {
+        alert('No matching charges found for this credit.');
+        return;
+      }
+      // Always show the modal so the user can confirm, regardless of candidate count.
+      setInlineCreditTxn(txn);
+      setInlineCandidates(match.candidates);
+      setInlineMatch(match);
+    } catch (e: any) {
+      alert('Error: ' + (e.message || String(e)));
+    } finally {
+      setInlineLinking(null);
+    }
+  };
+
+  const handleInlineConfirm = async (debitDateTransactionId: string) => {
+    if (!inlineCreditTxn) return;
+    try {
+      await confirmRefunds([{
+        creditDateTransactionId: inlineCreditTxn.dateTransactionId,
+        debitDateTransactionId,
+      }]);
+      setInlineCreditTxn(null);
+      setInlineCandidates(null);
+      setInlineMatch(null);
+      await load();
+    } catch (e: any) {
+      alert('Error: ' + (e.message || String(e)));
+    }
+  };
+
   const handleSaveManualTxn = (saved: Transaction) => {
     setTransactions(prev => {
       const idx = prev.findIndex(t => t.dateTransactionId === saved.dateTransactionId);
@@ -1273,6 +1704,20 @@ const TransactionsPage: React.FC = () => {
 
   const handleDeleteManualTxn = async (txn: Transaction) => {
     if (!window.confirm(`Delete "${txn.name}"? This cannot be undone.`)) return;
+    setDeletingId(txn.dateTransactionId);
+    try {
+      await deleteTransaction(txn.accountId, txn.dateTransactionId);
+      setTransactions(prev => prev.filter(t => t.dateTransactionId !== txn.dateTransactionId));
+    } catch (e: any) { setError(e.message); }
+    finally { setDeletingId(null); }
+  };
+
+  const handleDeletePendingTxn = async (txn: Transaction) => {
+    if (!window.confirm(
+      `Delete pending transaction "${txn.name}"?\n\n` +
+      `Warning: if this transaction hasn't posted yet, it will reappear the next time you sync. ` +
+      `Only delete it if you're sure it's a duplicate or was cancelled by the merchant.`
+    )) return;
     setDeletingId(txn.dateTransactionId);
     try {
       await deleteTransaction(txn.accountId, txn.dateTransactionId);
@@ -1297,6 +1742,18 @@ const TransactionsPage: React.FC = () => {
       setEditingRefId(null);
     } catch (e: any) { setError(e.message); }
     finally { setSavingRef(false); }
+  };
+
+  const saveNote = async (txn: Transaction, note: string) => {
+    setSavingNote(true);
+    try {
+      await updateTransactionNote(txn.accountId, txn.dateTransactionId, note);
+      setTransactions(prev => prev.map(t =>
+        t.dateTransactionId === txn.dateTransactionId ? { ...t, note: note || undefined } : t
+      ));
+      setEditingNoteId(null);
+    } catch (e: any) { setError(e.message); }
+    finally { setSavingNote(false); }
   };
 
   const openNameEditor = (txn: Transaction) => {
@@ -1344,10 +1801,11 @@ const TransactionsPage: React.FC = () => {
     setMbRuleModal(null);
   };
 
-  const amtColor = (txn: Transaction) => txn.amount > 0 ? '#e53e3e' : '#38a169';
+  const amtColor = (txn: Transaction) => txn.ignored ? '#a0aec0' : txn.amount > 0 ? '#e53e3e' : '#38a169';
   const amtStr = (txn: Transaction) => `${txn.amount > 0 ? '-' : '+'}${fmtCurrency(txn.amount)}`;
 
   const toggleSort = (key: typeof txnSortKey) => {
+    setTxnPage(1);
     if (txnSortKey === key) {
       setTxnSortDir(d => d === 'asc' ? 'desc' : 'asc');
     } else {
@@ -1361,8 +1819,17 @@ const TransactionsPage: React.FC = () => {
 
   const filtered = transactions
     .filter(t => selectedAccounts.has(t.accountId))
-    .filter(t => !showUncategorizedOnly || !t.customCategory)
-    .filter(t => showPending || !t.pending);
+    .filter(t => {
+      if (!showUncatUnbudgetedOnly) return true;
+      // For split transactions, check whether any split is missing a category or budget.
+      // Only show if at least one split is incomplete.
+      if (t.splits && t.splits.length > 0) {
+        return t.splits.some(s => !s.customCategory || !s.budgetId);
+      }
+      return !t.customCategory || !t.budgetId;
+    })
+    .filter(t => showPending || !t.pending)
+    .filter(t => showIgnored || !t.ignored);
   const visible = [...filtered].sort((a, b) => {
     // Pending always floats above posted regardless of sort column
     if (a.pending !== b.pending) return a.pending ? -1 : 1;
@@ -1373,8 +1840,39 @@ const TransactionsPage: React.FC = () => {
     return txnSortDir === 'asc' ? cmp : -cmp;
   });
 
+  
+  const totalPages = Math.max(1, Math.ceil(visible.length / txnPageSize));
+  const effectivePage = Math.min(txnPage, totalPages);
+  const paginated = visible.slice((effectivePage - 1) * txnPageSize, effectivePage * txnPageSize);
+
   return (
     <div className="page">
+      {candidateModalCreditId && refundReport && (() => {
+        const match = refundReport.matches.find(m => m.credit.dateTransactionId === candidateModalCreditId);
+        if (!match) return null;
+        return (
+          <RefundCandidateModal
+            credit={match.credit}
+            candidates={match.candidates}
+            selected={refundSelections[candidateModalCreditId]}
+            match={match}
+            onSelect={id => {
+              setRefundSelections(prev => ({ ...prev, [candidateModalCreditId]: id }));
+              setRefundChecked(prev => ({ ...prev, [candidateModalCreditId]: true }));
+            }}
+            onClose={() => setCandidateModalCreditId(null)}
+          />
+        );
+      })()}
+      {inlineCreditTxn && inlineCandidates && (
+        <RefundCandidateModal
+          credit={inlineCreditTxn}
+          candidates={inlineCandidates}
+          match={inlineMatch ?? undefined}
+          onSelect={handleInlineConfirm}
+          onClose={() => { setInlineCreditTxn(null); setInlineCandidates(null); setInlineMatch(null); }}
+        />
+      )}
       {pfcModal && (
         <PfcCategoryModal
           pfcLabel={pfcModal.label}
@@ -1393,6 +1891,21 @@ const TransactionsPage: React.FC = () => {
           onClose={() => setMbRuleModal(null)}
           onDone={handleMbRuleDone}
         />
+      )}
+      {pendingIgnoreTxn && (
+        <div style={navBlockStyles.overlay}>
+          <div style={navBlockStyles.dialog}>
+            <p style={navBlockStyles.title}>Ignore transaction?</p>
+            <p style={navBlockStyles.body}>
+              This transaction has a category{pendingIgnoreTxn.budgetId ? ' and budget' : ''} assigned.
+              Ignoring it will remove {pendingIgnoreTxn.budgetId ? 'them' : 'it'}.
+            </p>
+            <div style={navBlockStyles.footer}>
+              <button style={navBlockStyles.discardBtn} onClick={() => setPendingIgnoreTxn(null)}>Cancel</button>
+              <button style={navBlockStyles.stayBtn} onClick={() => { _doIgnore(pendingIgnoreTxn, true); setPendingIgnoreTxn(null); }}>Continue</button>
+            </div>
+          </div>
+        </div>
       )}
       {addTxnModal && (
         <AddTransactionModal
@@ -1444,37 +1957,47 @@ const TransactionsPage: React.FC = () => {
           <AccountFilterDropdown
             accounts={accounts}
             selected={selectedAccounts}
-            onChange={setSelectedAccounts}
+            onChange={v => { setSelectedAccounts(v); setTxnPage(1); }}
             isOpen={filterAccountsOpen}
             onOpen={() => setFilterAccountsOpen(true)}
             onClose={() => setFilterAccountsOpen(false)}
           />
           <select
             value={txnRange}
-            onChange={e => setTxnRange(e.target.value as typeof txnRange)}
+            onChange={e => { setTxnRange(e.target.value as typeof txnRange); setTxnPage(1); }}
             style={inlineStyles.monthPicker}
           >
             {RANGE_OPTIONS.map(o => (
               <option key={o.value} value={o.value}>{o.label}</option>
             ))}
           </select>
-          <label style={inlineStyles.checkLabel} onClick={() => setShowUncategorizedOnly(v => !v)}>
-            <span style={txnToggleStyles.track(showUncategorizedOnly)}>
-              <span style={txnToggleStyles.thumb(showUncategorizedOnly)} />
+          <label style={inlineStyles.checkLabel} onClick={() => { setShowUncatUnbudgetedOnly(v => !v); setTxnPage(1); }}>
+            <span style={txnToggleStyles.track(showUncatUnbudgetedOnly)}>
+              <span style={txnToggleStyles.thumb(showUncatUnbudgetedOnly)} />
             </span>
-            Uncategorized only
+            Uncategorized &amp; unbudgeted only
           </label>
-          <label style={inlineStyles.checkLabel} onClick={() => toggleShowPending(!showPending)}>
+          <label style={inlineStyles.checkLabel} onClick={() => { toggleShowPending(!showPending); setTxnPage(1); }}>
             <span style={txnToggleStyles.track(showPending)}>
               <span style={txnToggleStyles.thumb(showPending)} />
             </span>
             Show pending
+          </label>
+          <label style={inlineStyles.checkLabel} onClick={() => { toggleShowIgnored(!showIgnored); setTxnPage(1); }}>
+            <span style={txnToggleStyles.track(showIgnored)}>
+              <span style={txnToggleStyles.thumb(showIgnored)} />
+            </span>
+            Show ignored
           </label>
         </div>
         <div className="filter-right">
           <button style={inlineStyles.applyBtn} onClick={handleApplyRules} disabled={applyingRules}
             title="Re-run all auto-assignment rules on this month's transactions">
             {applyingRules ? 'Applying...' : 'Re-apply Rules'}
+          </button>
+          <button style={inlineStyles.applyBtn} onClick={handleFindRefunds} disabled={findingRefunds}
+            title="Find transactions that are likely refunds of earlier charges">
+            {findingRefunds ? 'Scanning...' : 'Find Refunds'}
           </button>
           <button style={inlineStyles.syncBtn} onClick={handleSync} disabled={syncing}
             title="Pull latest transactions from Plaid">
@@ -1486,6 +2009,164 @@ const TransactionsPage: React.FC = () => {
           </button>
         </div>
       </div>
+
+      {/* ── Refund matching panel ── */}
+      {(refundReport || refundMsg) && (
+        <div style={{ border: '1px solid #cbd5e0', borderRadius: '0.5rem', margin: '1rem 0', padding: '1rem', background: '#f7fafc' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem' }}>
+            <strong style={{ fontSize: '1rem' }}>
+              {refundReport ? `Found ${refundReport.matches.length} possible refund${refundReport.matches.length !== 1 ? 's' : ''}` : 'Refunds'}
+            </strong>
+            <button style={inlineStyles.refCancelBtn} onClick={() => { setRefundReport(null); setRefundMsg(null); }}>✕ Close</button>
+          </div>
+          {refundMsg && <div style={{ color: refundMsg.startsWith('Error') ? '#e53e3e' : '#2f855a', marginBottom: '0.5rem', fontSize: '0.9rem' }}>{refundMsg}</div>}
+          {refundReport && refundReport.matches.length > 0 && (
+            <>
+              {/* Status filter pills */}
+              <div style={{ display: 'flex', gap: '0.4rem', marginBottom: '0.6rem', flexWrap: 'wrap' }}>
+                {(['confident', 'ambiguous', 'partial', 'multi'] as const).map(s => {
+                  const count = refundReport.matches.filter(m => m.status === s).length;
+                  if (count === 0) return null;
+                  const active = refundStatusFilter.has(s);
+                  const pillColor = s === 'confident' ? '#38a169' : s === 'ambiguous' ? '#d69e2e' : s === 'partial' ? '#dd6b20' : '#805ad5';
+                  return (
+                    <button
+                      key={s}
+                      onClick={() => setRefundStatusFilter(prev => {
+                        const next = new Set(prev);
+                        if (next.has(s)) { next.delete(s); } else { next.add(s); }
+                        return next;
+                      })}
+                      style={{
+                        borderRadius: 12, padding: '0.2rem 0.75rem', fontSize: '0.78rem', cursor: 'pointer', fontWeight: 500,
+                        background: active ? pillColor : '#edf2f7',
+                        color: active ? '#fff' : '#4a5568',
+                        border: `1px solid ${active ? pillColor : '#cbd5e0'}`,
+                      }}
+                    >
+                      {s} ({count})
+                    </button>
+                  );
+                })}
+              </div>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.85rem' }}>
+                 <thead>
+                   <tr style={{ borderBottom: '1px solid #e2e8f0', color: '#718096' }}>
+                     <th style={{ padding: '0.3rem 0.5rem', width: '2rem' }}></th>
+                     <th style={{ textAlign: 'left', padding: '0.3rem 0.5rem' }}>Status</th>
+                    <th style={{ textAlign: 'left', padding: '0.3rem 0.5rem' }}>Credit (refund received)</th>
+                    <th style={{ textAlign: 'right', padding: '0.3rem 0.5rem' }}>Amount</th>
+                    <th style={{ textAlign: 'left', padding: '0.3rem 0.5rem' }}>Original charge</th>
+                    <th style={{ textAlign: 'left', padding: '0.3rem 0.5rem' }}>Category</th>
+                    <th style={{ textAlign: 'left', padding: '0.3rem 0.5rem' }}>Budget</th>
+                  </tr>
+                </thead>
+                 <tbody>
+                   {[...refundReport.matches].sort((a, b) => b.credit.date.localeCompare(a.credit.date)).filter(m => refundStatusFilter.has(m.status)).map((m: RefundMatch) => {
+                      const creditId = m.credit.dateTransactionId;
+                      const selected = refundSelections[creditId] ?? (m.status !== 'multi' ? m.candidates[0]?.dateTransactionId : undefined);
+                      const selectedCandidate = m.candidates.find(c => c.dateTransactionId === selected);
+                     const catOverride = refundCategoryOverrides[creditId];
+                    const budgetOverride = refundBudgetOverrides[creditId];
+                    // Use category/budget from the selected candidate (debit) directly
+                    const originalCat = selectedCandidate?.customCategory ?? '';
+                    const originalBudget = selectedCandidate?.budgetId ?? '';
+                    const catLabel = originalCat ? (categories.find(c => c.categoryId === originalCat)?.name ?? originalCat) : '';
+                    const budgetLabel = originalBudget ? (budgets.find(b => b.budgetId === originalBudget)?.name ?? originalBudget) : '';
+                     return (
+                       <tr key={creditId} style={{ borderBottom: '1px solid #edf2f7' }}>
+                         <td style={{ padding: '0.4rem 0.5rem', textAlign: 'center' }}>
+                           <input
+                             type="checkbox"
+                             checked={!!refundChecked[creditId]}
+                             disabled={m.status === 'multi' && !refundSelections[creditId]}
+                             onChange={e => setRefundChecked(prev => ({ ...prev, [creditId]: e.target.checked }))}
+                           />
+                         </td>
+                         <td style={{ padding: '0.4rem 0.5rem' }}>
+                           <span style={{
+                             display: 'inline-block', padding: '0.15rem 0.45rem', borderRadius: '999px', fontSize: '0.75rem', fontWeight: 600,
+                             background: m.status === 'confident' ? '#c6f6d5' : m.status === 'ambiguous' ? '#fef3c7' : m.status === 'partial' ? '#feebcb' : '#e9d8fd',
+                             color: m.status === 'confident' ? '#276749' : m.status === 'ambiguous' ? '#92400e' : m.status === 'partial' ? '#7b341e' : '#553c9a',
+                           }}>
+                             {m.status}
+                           </span>
+                           {m.note && <div style={{ fontSize: '0.72rem', color: '#718096', marginTop: '0.2rem' }}>{m.note}</div>}
+                        </td>
+                        <td style={{ padding: '0.4rem 0.5rem' }}>
+                          {fmtDate(m.credit.date)} — {m.credit.customName || m.credit.merchantName || m.credit.name}
+                        </td>
+                        <td style={{ padding: '0.4rem 0.5rem', textAlign: 'right', color: '#2f855a' }}>
+                          {fmtCurrency(Math.abs(m.credit.amount))}
+                        </td>
+                         <td style={{ padding: '0.4rem 0.5rem' }}>
+                           <>
+                             <button
+                               onClick={() => setCandidateModalCreditId(creditId)}
+                               style={{
+                                 fontSize: '0.8rem', padding: '0.2rem 0.6rem', cursor: 'pointer',
+                                 border: '1px solid #cbd5e0', borderRadius: 4, background: '#fff',
+                                 color: selectedCandidate ? '#2d3748' : '#718096',
+                               }}
+                             >
+                               {selectedCandidate
+                                 ? `${fmtDate(selectedCandidate.date)} — ${selectedCandidate.merchantName || selectedCandidate.name} (${fmtCurrency(selectedCandidate.amount)})`
+                                 : m.candidates.length > 1
+                                   ? `— pick from ${m.candidates.length} charges —`
+                                   : '— pick charge —'}
+                             </button>
+                             {selectedCandidate?.note && <div style={{ fontSize: '0.72rem', color: '#718096', marginTop: '0.15rem' }}>💬 {selectedCandidate.note}</div>}
+                           </>
+                          </td>
+                         <td style={{ padding: '0.4rem 0.5rem' }}>
+                           {originalCat && !catOverride ? (
+                            <span style={{ fontSize: '0.8rem', color: '#4a5568' }}>{catLabel}</span>
+                          ) : (
+                            <select
+                              value={catOverride || originalCat}
+                              onChange={e => setRefundCategoryOverrides(prev => ({ ...prev, [creditId]: e.target.value }))}
+                              style={{ fontSize: '0.8rem', padding: '0.15rem' }}
+                            >
+                              <option value="">— category —</option>
+                              {categories.map(c => <option key={c.categoryId} value={c.categoryId}>{c.name}</option>)}
+                            </select>
+                          )}
+                        </td>
+                        <td style={{ padding: '0.4rem 0.5rem' }}>
+                          {originalBudget && !budgetOverride ? (
+                            <span style={{ fontSize: '0.8rem', color: '#4a5568' }}>{budgetLabel}</span>
+                          ) : (
+                            <select
+                              value={budgetOverride || originalBudget}
+                              onChange={e => setRefundBudgetOverrides(prev => ({ ...prev, [creditId]: e.target.value }))}
+                              style={{ fontSize: '0.8rem', padding: '0.15rem' }}
+                            >
+                              <option value="">— budget —</option>
+                              {budgets.map(b => <option key={b.budgetId} value={b.budgetId}>{b.name}</option>)}
+                            </select>
+                          )}
+                        </td>
+                      </tr>
+                     );
+                   })}
+                 </tbody>
+               </table>
+              <div style={{ marginTop: '0.75rem', display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+                <button
+                  style={{ ...inlineStyles.applyBtn, background: '#2b6cb0', color: '#fff' }}
+                  onClick={handleConfirmRefunds}
+                  disabled={confirmingRefunds}
+                >
+                  {confirmingRefunds ? 'Saving...' : (() => { const n = refundReport.matches.filter((m: RefundMatch) => refundStatusFilter.has(m.status) && refundChecked[m.credit.dateTransactionId]).length; return `Confirm ${n} Link${n !== 1 ? 's' : ''}`; })()}
+                </button>
+              </div>
+            </>
+          )}
+          {refundReport && refundReport.matches.length === 0 && (
+            <div style={{ color: '#718096', fontSize: '0.9rem' }}>No unlinked refunds found.</div>
+          )}
+        </div>
+      )}
 
       {accounts.length === 0 && !loading && (
         <div style={inlineStyles.empty}>
@@ -1505,13 +2186,16 @@ const TransactionsPage: React.FC = () => {
                 <th style={inlineStyles.sortableTh} onClick={() => toggleSort('merchant')}>Merchant{sortArrow('merchant')}</th>
                 <th>Category</th><th>Budget</th>
                 <th style={{ textAlign: 'right', cursor: 'pointer', userSelect: 'none' }} onClick={() => toggleSort('amount')}>Amount{sortArrow('amount')}</th>
-                <th>Status</th><th>Ref</th><th>Split</th>
+                <th>Status</th><th>Ref</th><th>Actions</th>
               </tr>
             </thead>
             <tbody>
-              {visible.map(txn => (
+              {paginated.map(txn => (
                 <React.Fragment key={txn.dateTransactionId}>
-                  <tr style={txn.pending ? { background: '#f1f5f9', color: '#718096' } : undefined}>
+                   <tr id={`txn-row-${txn.dateTransactionId}`} style={
+                     txn.ignored ? { background: '#edf2f7', color: '#a0aec0', fontStyle: 'italic' } :
+                     txn.pending ? { background: '#f1f5f9', color: '#718096' } : undefined
+                   }>
                     <td>
                       <button
                         style={inlineStyles.merchantBtn}
@@ -1522,53 +2206,59 @@ const TransactionsPage: React.FC = () => {
                         {detailId === txn.dateTransactionId ? ' ▲' : ' ▼'}
                       </button>
                     </td>
-                    <td>
-                      {editingNameId === txn.dateTransactionId && !txn.pending ? (
-                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}>
-                          <input
-                            autoFocus
-                            type="text"
-                            value={nameDraft}
-                            onChange={e => setNameDraft(e.target.value)}
-                            onKeyDown={e => {
-                              if (e.key === 'Enter') { e.preventDefault(); (e.target as HTMLInputElement).blur(); }
-                              if (e.key === 'Escape') { nameCancelRef.current = true; setEditingNameId(null); }
-                            }}
-                            onBlur={() => saveName(txn)}
-                            placeholder={txn.merchantName || txn.name}
-                            style={inlineStyles.nickInput}
-                          />
-                        </span>
-                      ) : (
-                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}>
-                          <span>{txn.customName || txn.merchantName || txn.name}</span>
-                          {txn.customName && <span style={inlineStyles.origName}>({txn.merchantName || txn.name})</span>}
-                          {!txn.pending && <button style={inlineStyles.nickBtn} onClick={() => openNameEditor(txn)} title="Set friendly name">✎</button>}
-                        </span>
-                      )}
-                    </td>
-                    <td>
-                      <div style={inlineStyles.catCell}>
-                        {txn.pending ? null : txn.splits && txn.splits.length > 0 ? (
-                          <span style={{ fontSize: '0.8rem', color: '#718096', fontStyle: 'italic' }}>
-                            {txn.splits.length} splits
-                          </span>
-                        ) : (
-                          <>
-                            <CatSelect txn={txn} categories={categories} assigningId={assigningId} onAssign={assignCategory} />
-                          </>
-                        )}
-                      </div>
-                    </td>
-                    <td>
-                      <div style={inlineStyles.catCell}>
-                        {txn.pending ? null : txn.splits && txn.splits.length > 0 ? (
-                          <span style={{ fontSize: '0.8rem', color: '#718096', fontStyle: 'italic' }}>per split</span>
-                        ) : (
-                          <BudgetSelect txn={txn} budgets={budgets} incomeSources={incomeSources} assigningId={assigningBudgetId} onAssign={assignBudget} />
-                        )}
-                      </div>
-                    </td>
+                     <td>
+                       <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}>
+                         <span>{txn.customName || txn.merchantName || txn.name}</span>
+                         {txn.customName && <span style={inlineStyles.origName}>({txn.merchantName || txn.name})</span>}
+                         {txn.linkedRefundIds && txn.linkedRefundIds.length > 0 && (
+                           <span
+                             style={{ fontSize: '0.7rem', background: '#e2e8f0', color: '#4a5568', borderRadius: '999px', padding: '0.1rem 0.4rem', cursor: 'pointer' }}
+                             title={`Refunded (${txn.linkedRefundIds.length} refund${txn.linkedRefundIds.length > 1 ? 's' : ''})`}
+                             onClick={() => navigateToLinked(txn.linkedRefundIds!, 'refund')}
+                           >{txn.linkedRefundIds.length > 1 ? `↩ refunded ×${txn.linkedRefundIds.length}` : '↩ refunded'}</span>
+                         )}
+                         {txn.linkedOriginalId && (
+                           <span
+                             style={{ fontSize: '0.7rem', background: '#b2f5ea', color: '#234e52', borderRadius: '999px', padding: '0.1rem 0.4rem', cursor: 'pointer' }}
+                             title={`Refund of ${txn.linkedOriginalId}`}
+                             onClick={() => navigateToLinked(txn.linkedOriginalId!, 'original')}
+                           >refund</span>
+                         )}
+                         {txn.note && (
+                           <span title={txn.note} style={{ fontSize: '0.85rem', cursor: 'default', lineHeight: 1 }}>💬</span>
+                         )}
+                       </span>
+                     </td>
+                     <td>
+                       <div style={inlineStyles.catCell}>
+                         {txn.pending ? null : txn.splits && txn.splits.length > 0 ? (
+                           <span style={{ fontSize: '0.8rem', color: '#718096', fontStyle: 'italic' }}>
+                             {txn.splits.length} splits
+                           </span>
+                         ) : txn.ignored ? (
+                           txn.customCategory
+                             ? <CatBadge catId={txn.customCategory} categories={categories} />
+                             : <span style={{ fontSize: '0.8rem', color: '#a0aec0' }}>—</span>
+                         ) : (
+                           <>
+                             <CatSelect txn={txn} categories={categories} assigningId={assigningId} onAssign={assignCategory} />
+                           </>
+                         )}
+                       </div>
+                     </td>
+                     <td>
+                       <div style={inlineStyles.catCell}>
+                         {txn.pending ? null : txn.splits && txn.splits.length > 0 ? (
+                           <span style={{ fontSize: '0.8rem', color: '#718096', fontStyle: 'italic' }}>per split</span>
+                         ) : txn.ignored ? (
+                           <span style={{ fontSize: '0.8rem', color: '#a0aec0' }}>
+                             {txn.budgetId ? (budgets.find(b => b.budgetId === txn.budgetId)?.name ?? '—') : '—'}
+                           </span>
+                         ) : (
+                           <BudgetSelect txn={txn} budgets={budgets} incomeSources={incomeSources} assigningId={assigningBudgetId} onAssign={assignBudget} />
+                         )}
+                       </div>
+                     </td>
                     <td style={{ textAlign: 'right', color: amtColor(txn) }}>{amtStr(txn)}</td>
                     <td>{txn.pending ? 'Pending' : 'Posted'}</td>
                     <td>
@@ -1584,7 +2274,7 @@ const TransactionsPage: React.FC = () => {
                           {txn.referenceUrl && (
                             <a href={txn.referenceUrl} target="_blank" rel="noreferrer" style={inlineStyles.refLink} title={txn.referenceNote || txn.referenceUrl}>🔗</a>
                           )}
-                          {!txn.pending && (
+                          {!txn.pending && !txn.ignored && (
                             <button style={inlineStyles.refEditBtn} onClick={() => openRefEditor(txn)} title="Edit reference">
                               {txn.referenceUrl ? '✎' : '+'}
                             </button>
@@ -1592,30 +2282,47 @@ const TransactionsPage: React.FC = () => {
                         </div>
                       )}
                     </td>
-                     <td>
-                       {!txn.pending && (
-                         <>
-                           <button
-                             className="split-badge"
-                             onClick={() => setSplitEditorId(
-                               splitEditorId === txn.dateTransactionId ? null : txn.dateTransactionId
+                      <td>
+                        {!txn.pending && (
+                           <>
+                             {!txn.ignored && (
+                               <button
+                                 className="split-badge"
+                                 onClick={() => setSplitEditorId(
+                                   splitEditorId === txn.dateTransactionId ? null : txn.dateTransactionId
+                                 )}
+                                 title={txn.splits && txn.splits.length > 0 ? 'Edit splits' : 'Split transaction'}
+                               >
+                                 {txn.splits && txn.splits.length > 0 ? `⅔ ${txn.splits.length}` : '⅔ Split'}
+                               </button>
                              )}
-                             title={txn.splits && txn.splits.length > 0 ? 'Edit splits' : 'Split transaction'}
-                           >
-                             {txn.splits && txn.splits.length > 0 ? `⅔ ${txn.splits.length}` : '⅔ Split'}
-                           </button>
-                           {txn.transactionId.startsWith('manual-') && (
-                             <>
-                               <button style={inlineStyles.refEditBtn} title="Edit transaction"
-                                 onClick={() => setAddTxnModal({ txn })}>✎</button>
-                               <button style={{ ...inlineStyles.refEditBtn, color: '#e53e3e' }} title="Delete transaction"
-                                 disabled={deletingId === txn.dateTransactionId}
-                                 onClick={() => handleDeleteManualTxn(txn)}>🗑</button>
-                             </>
-                           )}
-                         </>
-                       )}
-                     </td>
+                             {!txn.ignored && txn.amount < 0 && !txn.linkedOriginalId && !txn.customCategory && !txn.budgetId && (
+                               <button
+                                 className="split-badge"
+                                 title="Link to original charge"
+                                 disabled={inlineLinking === txn.dateTransactionId}
+                                 onClick={() => handleInlineLinkRefund(txn)}
+                               >
+                                 {inlineLinking === txn.dateTransactionId ? '…' : 'Link refund'}
+                               </button>
+                             )}
+                             {txn.transactionId.startsWith('manual-') && (
+                               <>
+                                 <button style={inlineStyles.refEditBtn} title="Edit transaction"
+                                   onClick={() => setAddTxnModal({ txn })}>✎</button>
+                                 <button style={{ ...inlineStyles.refEditBtn, color: '#e53e3e' }} title="Delete transaction"
+                                   disabled={deletingId === txn.dateTransactionId}
+                                   onClick={() => handleDeleteManualTxn(txn)}>🗑</button>
+                               </>
+                             )}
+                           </>
+                         )}
+                         {txn.pending && (
+                           <button style={{ ...inlineStyles.refEditBtn, color: '#e53e3e' }} title="Delete pending transaction"
+                             disabled={deletingId === txn.dateTransactionId}
+                             onClick={() => handleDeletePendingTxn(txn)}>🗑</button>
+                         )}
+                      </td>
                   </tr>
                   {splitEditorId === txn.dateTransactionId && (
                     <tr>
@@ -1633,27 +2340,56 @@ const TransactionsPage: React.FC = () => {
                   {detailId === txn.dateTransactionId && (
                     <tr>
                       <td colSpan={8} style={{ padding: '0 0.75rem 0.75rem' }}>
-                        <TxnDetail
-                          txn={txn}
-                          accounts={accounts}
-                          onPfcClick={label => setPfcModal({ txn, label })}
-                        />
-                      </td>
-                    </tr>
-                  )}
-                </React.Fragment>
+                         <TxnDetail
+                           txn={txn}
+                           accounts={accounts}
+                           onPfcClick={label => setPfcModal({ txn, label })}
+                           editingNoteId={editingNoteId}
+                           noteDraft={noteDraft}
+                           savingNote={savingNote}
+                           onEditNote={t => { setEditingNoteId(t.dateTransactionId); setNoteDraft(t.note || ''); }}
+                           onNoteChange={setNoteDraft}
+                           onSaveNote={saveNote}
+                           onCancelNote={() => setEditingNoteId(null)}
+                           editingNameId={editingNameId}
+                           nameDraft={nameDraft}
+                           savingName={savingName}
+                           onEditName={openNameEditor}
+                           onNameChange={setNameDraft}
+                           onSaveName={saveName}
+                           onCancelName={() => setEditingNameId(null)}
+                           onLinkRefund={txn.customCategory && txn.budgetId ? handleInlineLinkRefund : undefined}
+                            linkingRefund={inlineLinking === txn.dateTransactionId}
+                            onIgnore={handleToggleIgnored}
+                            ignoringId={ignoringId}
+                          />
+                       </td>
+                     </tr>
+                   )}
+                 </React.Fragment>
               ))}
             </tbody>
           </table>
 
           {/* ── Mobile cards ── */}
           <div className="txn-cards">
-            {visible.map(txn => (
+            {paginated.map(txn => (
               <div key={txn.dateTransactionId} className="txn-card" style={txn.pending ? { background: '#f1f5f9', color: '#718096' } : undefined}>
                  <div className="txn-card-row">
                    <span className="txn-card-merchant">
                      {txn.customName || txn.merchantName || txn.name}
                      {txn.customName && <span style={inlineStyles.origName}> ({txn.merchantName || txn.name})</span>}
+                     {txn.linkedRefundIds && txn.linkedRefundIds.length > 0 && (
+                       <span style={{ fontSize: '0.7rem', background: '#e2e8f0', color: '#4a5568', borderRadius: '999px', padding: '0.1rem 0.4rem', marginLeft: '0.3rem' }}>
+                         {txn.linkedRefundIds.length > 1 ? `↩ refunded ×${txn.linkedRefundIds.length}` : '↩ refunded'}
+                       </span>
+                     )}
+                     {txn.linkedOriginalId && (
+                       <span style={{ fontSize: '0.7rem', background: '#b2f5ea', color: '#234e52', borderRadius: '999px', padding: '0.1rem 0.4rem', marginLeft: '0.3rem' }}>refund</span>
+                     )}
+                      {txn.note && (
+                        <span title={txn.note} style={{ fontSize: '0.85rem', marginLeft: '0.3rem', cursor: 'default' }}>💬</span>
+                      )}
                    </span>
                    <span className="txn-card-amount" style={{ color: amtColor(txn) }}>{amtStr(txn)}</span>
                  </div>
@@ -1685,6 +2421,15 @@ const TransactionsPage: React.FC = () => {
                         );
                       })}
                     </div>
+                  ) : txn.ignored ? (
+                    <>
+                      {txn.customCategory
+                        ? <CatBadge catId={txn.customCategory} categories={categories} />
+                        : <span style={{ fontSize: '0.8rem', color: '#a0aec0' }}>—</span>}
+                      <div style={{ marginTop: '0.4rem', fontSize: '0.8rem', color: '#a0aec0' }}>
+                        {txn.budgetId ? (budgets.find(b => b.budgetId === txn.budgetId)?.name ?? '—') : '—'}
+                      </div>
+                    </>
                   ) : (
                     <>
                       <CatSelect txn={txn} categories={categories} assigningId={assigningId} onAssign={assignCategory} />
@@ -1694,28 +2439,61 @@ const TransactionsPage: React.FC = () => {
                     </>
                   )}
                 </div>
-                {/* Split button on mobile */}
-                {!txn.pending && (
-                  <div style={{ marginTop: '0.4rem', display: 'flex', gap: '0.4rem', alignItems: 'center', flexWrap: 'wrap' }}>
-                    <button
-                      className="split-badge"
-                      onClick={() => setSplitEditorId(
-                        splitEditorId === txn.dateTransactionId ? null : txn.dateTransactionId
-                      )}
-                    >
-                      {txn.splits && txn.splits.length > 0 ? `⅔ Edit splits (${txn.splits.length})` : '⅔ Split'}
-                    </button>
-                    {txn.transactionId.startsWith('manual-') && (
-                      <>
-                        <button style={{ ...inlineStyles.refEditBtn, fontSize: '0.85rem' }} title="Edit"
-                          onClick={() => setAddTxnModal({ txn })}>✎ Edit</button>
-                        <button style={{ ...inlineStyles.refEditBtn, color: '#e53e3e', fontSize: '0.85rem' }} title="Delete"
-                          disabled={deletingId === txn.dateTransactionId}
-                          onClick={() => handleDeleteManualTxn(txn)}>🗑 Delete</button>
-                      </>
-                    )}
-                  </div>
-                )}
+                {/* Actions row on mobile */}
+                 {!txn.pending && (
+                   <div style={{ marginTop: '0.4rem', display: 'flex', gap: '0.4rem', alignItems: 'center', flexWrap: 'wrap' }}>
+                     {!txn.ignored && (
+                       <button
+                         className="split-badge"
+                         onClick={() => setSplitEditorId(
+                           splitEditorId === txn.dateTransactionId ? null : txn.dateTransactionId
+                         )}
+                       >
+                         {txn.splits && txn.splits.length > 0 ? `⅔ Edit splits (${txn.splits.length})` : '⅔ Split'}
+                       </button>
+                     )}
+                     {!txn.ignored && txn.amount < 0 && !txn.linkedOriginalId && !txn.customCategory && !txn.budgetId && (
+                       <button
+                         className="split-badge"
+                         title="Link to original charge"
+                         disabled={inlineLinking === txn.dateTransactionId}
+                         onClick={() => handleInlineLinkRefund(txn)}
+                       >
+                         {inlineLinking === txn.dateTransactionId ? '…' : 'Link refund'}
+                       </button>
+                     )}
+                     {txn.ignored && (
+                       <button
+                         style={{
+                           background: '#fff', border: '1px solid #0d7a6b', borderRadius: 6,
+                           padding: '0.3rem 0.75rem', cursor: ignoringId === txn.dateTransactionId ? 'default' : 'pointer',
+                           fontSize: '0.8rem', color: '#0d7a6b', fontWeight: 600,
+                           opacity: ignoringId === txn.dateTransactionId ? 0.6 : 1,
+                         }}
+                         disabled={ignoringId === txn.dateTransactionId}
+                         onClick={() => handleToggleIgnored(txn, false)}
+                       >
+                         {ignoringId === txn.dateTransactionId ? '…' : 'Unignore'}
+                       </button>
+                     )}
+                     {txn.transactionId.startsWith('manual-') && (
+                       <>
+                         <button style={{ ...inlineStyles.refEditBtn, fontSize: '0.85rem' }} title="Edit"
+                           onClick={() => setAddTxnModal({ txn })}>✎ Edit</button>
+                         <button style={{ ...inlineStyles.refEditBtn, color: '#e53e3e', fontSize: '0.85rem' }} title="Delete"
+                           disabled={deletingId === txn.dateTransactionId}
+                           onClick={() => handleDeleteManualTxn(txn)}>🗑 Delete</button>
+                       </>
+                     )}
+                   </div>
+                 )}
+                 {txn.pending && (
+                   <div style={{ marginTop: '0.4rem' }}>
+                     <button style={{ ...inlineStyles.refEditBtn, color: '#e53e3e', fontSize: '0.85rem' }} title="Delete pending transaction"
+                       disabled={deletingId === txn.dateTransactionId}
+                       onClick={() => handleDeletePendingTxn(txn)}>🗑 Delete pending</button>
+                   </div>
+                 )}
                 {splitEditorId === txn.dateTransactionId && (
                    <SplitEditor
                      txn={txn}
@@ -1725,33 +2503,33 @@ const TransactionsPage: React.FC = () => {
                      onSaved={handleSplitSaved}
                    />
                 )}
-                {detailId === txn.dateTransactionId && (
-                  <TxnDetail
-                    txn={txn}
-                    accounts={accounts}
-                    onPfcClick={label => setPfcModal({ txn, label })}
-                  />
-                )}
-                {/* Name editor on mobile */}
-                {!txn.pending && (
-                  <div className="txn-card-ref">
-                    {editingNameId === txn.dateTransactionId ? (
-                      <div className="ref-editor-mobile">
-                        <input type="text" placeholder={txn.merchantName || txn.name} value={nameDraft} onChange={e => setNameDraft(e.target.value)} />
-                        <div className="ref-editor-mobile-btns">
-                          <button style={{ ...inlineStyles.refSaveBtn, flex: 1 }} onClick={() => saveName(txn)} disabled={savingName}>{savingName ? '...' : 'Save'}</button>
-                          <button style={inlineStyles.refCancelBtn} onClick={() => setEditingNameId(null)}>Cancel</button>
-                        </div>
-                      </div>
-                    ) : (
-                      <button style={{ ...inlineStyles.refEditBtn, fontSize: '0.8rem' }} onClick={() => openNameEditor(txn)}>
-                        {txn.customName ? '✎ Edit friendly name' : '+ Add friendly name'}
-                      </button>
-                    )}
-                  </div>
-                )}
-                {/* Ref editor on mobile */}
-                {!txn.pending && (
+                 {detailId === txn.dateTransactionId && (
+                   <TxnDetail
+                     txn={txn}
+                     accounts={accounts}
+                     onPfcClick={label => setPfcModal({ txn, label })}
+                     editingNoteId={editingNoteId}
+                     noteDraft={noteDraft}
+                     savingNote={savingNote}
+                     onEditNote={t => { setEditingNoteId(t.dateTransactionId); setNoteDraft(t.note || ''); }}
+                     onNoteChange={setNoteDraft}
+                     onSaveNote={saveNote}
+                     onCancelNote={() => setEditingNoteId(null)}
+                     editingNameId={editingNameId}
+                     nameDraft={nameDraft}
+                     savingName={savingName}
+                     onEditName={openNameEditor}
+                     onNameChange={setNameDraft}
+                     onSaveName={saveName}
+                     onCancelName={() => setEditingNameId(null)}
+                      onLinkRefund={txn.customCategory && txn.budgetId ? handleInlineLinkRefund : undefined}
+                      linkingRefund={inlineLinking === txn.dateTransactionId}
+                      onIgnore={handleToggleIgnored}
+                      ignoringId={ignoringId}
+                    />
+                  )}
+                  {/* Ref editor on mobile */}
+                {!txn.pending && !txn.ignored && (
                   <div className="txn-card-ref">
                     {editingRefId === txn.dateTransactionId ? (
                       <div className="ref-editor-mobile">
@@ -1763,15 +2541,60 @@ const TransactionsPage: React.FC = () => {
                         </div>
                       </div>
                     ) : (
-                      <button style={{ ...inlineStyles.refEditBtn, fontSize: '0.8rem' }} onClick={() => openRefEditor(txn)}>
-                        {txn.referenceUrl ? '✎ Edit reference' : '+ Add reference'}
-                      </button>
+                      <div style={inlineStyles.refView}>
+                        {txn.referenceUrl && (
+                          <a href={txn.referenceUrl} target="_blank" rel="noreferrer" style={inlineStyles.refLink} title={txn.referenceNote || txn.referenceUrl}>🔗</a>
+                        )}
+                        <button style={{ ...inlineStyles.refEditBtn, fontSize: '0.8rem' }} onClick={() => openRefEditor(txn)}>
+                          {txn.referenceUrl ? '✎ Edit reference' : '+ Add reference'}
+                        </button>
+                      </div>
                     )}
                   </div>
                 )}
               </div>
             ))}
           </div>
+
+          {/* ── Pagination ── */}
+          {visible.length > 0 && (() => {
+            const rangeSize = 5;
+            const half = Math.floor(rangeSize / 2);
+            let rangeStart = Math.max(1, effectivePage - half);
+            let rangeEnd = Math.min(totalPages, rangeStart + rangeSize - 1);
+            if (rangeEnd - rangeStart < rangeSize - 1) rangeStart = Math.max(1, rangeEnd - rangeSize + 1);
+            const pages = Array.from({ length: rangeEnd - rangeStart + 1 }, (_, i) => rangeStart + i);
+            const btnBase: React.CSSProperties = {
+              minWidth: '2rem', padding: '0.25rem 0.5rem', border: '1px solid #cbd5e0',
+              borderRadius: '0.25rem', background: '#fff', cursor: 'pointer', fontSize: '0.85rem',
+            };
+            const btnDisabled: React.CSSProperties = { ...btnBase, color: '#a0aec0', cursor: 'default', background: '#f7fafc' };
+            const btnActive: React.CSSProperties = { ...btnBase, background: '#2b6cb0', color: '#fff', borderColor: '#2b6cb0', fontWeight: 600 };
+            return (
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.3rem', justifyContent: 'center', padding: '0.75rem 0 0.25rem', flexWrap: 'wrap' }}>
+                <button style={effectivePage === 1 ? btnDisabled : btnBase} disabled={effectivePage === 1} onClick={() => setTxnPage(1)} title="First page">{'<<'}</button>
+                <button style={effectivePage === 1 ? btnDisabled : btnBase} disabled={effectivePage === 1} onClick={() => setTxnPage(p => Math.max(1, p - 1))} title="Previous page">{'<'}</button>
+                {rangeStart > 1 && <span style={{ padding: '0 0.25rem', color: '#718096' }}>…</span>}
+                {pages.map(p => (
+                  <button key={p} style={p === effectivePage ? btnActive : btnBase} onClick={() => setTxnPage(p)}>{p}</button>
+                ))}
+                {rangeEnd < totalPages && <span style={{ padding: '0 0.25rem', color: '#718096' }}>…</span>}
+                <button style={effectivePage === totalPages ? btnDisabled : btnBase} disabled={effectivePage === totalPages} onClick={() => setTxnPage(p => Math.min(totalPages, p + 1))} title="Next page">{'>'}</button>
+                <button style={effectivePage === totalPages ? btnDisabled : btnBase} disabled={effectivePage === totalPages} onClick={() => setTxnPage(totalPages)} title="Last page">{'>>'}</button>
+                <select
+                  value={txnPageSize}
+                  onChange={e => { setTxnPageSize(Number(e.target.value)); setTxnPage(1); }}
+                  style={{ marginLeft: '0.5rem', fontSize: '0.85rem', padding: '0.25rem 0.4rem', border: '1px solid #cbd5e0', borderRadius: '0.25rem' }}
+                  title="Rows per page"
+                >
+                  {[10, 25, 50, 100].map(n => <option key={n} value={n}>{n} / page</option>)}
+                </select>
+                <span style={{ marginLeft: '0.25rem', fontSize: '0.8rem', color: '#718096' }}>
+                  {(effectivePage - 1) * txnPageSize + 1}–{Math.min(effectivePage * txnPageSize, visible.length)} of {visible.length}
+                </span>
+              </div>
+            );
+          })()}
         </>
       )}
 
@@ -1785,7 +2608,75 @@ const TransactionsPage: React.FC = () => {
       )}
       {!loading && visible.length === 0 && selectedAccounts.size > 0 && accounts.length > 0 && (
         <div style={inlineStyles.empty}>
-          {showUncategorizedOnly ? 'No uncategorized transactions for this period.' : 'No transactions found for this period.'}
+          {showUncatUnbudgetedOnly ? 'No uncategorized & unbudgeted transactions for this period.' : 'No transactions found for this period.'}
+        </div>
+      )}
+
+      {/* ── Linked transaction nav modal ── */}
+      {linkedNavModal && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+          onClick={() => setLinkedNavModal(null)}>
+          <div style={{ background: '#fff', borderRadius: '0.75rem', padding: '1.5rem', maxWidth: 460, width: '90%', boxShadow: '0 10px 40px rgba(0,0,0,0.2)' }}
+            onClick={e => e.stopPropagation()}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+              <div style={{ fontSize: '1rem', fontWeight: 600 }}>
+                {linkedNavModal.direction === 'refund' ? '↩ Refund credit' : 'Original charge'}
+                {linkedNavModal.direction === 'refund' && linkedNavModal.allTxns.length > 1 && (
+                  <span style={{ fontWeight: 400, color: '#718096', fontSize: '0.85rem', marginLeft: '0.5rem' }}>({linkedNavModal.allTxns.length} refunds)</span>
+                )}
+              </div>
+              <button style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '1.1rem', color: '#718096', lineHeight: 1 }} onClick={() => setLinkedNavModal(null)}>✕</button>
+            </div>
+            {linkedNavModal.loading && (
+              <div style={{ color: '#718096', fontSize: '0.9rem', padding: '1rem 0' }}>Loading...</div>
+            )}
+            {!linkedNavModal.loading && linkedNavModal.allTxns.length === 0 && (
+              <div style={{ color: '#e53e3e', fontSize: '0.9rem' }}>Transaction not found.</div>
+            )}
+            {!linkedNavModal.loading && linkedNavModal.allTxns.length > 0 && (() => {
+              const t = linkedNavModal.allTxns.find(x => x.dateTransactionId === linkedNavModal.selectedDtid) ?? linkedNavModal.allTxns[0];
+              const acct = accounts.find(a => a.accountId === t.accountId);
+              const cat = categories.find(c => c.categoryId === t.customCategory);
+              const bud = budgets.find(b => b.budgetId === t.budgetId);
+              const isCredit = t.amount < 0;
+              return (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                  {linkedNavModal.allTxns.length > 1 && (
+                    <select
+                      value={linkedNavModal.selectedDtid}
+                      onChange={e => setLinkedNavModal(prev => prev ? { ...prev, selectedDtid: e.target.value } : null)}
+                      style={{ marginBottom: '0.5rem', padding: '0.3rem 0.5rem', borderRadius: '0.35rem', border: '1px solid #cbd5e0', fontSize: '0.875rem' }}
+                    >
+                      {linkedNavModal.allTxns.map(x => (
+                        <option key={x.dateTransactionId} value={x.dateTransactionId}>
+                          {fmtDate(x.date)} — {isCredit ? '+' : ''}{fmtCurrency(Math.abs(x.amount))}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
+                    <div style={{ fontWeight: 600, fontSize: '1rem' }}>{t.customName || t.merchantName || t.name}</div>
+                    <div style={{ fontWeight: 700, fontSize: '1.1rem', color: isCredit ? '#2f855a' : '#1a202c' }}>
+                      {isCredit ? '+' : ''}{fmtCurrency(Math.abs(t.amount))}
+                    </div>
+                  </div>
+                  <div style={{ color: '#718096', fontSize: '0.85rem' }}>{fmtDate(t.date)}</div>
+                  <div style={{ borderTop: '1px solid #edf2f7', paddingTop: '0.5rem', display: 'flex', flexDirection: 'column', gap: '0.3rem', fontSize: '0.85rem', color: '#4a5568' }}>
+                    {acct && <div><span style={{ color: '#a0aec0' }}>Account: </span>{acct.name}</div>}
+                    {cat && <div><span style={{ color: '#a0aec0' }}>Category: </span>{cat.name}</div>}
+                    {bud && <div><span style={{ color: '#a0aec0' }}>Budget: </span>{bud.name}</div>}
+                    {t.referenceUrl && <div><span style={{ color: '#a0aec0' }}>Reference: </span><a href={t.referenceUrl} target="_blank" rel="noreferrer" style={{ color: '#2b6cb0' }}>{t.referenceNote || t.referenceUrl}</a></div>}
+                  </div>
+                </div>
+              );
+            })()}
+            <div style={{ marginTop: '1.25rem', display: 'flex', justifyContent: 'flex-end' }}>
+              <button
+                style={{ padding: '0.4rem 0.9rem', borderRadius: '0.4rem', border: '1px solid #cbd5e0', background: '#fff', cursor: 'pointer', fontSize: '0.875rem' }}
+                onClick={() => setLinkedNavModal(null)}
+              >Close</button>
+            </div>
+          </div>
         </div>
       )}
     </div>
