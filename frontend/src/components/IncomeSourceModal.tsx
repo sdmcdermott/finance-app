@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import {
   Transaction, IncomeSource, Rule,
   putRule, updateTransactionBudget,
-  INCOME_BUDGET_PREFIX, INCOME_CATEGORY_ID, MASTER_BUDGET_ID,
+  INCOME_BUDGET_PREFIX, INCOME_CATEGORY_ID,
 } from '../api/client';
 import { fmtCurrency } from '../utils/dates';
 

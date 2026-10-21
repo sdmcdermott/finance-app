@@ -12,6 +12,7 @@ import { AuthProvider, useAuth } from './auth/AuthContext';
 import { DataProvider, useData } from './auth/DataContext';
 import SplitEditor from './components/SplitEditor';
 import AccountsPage from './pages/AccountsPage';
+import { ReauthBanner } from './components/ReauthBanner';
 import CategoriesPage from './pages/CategoriesPage';
 import BudgetsPage from './pages/BudgetsPage';
 import BudgetPeriodPage from './pages/BudgetPeriodPage';
@@ -20,6 +21,8 @@ import ImportPage from './pages/ImportPage';
 import LoginPage from './pages/LoginPage';
 import { IncomePage } from './pages/IncomePage';
 import MasterBudgetPage from './pages/MasterBudgetPage';
+import CashFlowPage from './pages/CashFlowPage';
+import PlaidOAuthReturnPage from './pages/PlaidOAuthReturnPage';
 import { IncomeSourceModal } from './components/IncomeSourceModal';
 import { fmtDate } from './utils/dates';
 import { fmtCurrency } from './utils/dates';
@@ -43,6 +46,7 @@ const Nav: React.FC = () => {
     { to: '/categories', label: 'Categories' },
     { to: '/budgets', label: 'Budgets' },
     { to: '/master-budget', label: 'Master Budget' },
+    { to: '/cash-flow', label: 'Cash Flow' },
     { to: '/rules', label: 'Rules' },
     { to: '/income', label: 'Income' },
     { to: '/import', label: 'Import' },
@@ -719,7 +723,7 @@ const RefundCandidateModal: React.FC<{
   };
 
   return (
-    <div style={modalStyles.overlay} onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
+    <div style={modalStyles.overlay}>
       <div style={{ ...modalStyles.box, maxWidth: 640, maxHeight: '80vh', display: 'flex', flexDirection: 'column', gap: 0 }}>
         {/* Header */}
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '0.75rem' }}>
@@ -1387,7 +1391,16 @@ const TransactionsPage: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [assigningId, setAssigningId] = useState<string | null>(null);
   const [assigningBudgetId, setAssigningBudgetId] = useState<string | null>(null);
-  const [showUncatUnbudgetedOnly, setShowUncatUnbudgetedOnly] = useState(false);
+  const [showUncatUnbudgetedOnly, setShowUncatUnbudgetedOnly] = useState(
+    () => localStorage.getItem('finance_show_uncat_unbudgeted_only') === 'true'
+  );
+  const toggleShowUncatUnbudgetedOnly = () => {
+    setShowUncatUnbudgetedOnly(v => {
+      const next = !v;
+      localStorage.setItem('finance_show_uncat_unbudgeted_only', String(next));
+      return next;
+    });
+  };
   const [applyingRules, setApplyingRules] = useState(false);
   const [applyMsg, setApplyMsg] = useState<string | null>(null);
   const [syncing, setSyncing] = useState(false);
@@ -1951,6 +1964,8 @@ const TransactionsPage: React.FC = () => {
       {error && <div style={inlineStyles.error}>{error}</div>}
       {applyMsg && <div style={inlineStyles.success}>{applyMsg}</div>}
 
+      <ReauthBanner />
+
       {/* Filters */}
       <div className="filters">
         <div className="filter-left">
@@ -1971,7 +1986,7 @@ const TransactionsPage: React.FC = () => {
               <option key={o.value} value={o.value}>{o.label}</option>
             ))}
           </select>
-          <label style={inlineStyles.checkLabel} onClick={() => { setShowUncatUnbudgetedOnly(v => !v); setTxnPage(1); }}>
+          <label style={inlineStyles.checkLabel} onClick={() => { toggleShowUncatUnbudgetedOnly(); setTxnPage(1); }}>
             <span style={txnToggleStyles.track(showUncatUnbudgetedOnly)}>
               <span style={txnToggleStyles.thumb(showUncatUnbudgetedOnly)} />
             </span>
@@ -2614,10 +2629,8 @@ const TransactionsPage: React.FC = () => {
 
       {/* ── Linked transaction nav modal ── */}
       {linkedNavModal && (
-        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
-          onClick={() => setLinkedNavModal(null)}>
-          <div style={{ background: '#fff', borderRadius: '0.75rem', padding: '1.5rem', maxWidth: 460, width: '90%', boxShadow: '0 10px 40px rgba(0,0,0,0.2)' }}
-            onClick={e => e.stopPropagation()}>
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <div style={{ background: '#fff', borderRadius: '0.75rem', padding: '1.5rem', maxWidth: 460, width: '90%', boxShadow: '0 10px 40px rgba(0,0,0,0.2)' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
               <div style={{ fontSize: '1rem', fontWeight: 600 }}>
                 {linkedNavModal.direction === 'refund' ? '↩ Refund credit' : 'Original charge'}
@@ -2703,7 +2716,9 @@ const AppInner: React.FC = () => {
           <Route path="/rules" element={<RulesPage />} />
           <Route path="/income" element={<IncomePage />} />
           <Route path="/master-budget" element={<MasterBudgetPage />} />
+          <Route path="/cash-flow" element={<CashFlowPage />} />
           <Route path="/import" element={<ImportPage />} />
+          <Route path="/plaid-oauth" element={<PlaidOAuthReturnPage />} />
         </Routes>
       </main>
     </>

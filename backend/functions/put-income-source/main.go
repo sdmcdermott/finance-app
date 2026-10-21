@@ -37,6 +37,7 @@ type incomeSourceRequest struct {
 	Step4bDeductions       float64               `json:"step4bDeductions"`
 	Step4bItems            []dbpkg.DeductionItem `json:"step4bItems"`
 	IsActive               bool                  `json:"isActive"`
+	NextPayDateOverride    string                `json:"nextPayDateOverride"`
 }
 
 var validFrequencies = map[string]bool{
@@ -108,6 +109,7 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response,
 		Step4bDeductions:       body.Step4bDeductions,
 		Step4bItems:            body.Step4bItems,
 		IsActive:               body.IsActive,
+		NextPayDateOverride:    body.NextPayDateOverride,
 	}
 
 	// Preserve the existing lastNetPay so a save never wipes a previously

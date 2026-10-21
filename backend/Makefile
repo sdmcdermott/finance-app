@@ -95,6 +95,15 @@ build-PutMasterBudgetFunction:
 build-GetMasterBudgetVarianceFunction:
 	$(GOENV) go build $(GOFLAGS) -o $(ARTIFACTS_DIR)/bootstrap ./functions/get-master-budget-variance
 
+build-GetCashFlowForecastFunction:
+	$(GOENV) go build $(GOFLAGS) -o $(ARTIFACTS_DIR)/bootstrap ./functions/get-cash-flow-forecast
+
+build-GetCCCycleSuggestionFunction:
+	$(GOENV) go build $(GOFLAGS) -o $(ARTIFACTS_DIR)/bootstrap ./functions/get-cc-cycle-suggestion
+
+build-CCCycleGuidedFunction:
+	$(GOENV) go build $(GOFLAGS) -o $(ARTIFACTS_DIR)/bootstrap ./functions/cc-cycle-guided
+
 build-GetBudgetsFunction:
 	$(GOENV) go build $(GOFLAGS) -o $(ARTIFACTS_DIR)/bootstrap ./functions/get-budgets
 
@@ -124,6 +133,9 @@ build-PutTransactionFunction:
 
 build-DeleteTransactionFunction:
 	$(GOENV) go build $(GOFLAGS) -o $(ARTIFACTS_DIR)/bootstrap ./functions/delete-transaction
+
+build-BulkDeleteTransactionsFunction:
+	$(GOENV) go build $(GOFLAGS) -o $(ARTIFACTS_DIR)/bootstrap ./functions/bulk-delete-transactions
 
 build-FindRefundsFunction:
 	$(GOENV) go build $(GOFLAGS) -o $(ARTIFACTS_DIR)/bootstrap ./functions/find-refunds

@@ -374,6 +374,42 @@ const MasterBudgetPage: React.FC = () => {
 
   const save = async () => {
     if (!mb) return;
+
+    // Warn if editing an existing budget version in place (not via "+ New
+    // Version") is about to change the amount/frequency of a fixed cost
+    // that's actively linked for variance tracking. Since variance is
+    // recomputed fresh from whichever master budget version was in effect
+    // for each historical month, an in-place edit applies to EVERY month
+    // that cost has ever matched — not just going forward — which can
+    // silently rewrite previously-correct past variance. "+ New Version"
+    // with an effective date is the way to change a cost's amount starting
+    // from a specific point in time without disturbing history before it.
+    const isInPlaceEdit = (mb.effectiveDate ?? '') === originalVersionDate;
+    if (isInPlaceEdit) {
+      const originalVersion = versions.find(v => (v.effectiveDate ?? '') === originalVersionDate);
+      if (originalVersion) {
+        const changedLinkedCosts = mb.fixedCosts.filter(fc => {
+          if (!fc.linkedBudgetId) return false;
+          const orig = originalVersion.fixedCosts.find(o => o.id === fc.id);
+          if (!orig) return false; // brand new this session — nothing retroactive to worry about
+          return orig.amount !== fc.amount || orig.frequency !== fc.frequency;
+        });
+        if (changedLinkedCosts.length > 0) {
+          const names = changedLinkedCosts.map(fc => fc.name || 'Unnamed cost').join(', ');
+          const plural = changedLinkedCosts.length !== 1;
+          const proceed = window.confirm(
+            `You changed the amount or frequency for: ${names}.\n\n` +
+            `You're editing the existing budget version in place (not creating a new dated version). ` +
+            `This will retroactively recalculate ALL historical variance for ${plural ? 'these costs' : 'this cost'} — ` +
+            `including past months that previously matched correctly.\n\n` +
+            `If the amount actually changed on a specific date, click Cancel and use "+ New Version" instead ` +
+            `to preserve historical accuracy. Continue with this in-place edit anyway?`
+          );
+          if (!proceed) return;
+        }
+      }
+    }
+
     setSaving(true);
     setError('');
     try {
@@ -658,15 +694,15 @@ const MasterBudgetPage: React.FC = () => {
       {error && <p style={s.error}>{error}</p>}
 
       {/* ── Summary bar ─────────────────────────────────────────────────── */}
-      <div style={s.summaryBar}>
+      <div style={s.summaryBar} className="mb-summary-bar">
         <SummaryCell label="Monthly Income" value={totalIncome} color="#0d7a6b" />
-        <span style={s.summaryArrow}>−</span>
+        <span style={s.summaryArrow} className="mb-summary-arrow">−</span>
         <SummaryCell label="Fixed Costs" value={totalFixed} color="#dc2626" />
-        <span style={s.summaryArrow}>=</span>
+        <span style={s.summaryArrow} className="mb-summary-arrow">=</span>
         <SummaryCell label="Discretionary" value={discretionary} color={discretionary >= 0 ? '#0d7a6b' : '#dc2626'} />
-        <span style={s.summaryArrow}>−</span>
+        <span style={s.summaryArrow} className="mb-summary-arrow">−</span>
         <SummaryCell label="Allocated" value={totalAllocated} color="#374151" />
-        <span style={s.summaryArrow}>=</span>
+        <span style={s.summaryArrow} className="mb-summary-arrow">=</span>
         <SummaryCell
           label="Unallocated"
           value={unallocated}
@@ -676,6 +712,7 @@ const MasterBudgetPage: React.FC = () => {
 
       {/* ── Income ──────────────────────────────────────────────────────── */}
       <Section title="Income Sources">
+        <div className="mb-table-wrap">
         <table style={s.table}>
           <thead>
             <tr>
@@ -795,6 +832,119 @@ const MasterBudgetPage: React.FC = () => {
             })}
           </tbody>
         </table>
+        </div>{/* end mb-table-wrap */}
+
+        {/* ── Income source cards (mobile) ── */}
+        <div className="mb-income-cards">
+          {mb.incomeSources.map(mbi => {
+            const src = incomeSources.find(s2 => s2.incomeSourceId === mbi.incomeSourceId);
+            if (!src) return null;
+            const netPerPeriod = src.lastNetPay?.netPay ?? src.grossAmount;
+            const monthly = monthlyNetPay(mbi.incomeSourceId);
+            const isExpanded = expandedIncomeRule.has(mbi.incomeSourceId);
+            const draft = incomeRuleDraft[mbi.incomeSourceId];
+            const hasRule = !!mbi.incomeRuleId || rules.some(r => r.incomeSourceId === mbi.incomeSourceId);
+            return (
+              <div key={mbi.incomeSourceId} className="mb-card" style={{ opacity: mbi.enabled ? 1 : 0.6 }}>
+                <div className="mb-card-row">
+                  <span className="mb-card-title">{src.name}</span>
+                  <Toggle on={mbi.enabled} onChange={v => updateMBIS(mbi.incomeSourceId, { enabled: v })} />
+                </div>
+                <div className="mb-card-field">
+                  <span className="mb-card-field-label">Frequency</span>
+                  <span className="mb-card-field-value">{FREQ_LABELS[src.frequency] ?? src.frequency}</span>
+                </div>
+                <div className="mb-card-field">
+                  <span className="mb-card-field-label">Net pay / period</span>
+                  <span className="mb-card-field-value">
+                    {fmtCurrency(netPerPeriod)}
+                    {!src.lastNetPay && <span style={s.estBadge} title="No net pay calculated; using gross pay">gross</span>}
+                  </span>
+                </div>
+                <div className="mb-card-field">
+                  <span className="mb-card-field-label">Monthly net pay</span>
+                  <span className="mb-card-field-value">{fmtCurrency(monthly)}</span>
+                </div>
+                <div className="mb-card-field">
+                  <span className="mb-card-field-label">Monthly override</span>
+                  <span className="mb-card-field-value">
+                    <MoneyInput
+                      value={mbi.monthlyOverride}
+                      onChange={v => updateMBIS(mbi.incomeSourceId, { monthlyOverride: v })}
+                      placeholder="Optional"
+                      style={{ maxWidth: 120, textAlign: 'right' }}
+                    />
+                  </span>
+                </div>
+                <div className="mb-card-field">
+                  <span className="mb-card-field-label">Variance budget</span>
+                  <span className="mb-card-field-value">
+                    <select
+                      style={{ ...s.freqSelect, maxWidth: 160 }}
+                      value={mbi.linkedBudgetId ?? ''}
+                      onChange={e => updateMBIS(mbi.incomeSourceId, { linkedBudgetId: e.target.value || undefined })}
+                    >
+                      <option value="">— none —</option>
+                      {budgets.map(b => (
+                        <option key={b.budgetId} value={b.budgetId}>{b.name}</option>
+                      ))}
+                    </select>
+                  </span>
+                </div>
+                <div style={{ marginTop: '0.4rem' }}>
+                  <button
+                    style={{ ...s.suggestLink, fontSize: '0.82rem' }}
+                    onClick={() => toggleIncomeRuleExpand(mbi.incomeSourceId)}
+                  >
+                    {hasRule ? '✓ rule' : '+ match rule'}{isExpanded ? ' ▲' : ' ▼'}
+                  </button>
+                </div>
+                {isExpanded && (
+                  <div style={{ marginTop: '0.5rem', background: '#f7fafc', borderRadius: 6, padding: '0.6rem 0.75rem' }}>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
+                      <label style={s.ruleLabel}>
+                        Deposit description contains
+                        <input
+                          style={s.ruleInput}
+                          placeholder="e.g. ADP, DIRECT DEP"
+                          value={draft?.pattern ?? ''}
+                          onChange={e => patchRuleDraft(mbi.incomeSourceId, { pattern: e.target.value })}
+                        />
+                      </label>
+                      <label style={s.ruleLabel}>
+                        Expected amount ($)
+                        <input
+                          style={s.ruleInput}
+                          type="number" min="0" step="0.01"
+                          placeholder={String(netPerPeriod.toFixed(2))}
+                          value={draft?.amountMatch || ''}
+                          onChange={e => patchRuleDraft(mbi.incomeSourceId, { amountMatch: parseFloat(e.target.value) || 0 })}
+                        />
+                      </label>
+                      <label style={s.ruleLabel}>
+                        ± tolerance ($)
+                        <input
+                          style={{ ...s.ruleInput, maxWidth: 70 }}
+                          type="number" min="0" step="0.01"
+                          value={draft?.amountTolerance ?? 5}
+                          onChange={e => patchRuleDraft(mbi.incomeSourceId, { amountTolerance: parseFloat(e.target.value) || 0 })}
+                        />
+                      </label>
+                      <button
+                        style={draft?.pattern ? s.addBtn : { ...s.addBtn, opacity: 0.5 }}
+                        disabled={!draft?.pattern || incomeRuleSaving.has(mbi.incomeSourceId)}
+                        onClick={() => saveIncomeRule(mbi)}
+                      >
+                        {incomeRuleSaving.has(mbi.incomeSourceId) ? 'Saving…' : 'Save rule'}
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+
         {mb.incomeSources.length === 0 && (
           <p style={s.muted}>No income sources yet. Add them on the Income page.</p>
         )}
@@ -806,6 +956,7 @@ const MasterBudgetPage: React.FC = () => {
           (suggest from transactions)
         </button>
       }>
+        <div className="mb-table-wrap">
         <table style={s.table}>
           <thead>
             <tr>
@@ -893,6 +1044,18 @@ const MasterBudgetPage: React.FC = () => {
                       >
                         {hasRule ? '✓ rule' : '+ match rule'}{isExpanded ? ' ▲' : ' ▼'}
                       </button>
+                      {!hasRule && (
+                        <label style={{ display: 'flex', alignItems: 'center', gap: 4, marginTop: 4, fontSize: '0.72rem', color: '#6b7280' }}>
+                          Forecast day
+                          <input
+                            type="number" min={1} max={31}
+                            style={{ ...s.ruleInput, maxWidth: 55, padding: '2px 4px' }}
+                            value={fc.dayOfMonthOverride ?? ''}
+                            onChange={e => updateFixedCost(fc.id, { dayOfMonthOverride: e.target.value ? parseInt(e.target.value, 10) : undefined })}
+                            title="Day of month (1-31) used as a fallback anchor for Cash Flow forecasting when there's no match rule"
+                          />
+                        </label>
+                      )}
                     </td>
                   </>
                 ) : (
@@ -1026,6 +1189,221 @@ const MasterBudgetPage: React.FC = () => {
             })}
           </tbody>
         </table>
+        </div>{/* end mb-table-wrap */}
+
+        {/* ── Fixed cost cards (mobile) ── */}
+        <div className="mb-fc-cards">
+          {mb.fixedCosts.map(fc => {
+            const isEditing = editingFcIds.has(fc.id);
+            const isExpanded = expandedFcRule.has(fc.id);
+            const draft = fcRuleDraft[fc.id];
+            const hasRule = !!fc.ruleId;
+            const linkedBudgetName = budgets.find(b => b.budgetId === fc.linkedBudgetId)?.name;
+            return (
+              <div key={fc.id} className="mb-card">
+                {isEditing ? (
+                  <>
+                    <div className="mb-card-row">
+                      <input
+                        style={{ ...s.nameInput, flex: 1 }}
+                        value={fc.name}
+                        onChange={e => updateFixedCost(fc.id, { name: e.target.value })}
+                        placeholder="e.g. Mortgage"
+                      />
+                      <div style={{ display: 'flex', gap: 4 }}>
+                        <button style={{ ...s.removeBtn, color: '#0d7a6b' }} onClick={() => toggleFcEdit(fc.id)} title="Done">✏</button>
+                        <button style={s.removeBtn} onClick={() => removeFixedCost(fc.id)} title="Remove">✕</button>
+                      </div>
+                    </div>
+                    <div className="mb-card-field">
+                      <span className="mb-card-field-label">Frequency</span>
+                      <select
+                        style={{ ...s.freqSelect, maxWidth: 160 }}
+                        value={fc.frequency}
+                        onChange={e => updateFixedCost(fc.id, { frequency: e.target.value as MBFixedCost['frequency'] })}
+                      >
+                        {Object.entries(FREQ_LABELS).map(([v, l]) => (
+                          <option key={v} value={v}>{l}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="mb-card-field">
+                      <span className="mb-card-field-label">Amount</span>
+                      <MoneyInput
+                        value={fc.amount}
+                        onChange={v => updateFixedCost(fc.id, { amount: v })}
+                        style={{ maxWidth: 130, textAlign: 'right' }}
+                      />
+                    </div>
+                    <div className="mb-card-field">
+                      <span className="mb-card-field-label">Monthly</span>
+                      <span style={{ color: '#dc2626' }}>{fmtCurrency(toMonthly(fc.amount, fc.frequency))}</span>
+                    </div>
+                    <div className="mb-card-field">
+                      <span className="mb-card-field-label">Variance budget</span>
+                      <select
+                        style={{ ...s.freqSelect, maxWidth: 160 }}
+                        value={fc.linkedBudgetId ?? ''}
+                        onChange={e => updateFixedCost(fc.id, { linkedBudgetId: e.target.value || undefined })}
+                      >
+                        <option value="">— none —</option>
+                        {budgets.map(b => (
+                          <option key={b.budgetId} value={b.budgetId}>{b.name}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div style={{ marginTop: '0.4rem' }}>
+                      <button
+                        style={{ ...s.suggestLink, fontSize: '0.82rem' }}
+                        onClick={() => toggleFcRuleExpand(fc.id)}
+                      >
+                        {hasRule ? '✓ rule' : '+ match rule'}{isExpanded ? ' ▲' : ' ▼'}
+                      </button>
+                    </div>
+                    {!hasRule && (
+                      <div className="mb-card-field">
+                        <span className="mb-card-field-label">Forecast day (optional)</span>
+                        <input
+                          type="number" min={1} max={31}
+                          style={{ ...s.ruleInput, maxWidth: 70 }}
+                          value={fc.dayOfMonthOverride ?? ''}
+                          onChange={e => updateFixedCost(fc.id, { dayOfMonthOverride: e.target.value ? parseInt(e.target.value, 10) : undefined })}
+                          title="Day of month (1-31) used as a fallback anchor for Cash Flow forecasting when there's no match rule"
+                        />
+                      </div>
+                    )}
+                    {isExpanded && (
+                      <div style={{ marginTop: '0.5rem', background: '#f7fafc', borderRadius: 6, padding: '0.6rem 0.75rem' }}>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
+                          <label style={s.ruleLabel}>
+                            Description contains
+                            <input
+                              style={s.ruleInput}
+                              placeholder={`e.g. ${fc.name || 'netflix'}`}
+                              value={draft?.pattern ?? ''}
+                              onChange={e => patchFcRuleDraft(fc.id, { pattern: e.target.value })}
+                            />
+                          </label>
+                          <label style={s.ruleLabel}>
+                            Category <span style={{ fontWeight: 400, color: '#a0aec0' }}>(optional)</span>
+                            <select
+                              style={{ ...s.ruleInput, minWidth: 0 }}
+                              value={draft?.categoryId ?? ''}
+                              onChange={e => patchFcRuleDraft(fc.id, { categoryId: e.target.value })}
+                            >
+                              <option value="">— None —</option>
+                              {categories.map(c => (
+                                <option key={c.categoryId} value={c.categoryId}>{c.name}</option>
+                              ))}
+                            </select>
+                          </label>
+                          <label style={{ ...s.ruleLabel, flexDirection: 'row', alignItems: 'center', gap: '0.35rem' }}>
+                            <input
+                              type="checkbox"
+                              checked={draft?.useAmount ?? false}
+                              onChange={e => patchFcRuleDraft(fc.id, { useAmount: e.target.checked })}
+                            />
+                            Match amount
+                          </label>
+                          {draft?.useAmount && (
+                            <>
+                              <label style={s.ruleLabel}>
+                                Amount ($)
+                                <input
+                                  style={{ ...s.ruleInput, maxWidth: 100 }}
+                                  type="number" min="0" step="0.01"
+                                  value={draft?.amountMatch || ''}
+                                  onChange={e => patchFcRuleDraft(fc.id, { amountMatch: parseFloat(e.target.value) || 0 })}
+                                />
+                              </label>
+                              <label style={s.ruleLabel}>
+                                ±$ tolerance
+                                <input
+                                  style={{ ...s.ruleInput, maxWidth: 70 }}
+                                  type="number" min="0" step="0.01"
+                                  value={draft?.amountTolerance ?? 5}
+                                  onChange={e => patchFcRuleDraft(fc.id, { amountTolerance: parseFloat(e.target.value) || 0 })}
+                                />
+                              </label>
+                            </>
+                          )}
+                          <label style={{ ...s.ruleLabel, flexDirection: 'row', alignItems: 'center', gap: '0.35rem' }}>
+                            <input
+                              type="checkbox"
+                              checked={draft?.useDay ?? false}
+                              onChange={e => patchFcRuleDraft(fc.id, { useDay: e.target.checked })}
+                            />
+                            Match day of month
+                          </label>
+                          {draft?.useDay && (
+                            <>
+                              <label style={s.ruleLabel}>
+                                Day (1–31)
+                                <input
+                                  style={{ ...s.ruleInput, maxWidth: 70 }}
+                                  type="number" min="1" max="31"
+                                  value={draft?.dayOfMonth || ''}
+                                  onChange={e => patchFcRuleDraft(fc.id, { dayOfMonth: parseInt(e.target.value) || 0 })}
+                                />
+                              </label>
+                              <label style={s.ruleLabel}>
+                                ±days tolerance
+                                <input
+                                  style={{ ...s.ruleInput, maxWidth: 70 }}
+                                  type="number" min="0" max="15"
+                                  value={draft?.dayTolerance ?? 3}
+                                  onChange={e => patchFcRuleDraft(fc.id, { dayTolerance: parseInt(e.target.value) || 0 })}
+                                />
+                              </label>
+                            </>
+                          )}
+                          <button
+                            style={draft?.pattern ? s.addBtn : { ...s.addBtn, opacity: 0.5 }}
+                            disabled={!draft?.pattern || fcRuleSaving.has(fc.id)}
+                            onClick={() => saveFcRule(fc)}
+                          >
+                            {fcRuleSaving.has(fc.id) ? 'Saving…' : 'Save rule'}
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    <div className="mb-card-row">
+                      <span className="mb-card-title">{fc.name || <span style={{ color: '#a0aec0', fontStyle: 'italic' }}>unnamed</span>}</span>
+                      <div style={{ display: 'flex', gap: 4 }}>
+                        <button style={s.removeBtn} onClick={() => toggleFcEdit(fc.id)} title="Edit">✏</button>
+                        <button style={s.removeBtn} onClick={() => removeFixedCost(fc.id)} title="Remove">✕</button>
+                      </div>
+                    </div>
+                    <div className="mb-card-field">
+                      <span className="mb-card-field-label">Frequency</span>
+                      <span>{FREQ_LABELS[fc.frequency] ?? fc.frequency}</span>
+                    </div>
+                    <div className="mb-card-field">
+                      <span className="mb-card-field-label">Amount</span>
+                      <span>{fmtCurrency(fc.amount)}</span>
+                    </div>
+                    <div className="mb-card-field">
+                      <span className="mb-card-field-label">Monthly</span>
+                      <span style={{ color: '#dc2626' }}>{fmtCurrency(toMonthly(fc.amount, fc.frequency))}</span>
+                    </div>
+                    <div className="mb-card-field">
+                      <span className="mb-card-field-label">Variance budget</span>
+                      <span style={{ color: linkedBudgetName ? '#2d3748' : '#a0aec0' }}>{linkedBudgetName ?? '—'}</span>
+                    </div>
+                    <div className="mb-card-field">
+                      <span className="mb-card-field-label">Rule</span>
+                      <span style={{ color: hasRule ? '#059669' : '#a0aec0' }}>{hasRule ? '✓ rule' : '—'}</span>
+                    </div>
+                  </>
+                )}
+              </div>
+            );
+          })}
+        </div>
+
         <button style={s.addBtn} onClick={addFixedCost}>+ Add cost</button>
       </Section>
 
@@ -1036,6 +1414,7 @@ const MasterBudgetPage: React.FC = () => {
           {variance.income.length > 0 && (
             <>
               <p style={{ ...s.sectionNote, marginBottom: '0.4rem' }}>Income</p>
+              <div className="mb-table-wrap">
               <table style={s.table}>
                 <thead>
                   <tr>
@@ -1066,6 +1445,38 @@ const MasterBudgetPage: React.FC = () => {
                   })}
                 </tbody>
               </table>
+              </div>{/* end mb-table-wrap */}
+
+              {/* Income variance cards (mobile) */}
+              <div className="mb-var-cards">
+                {variance.income.map(v => {
+                  const src = incomeSources.find(s2 => s2.incomeSourceId === v.incomeSourceId);
+                  const varColor = v.variance >= 0 ? '#16a34a' : '#dc2626';
+                  return (
+                    <div key={v.incomeSourceId} className="mb-card">
+                      <div className="mb-card-title" style={{ marginBottom: '0.35rem' }}>{src?.name ?? v.incomeSourceId}</div>
+                      <div className="mb-card-field">
+                        <span className="mb-card-field-label">Expected</span>
+                        <span>{fmtCurrency(v.expectedMonthly)}</span>
+                      </div>
+                      <div className="mb-card-field">
+                        <span className="mb-card-field-label">Actual</span>
+                        <span>{fmtCurrency(v.actual)}</span>
+                      </div>
+                      <div className="mb-card-field">
+                        <span className="mb-card-field-label">Variance</span>
+                        <span style={{ color: varColor, fontWeight: 600 }}>{v.variance >= 0 ? '+' : ''}{fmtCurrency(v.variance)}</span>
+                      </div>
+                      <div className="mb-card-field">
+                        <span className="mb-card-field-label">Matched</span>
+                        <span style={{ color: v.matchedCount === 0 ? '#dc2626' : '#2d3748' }}>
+                          {v.matchedCount === 0 ? '⚠ none' : `${v.matchedCount}×`}
+                        </span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
             </>
           )}
           {variance.income.length === 0 && (
@@ -1116,6 +1527,7 @@ const MasterBudgetPage: React.FC = () => {
             const renderCostTable = (rows: typeof variance.fixedCosts, group: string) => rows.length > 0 && (
               <>
                 <p style={{ ...s.sectionNote, marginTop: '1rem', marginBottom: '0.4rem' }}>{periodLabel[group]}</p>
+                <div className="mb-table-wrap">
                 <table style={s.table}>
                   <thead>
                     <tr>
@@ -1149,6 +1561,40 @@ const MasterBudgetPage: React.FC = () => {
                     })}
                   </tbody>
                 </table>
+                </div>{/* end mb-table-wrap */}
+
+                {/* Fixed cost variance cards (mobile) */}
+                <div className="mb-var-cards">
+                  {rows.map(v => {
+                    const multiplier = expectedMultiplier[group];
+                    const expected   = v.expectedMonthly * multiplier;
+                    const variance_  = v.actual - expected;
+                    const varColor = variance_ > 0 ? '#dc2626' : variance_ < 0 ? '#16a34a' : '#2d3748';
+                    return (
+                      <div key={v.fixedCostId} className="mb-card">
+                        <div className="mb-card-title" style={{ marginBottom: '0.35rem' }}>{v.name}</div>
+                        <div className="mb-card-field">
+                          <span className="mb-card-field-label">Expected</span>
+                          <span>{fmtCurrency(expected)}</span>
+                        </div>
+                        <div className="mb-card-field">
+                          <span className="mb-card-field-label">Actual</span>
+                          <span>{fmtCurrency(v.actual)}</span>
+                        </div>
+                        <div className="mb-card-field">
+                          <span className="mb-card-field-label">Variance</span>
+                          <span style={{ color: varColor, fontWeight: 600 }}>{variance_ > 0 ? '+' : ''}{fmtCurrency(variance_)}</span>
+                        </div>
+                        <div className="mb-card-field">
+                          <span className="mb-card-field-label">Matched</span>
+                          <span style={{ color: v.matchedCount === 0 ? '#9ca3af' : '#2d3748' }}>
+                            {v.matchedCount === 0 ? '—' : `${v.matchedCount}×`}
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
               </>
             );
 
@@ -1171,6 +1617,7 @@ const MasterBudgetPage: React.FC = () => {
           into spending buckets. Link each bucket to an existing budget to push the amount there as a
           goal amount or checkbook credit.
         </p>
+        <div className="mb-table-wrap">
         <table style={s.table}>
           <thead>
             <tr>
@@ -1295,6 +1742,119 @@ const MasterBudgetPage: React.FC = () => {
             })}
           </tbody>
         </table>
+        </div>{/* end mb-table-wrap */}
+
+        {/* ── Discretionary bucket cards (mobile) ── */}
+        <div className="mb-bucket-cards">
+          {mb.buckets.map(b => {
+            const isPercent   = percentMode.has(b.id);
+            const isRemaining = remainingMode.has(b.id);
+            const otherAllocated = mb.buckets
+              .filter(x => x.id !== b.id)
+              .reduce((sum, x) => {
+                if (remainingMode.has(x.id)) return sum;
+                if (percentMode.has(x.id))   return sum + discretionary * x.percent;
+                return sum + x.amountMonthly;
+              }, 0);
+            const remainingVal = Math.max(0, Math.round((discretionary - otherAllocated) * 100) / 100);
+            const monthly = isRemaining
+              ? remainingVal
+              : isPercent
+                ? discretionary * b.percent
+                : b.amountMonthly;
+            const linkedBudget = budgets.find(bg => bg.budgetId === b.linkedBudgetId);
+            const derivedLinkType = linkedBudget?.budgetType === 'checkbook' ? 'credit' : 'goal';
+            const amtType = isRemaining ? 'remaining' : isPercent ? 'percent' : 'fixed';
+
+            return (
+              <div key={b.id} className="mb-card">
+                <div className="mb-card-row">
+                  <input
+                    style={{ ...s.nameInput, flex: 1 }}
+                    value={b.name}
+                    onChange={e => updateBucket(b.id, { name: e.target.value })}
+                    placeholder="e.g. Dining out"
+                  />
+                  <button style={{ ...s.removeBtn, marginLeft: 8 }} onClick={() => removeBucket(b.id)} title="Remove">✕</button>
+                </div>
+                <div className="mb-card-field">
+                  <span className="mb-card-field-label">Amount type</span>
+                  <select
+                    style={{ ...s.freqSelect, maxWidth: 160 }}
+                    value={amtType}
+                    onChange={e => {
+                      const val = e.target.value;
+                      setPercentMode(prev => { const n = new Set(prev); n.delete(b.id); return n; });
+                      setRemainingMode(prev => { const n = new Set(prev); n.delete(b.id); return n; });
+                      if (val === 'percent') {
+                        setPercentMode(prev => new Set(prev).add(b.id));
+                        const pct = discretionary > 0 ? monthly / discretionary : 0;
+                        updateBucket(b.id, { amountMonthly: 0, percent: pct, amountType: 'percent' });
+                      } else if (val === 'remaining') {
+                        setRemainingMode(prev => new Set(prev).add(b.id));
+                        updateBucket(b.id, { amountMonthly: 0, percent: 0, amountType: 'remaining' });
+                      } else {
+                        updateBucket(b.id, { percent: 0, amountMonthly: Math.round(monthly * 100) / 100, amountType: 'fixed' });
+                      }
+                    }}
+                  >
+                    <option value="fixed">Fixed $</option>
+                    <option value="percent">% of discretionary</option>
+                    <option value="remaining">$ Remaining</option>
+                  </select>
+                </div>
+                <div className="mb-card-field">
+                  <span className="mb-card-field-label">Value</span>
+                  <span>
+                    {isRemaining ? (
+                      <span style={{ color: '#6b7280' }}>{fmtCurrency(remainingVal)}</span>
+                    ) : !isPercent ? (
+                      <BucketMoneyInput
+                        value={b.amountMonthly}
+                        onCommit={v => updateBucket(b.id, { amountMonthly: v })}
+                      />
+                    ) : (
+                      <BucketPercentInput
+                        value={b.percent}
+                        onCommit={v => updateBucket(b.id, { percent: v })}
+                      />
+                    )}
+                  </span>
+                </div>
+                <div className="mb-card-field">
+                  <span className="mb-card-field-label">Monthly</span>
+                  <span>{fmtCurrency(monthly)}</span>
+                </div>
+                <div className="mb-card-field">
+                  <span className="mb-card-field-label">Link to budget</span>
+                  <select
+                    style={{ ...s.freqSelect, maxWidth: 160 }}
+                    value={b.linkedBudgetId ?? ''}
+                    onChange={e => {
+                      const newId = e.target.value || undefined;
+                      const bg = budgets.find(x => x.budgetId === newId);
+                      const lt = bg?.budgetType === 'checkbook' ? 'credit' : 'goal';
+                      updateBucket(b.id, { linkedBudgetId: newId, linkType: newId ? lt : undefined });
+                    }}
+                  >
+                    <option value="">— none —</option>
+                    {budgets.map(bg => (
+                      <option key={bg.budgetId} value={bg.budgetId}>{bg.name}</option>
+                    ))}
+                  </select>
+                </div>
+                {linkedBudget && (
+                  <div className="mb-card-field">
+                    <span className="mb-card-field-label">Link type</span>
+                    <span style={s.linkTypeBadge}>
+                      {derivedLinkType === 'credit' ? 'Checkbook credit' : 'Goal amount'}
+                    </span>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
 
         <button style={s.addBtn} onClick={addBucket}>+ Add bucket</button>
 
@@ -1311,6 +1871,8 @@ const MasterBudgetPage: React.FC = () => {
 
     {showSuggest && (
       <SuggestFixedCostsModal
+        existingFixedCosts={mb?.fixedCosts ?? []}
+        existingRules={rules}
         onClose={() => setShowSuggest(false)}
         onConfirm={added => {
           if (mb) {

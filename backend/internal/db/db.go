@@ -23,6 +23,7 @@ import (
 	"os"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -95,6 +96,38 @@ type Account struct {
 	Enabled *bool `dynamodbav:"enabled,omitempty"  json:"enabled"`
 	// NickName is an optional user-supplied display name that overrides the Plaid-provided Name.
 	NickName string `dynamodbav:"nickName,omitempty" json:"nickName,omitempty"`
+
+	// ── Cash flow forecasting ──────────────────────────────────────────────
+	// IsCashAccount designates the single account whose balance the cash flow
+	// forecast projects forward. Only one account should have this set at a
+	// time (enforced at the update-account handler, not the DB layer).
+	IsCashAccount bool `dynamodbav:"isCashAccount,omitempty" json:"isCashAccount,omitempty"`
+	// CurrentBalance/AvailableBalance are populated from Plaid's free cached
+	// /accounts/get response (refreshed during sync-transactions) — not a
+	// billed real-time Balance product call, since the forecast only needs a
+	// reasonably-fresh starting point, not sub-second precision.
+	CurrentBalance   float64   `dynamodbav:"currentBalance,omitempty"    json:"currentBalance,omitempty"`
+	AvailableBalance float64   `dynamodbav:"availableBalance,omitempty"  json:"availableBalance,omitempty"`
+	BalanceUpdatedAt time.Time `dynamodbav:"balanceUpdatedAt,omitempty"  json:"balanceUpdatedAt,omitempty"`
+
+	// ── Credit card billing cycle override (cash flow forecasting) ─────────
+	// Only meaningful when Type == "credit". When both CCPaymentDueDay
+	// and CCGracePeriodDays are set (> 0), the cash flow forecast uses them
+	// directly (ReconstructCreditCardCycleManual) instead of the automatic
+	// heuristic (ReconstructCreditCardCycle, see internal/db/cccycle.go) —
+	// set via the Accounts page's "Configure cash flow" modal, either typed
+	// directly, derived from a guided statement Q&A, or copied from the
+	// automatic heuristic's own suggestion. CCPaymentDueDay (not the
+	// statement close day) is the fixed anchor, per Regulation Z requiring
+	// a fixed payment due date — see cccycle.go's package doc comment for
+	// why the close day is NOT a reliable fixed value. CCCycleConfidence is
+	// "manual" when an override is set; CCCycleCheckedAt records when it
+	// was last saved. Clearing CCPaymentDueDay/CCGracePeriodDays (both back
+	// to 0) reverts to automatic detection.
+	CCPaymentDueDay   int       `dynamodbav:"ccPaymentDueDay,omitempty"   json:"ccPaymentDueDay,omitempty"` // 1-31
+	CCGracePeriodDays int       `dynamodbav:"ccGracePeriodDays,omitempty" json:"ccGracePeriodDays,omitempty"`
+	CCCycleConfidence string    `dynamodbav:"ccCycleConfidence,omitempty" json:"ccCycleConfidence,omitempty"` // "manual" when an override is set
+	CCCycleCheckedAt  time.Time `dynamodbav:"ccCycleCheckedAt,omitempty"  json:"ccCycleCheckedAt,omitempty"`
 }
 
 // PlaidItem holds the Plaid access token for a linked institution.
@@ -108,6 +141,16 @@ type PlaidItem struct {
 	ItemID      string `dynamodbav:"itemId"      json:"itemId"`
 	AccessToken string `dynamodbav:"accessToken" json:"-"` // never sent to frontend
 	Institution string `dynamodbav:"institution" json:"institution"`
+
+	// Re-authentication tracking. Set when a Plaid sync call fails with an
+	// item error indicating the stored connection is no longer valid
+	// (e.g. ITEM_LOGIN_REQUIRED after a bank password change or MFA reset).
+	// This is a normal, expected condition — not a bug — and is resolved by
+	// the user re-connecting via Plaid Link's "update mode".
+	NeedsReauth      bool      `dynamodbav:"needsReauth,omitempty"      json:"needsReauth,omitempty"`
+	LastErrorCode    string    `dynamodbav:"lastErrorCode,omitempty"    json:"lastErrorCode,omitempty"`
+	LastErrorMessage string    `dynamodbav:"lastErrorMessage,omitempty" json:"lastErrorMessage,omitempty"`
+	LastErrorAt      time.Time `dynamodbav:"lastErrorAt,omitempty"      json:"lastErrorAt,omitempty"`
 }
 
 // Category is a user-defined spending category (no longer carries a budget).
@@ -267,6 +310,10 @@ type MBFixedCost struct {
 	FromTxn bool `dynamodbav:"fromTxn,omitempty" json:"fromTxn,omitempty"`
 	// LinkedBudgetID: optional checkbook budget that tracks actual spend vs. this expected amount
 	LinkedBudgetID string `dynamodbav:"linkedBudgetId,omitempty" json:"linkedBudgetId,omitempty"`
+	// DayOfMonthOverride is a manual fallback anchor (1-31) for cash flow
+	// forecasting, used only when there's no linked rule/day-of-month and no
+	// matched transaction history to derive an anchor day automatically.
+	DayOfMonthOverride int `dynamodbav:"dayOfMonthOverride,omitempty" json:"dayOfMonthOverride,omitempty"`
 }
 
 // MBBucket is a discretionary spending allocation linked optionally to a Budget.
@@ -470,6 +517,10 @@ type IncomeSource struct {
 	// LastNetPay is the most recently computed net pay breakdown. Stored so it
 	// survives page reloads without requiring another payrolltax API call.
 	LastNetPay *NetPayResult `dynamodbav:"lastNetPay,omitempty" json:"lastNetPay,omitempty"`
+	// NextPayDateOverride is a manual fallback anchor (YYYY-MM-DD) for cash
+	// flow forecasting, used only when no rule-matched paycheck history
+	// exists yet to derive an anchor date automatically.
+	NextPayDateOverride string `dynamodbav:"nextPayDateOverride,omitempty" json:"nextPayDateOverride,omitempty"`
 }
 
 // NetPayResult mirrors payrolltax.NetPayResult for storage on IncomeSource.
@@ -627,7 +678,106 @@ func (c *Client) UpdateAccountNickName(ctx context.Context, userID, accountID, n
 	return err
 }
 
-// PutPlaidItem upserts a PlaidItem (access token + institution) keyed by itemId.
+// SetCashAccount designates accountID as the single "cash" account used for
+// cash flow forecasting, clearing the flag from any other account the user
+// has (enforcing at most one at a time). Passing enabled=false simply clears
+// the flag on accountID without setting it anywhere else.
+func (c *Client) SetCashAccount(ctx context.Context, userID, accountID string, enabled bool) error {
+	if enabled {
+		accounts, err := c.GetAccounts(ctx, userID)
+		if err != nil {
+			return err
+		}
+		for _, a := range accounts {
+			if a.AccountID != accountID && a.IsCashAccount {
+				if _, err := c.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+					TableName: &c.table,
+					Key: map[string]types.AttributeValue{
+						"pk": &types.AttributeValueMemberS{Value: userPK(userID)},
+						"sk": &types.AttributeValueMemberS{Value: accountSK(a.AccountID)},
+					},
+					UpdateExpression: aws.String("REMOVE isCashAccount"),
+				}); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	input := &dynamodb.UpdateItemInput{
+		TableName: &c.table,
+		Key: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: userPK(userID)},
+			"sk": &types.AttributeValueMemberS{Value: accountSK(accountID)},
+		},
+	}
+	if enabled {
+		input.UpdateExpression = aws.String("SET isCashAccount = :v")
+		input.ExpressionAttributeValues = map[string]types.AttributeValue{
+			":v": &types.AttributeValueMemberBOOL{Value: true},
+		}
+	} else {
+		input.UpdateExpression = aws.String("REMOVE isCashAccount")
+	}
+	_, err := c.ddb.UpdateItem(ctx, input)
+	return err
+}
+
+// UpdateAccountBalance persists Plaid's cached current/available balance for
+// an account (from the free /accounts/get response — not the billed
+// real-time /accounts/balance/get endpoint).
+func (c *Client) UpdateAccountBalance(ctx context.Context, userID, accountID string, current, available float64) error {
+	_, err := c.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: &c.table,
+		Key: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: userPK(userID)},
+			"sk": &types.AttributeValueMemberS{Value: accountSK(accountID)},
+		},
+		UpdateExpression: aws.String("SET currentBalance = :c, availableBalance = :a, balanceUpdatedAt = :t"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":c": &types.AttributeValueMemberN{Value: strconv.FormatFloat(current, 'f', -1, 64)},
+			":a": &types.AttributeValueMemberN{Value: strconv.FormatFloat(available, 'f', -1, 64)},
+			":t": &types.AttributeValueMemberS{Value: time.Now().UTC().Format(time.RFC3339)},
+		},
+	})
+	return err
+}
+
+// UpdateAccountCCCycle sets a manual credit card billing cycle override
+// (see cccycle.go) so the cash flow forecast uses it directly instead of
+// running the automatic heuristic every request.
+func (c *Client) UpdateAccountCCCycle(ctx context.Context, userID, accountID string, paymentDueDay, gracePeriodDays int, confidence string) error {
+	_, err := c.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: &c.table,
+		Key: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: userPK(userID)},
+			"sk": &types.AttributeValueMemberS{Value: accountSK(accountID)},
+		},
+		UpdateExpression: aws.String("SET ccPaymentDueDay = :d, ccGracePeriodDays = :g, ccCycleConfidence = :conf, ccCycleCheckedAt = :t"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":d":    &types.AttributeValueMemberN{Value: strconv.Itoa(paymentDueDay)},
+			":g":    &types.AttributeValueMemberN{Value: strconv.Itoa(gracePeriodDays)},
+			":conf": &types.AttributeValueMemberS{Value: confidence},
+			":t":    &types.AttributeValueMemberS{Value: time.Now().UTC().Format(time.RFC3339)},
+		},
+	})
+	return err
+}
+
+// ClearAccountCCCycle removes a manual credit card billing cycle override,
+// reverting the cash flow forecast back to the automatic heuristic for this
+// account.
+func (c *Client) ClearAccountCCCycle(ctx context.Context, userID, accountID string) error {
+	_, err := c.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: &c.table,
+		Key: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: userPK(userID)},
+			"sk": &types.AttributeValueMemberS{Value: accountSK(accountID)},
+		},
+		UpdateExpression: aws.String("REMOVE ccPaymentDueDay, ccGracePeriodDays, ccCycleConfidence, ccCycleCheckedAt"),
+	})
+	return err
+}
+
 func (c *Client) PutPlaidItem(ctx context.Context, item PlaidItem) error {
 	item.PK = userPK(item.UserID)
 	item.SK = itemSK(item.ItemID)
@@ -638,6 +788,51 @@ func (c *Client) PutPlaidItem(ctx context.Context, item PlaidItem) error {
 	_, err = c.ddb.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName: &c.table,
 		Item:      av,
+	})
+	return err
+}
+
+// UpdateItemReauthStatus marks a PlaidItem as needing re-authentication (with
+// the triggering Plaid error code/message), or clears the flag on successful
+// sync/reconnect. It only touches the reauth-tracking fields — AccessToken
+// and Institution are left untouched.
+func (c *Client) UpdateItemReauthStatus(ctx context.Context, userID, itemID string, needsReauth bool, errorCode, errorMessage string) error {
+	input := &dynamodb.UpdateItemInput{
+		TableName: &c.table,
+		Key: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: userPK(userID)},
+			"sk": &types.AttributeValueMemberS{Value: itemSK(itemID)},
+		},
+	}
+	if needsReauth {
+		input.UpdateExpression = aws.String("SET needsReauth = :n, lastErrorCode = :c, lastErrorMessage = :m, lastErrorAt = :t")
+		input.ExpressionAttributeValues = map[string]types.AttributeValue{
+			":n": &types.AttributeValueMemberBOOL{Value: true},
+			":c": &types.AttributeValueMemberS{Value: errorCode},
+			":m": &types.AttributeValueMemberS{Value: errorMessage},
+			":t": &types.AttributeValueMemberS{Value: time.Now().UTC().Format(time.RFC3339)},
+		}
+	} else {
+		input.UpdateExpression = aws.String("REMOVE needsReauth, lastErrorCode, lastErrorMessage, lastErrorAt")
+	}
+	_, err := c.ddb.UpdateItem(ctx, input)
+	return err
+}
+
+// UpdatePlaidItemAccessToken updates only the AccessToken on an existing
+// PlaidItem (used after a successful Link "update mode" reconnect, which may
+// or may not rotate the token) without disturbing anything else.
+func (c *Client) UpdatePlaidItemAccessToken(ctx context.Context, userID, itemID, accessToken string) error {
+	_, err := c.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: &c.table,
+		Key: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: userPK(userID)},
+			"sk": &types.AttributeValueMemberS{Value: itemSK(itemID)},
+		},
+		UpdateExpression: aws.String("SET accessToken = :a"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":a": &types.AttributeValueMemberS{Value: accessToken},
+		},
 	})
 	return err
 }
@@ -1026,87 +1221,175 @@ func (c *Client) SuggestFixedCosts(ctx context.Context, userID string) (*Suggest
 	}
 	fullWindow := monthsCovered >= 5.5
 
-	// Filter: skip already-categorized, already-budgeted, or master-budget-assigned
+	// Filter: skip credits/refunds only. Transactions that are already
+	// categorized or budgeted are intentionally kept — repeated manual
+	// assignments of the same kind are strong evidence of a recurring cost.
 	var candidates []Transaction
 	for _, t := range allTxns {
-		if t.CustomCategory != "" || t.BudgetID != "" {
-			continue
-		}
 		if t.Amount <= 0 { // credits/refunds
 			continue
 		}
 		candidates = append(candidates, t)
 	}
 
-	// Cluster: group transactions that share merchant and are within ±1 day / ±$5 of each other.
+	// Cluster: group transactions that share merchant name (or the same
+	// user-assigned budget/category) and are within ±3 days / ±$5 of each other.
+	//
+	// To avoid an O(n²) scan over all candidates we first bucket by normalized
+	// merchant name, then do the detailed day/amount check only within each
+	// bucket.  Transactions that share a user-assigned budget or category are
+	// placed into an additional synthetic bucket so they can form clusters even
+	// when merchant names differ slightly across billing cycles.
+	txnsSameAssignment := func(t, u Transaction) bool {
+		if t.BudgetID != "" && t.BudgetID == u.BudgetID {
+			return true
+		}
+		if t.CustomCategory != "" && t.CustomCategory == u.CustomCategory {
+			return true
+		}
+		return false
+	}
+
 	type cluster struct {
 		merchant string
 		txns     []Transaction
 	}
-	assigned := make([]bool, len(candidates))
+
+	// normalizedKey returns the lowercase normalized name used as the bucket key.
+	normalizedKey := func(t Transaction) string {
+		raw := t.MerchantName
+		if raw == "" {
+			raw = t.Name
+		}
+		if raw == "" {
+			return ""
+		}
+		k := strings.ToLower(normalizeTxnName(raw))
+		if k == "" {
+			k = strings.ToLower(raw)
+		}
+		return k
+	}
+
+	// Build merchant-name buckets.
+	nameBuckets := map[string][]Transaction{}
+	for _, t := range candidates {
+		k := normalizedKey(t)
+		if k == "" {
+			continue
+		}
+		nameBuckets[k] = append(nameBuckets[k], t)
+	}
+
+	// Build assignment buckets: key = "budget:<id>" or "cat:<id>".
+	assignBuckets := map[string][]Transaction{}
+	for _, t := range candidates {
+		if t.BudgetID != "" {
+			k := "budget:" + t.BudgetID
+			assignBuckets[k] = append(assignBuckets[k], t)
+		}
+		if t.CustomCategory != "" {
+			k := "cat:" + t.CustomCategory
+			assignBuckets[k] = append(assignBuckets[k], t)
+		}
+	}
+
+	// clusterBucket runs the ±3-day / ±$5 pairing logic on a pre-filtered slice.
+	// It uses a local assigned map so the same transaction isn't claimed twice
+	// within a bucket; returns the resulting clusters.
+	clusterBucket := func(txns []Transaction, sameGroup func(Transaction, Transaction) bool) []cluster {
+		localAssigned := make([]bool, len(txns))
+		var out []cluster
+		for i, t := range txns {
+			if localAssigned[i] {
+				continue
+			}
+			tDate, _ := time.Parse("2006-01-02", t.Date)
+			dayI := tDate.Day()
+			merchant := normalizedKey(t)
+			cl := cluster{merchant: merchant, txns: []Transaction{t}}
+			localAssigned[i] = true
+
+			for j := i + 1; j < len(txns); j++ {
+				if localAssigned[j] {
+					continue
+				}
+				u := txns[j]
+				if u.Date == t.Date {
+					continue // same calendar date = not recurring
+				}
+				if !sameGroup(t, u) {
+					continue
+				}
+				uDate, _ := time.Parse("2006-01-02", u.Date)
+				dayJ := uDate.Day()
+				dayDiff := dayI - dayJ
+				if dayDiff < 0 {
+					dayDiff = -dayDiff
+				}
+				if dayDiff > 15 {
+					dayDiff = 30 - dayDiff
+				}
+				if dayDiff > 3 {
+					continue
+				}
+				amtDiff := math.Abs(t.Amount) - math.Abs(u.Amount)
+				if amtDiff < 0 {
+					amtDiff = -amtDiff
+				}
+				if amtDiff > 5.0 {
+					continue
+				}
+				cl.txns = append(cl.txns, u)
+				localAssigned[j] = true
+			}
+
+			if len(cl.txns) >= 2 {
+				monthSet := map[string]bool{}
+				for _, tx := range cl.txns {
+					if len(tx.Date) >= 7 {
+						monthSet[tx.Date[:7]] = true
+					}
+				}
+				if len(monthSet) >= 2 {
+					out = append(out, cl)
+				}
+			}
+		}
+		return out
+	}
+
+	// Collect clusters from name buckets, then from assignment buckets.
+	// De-duplicate by merchant key so we don't emit the same recurring charge twice.
+	seen := map[string]bool{}
 	var clusters []cluster
 
-	for i, t := range candidates {
-		if assigned[i] {
+	for key, txns := range nameBuckets {
+		if len(txns) < 2 {
 			continue
 		}
-		rawMerchant := t.MerchantName
-		if rawMerchant == "" {
-			rawMerchant = t.Name
+		for _, cl := range clusterBucket(txns, func(t, u Transaction) bool {
+			return txnNamesMatch(t.MerchantName+t.Name, u.MerchantName+u.Name) || txnNamesMatch(normalizedKey(t), normalizedKey(u))
+		}) {
+			if !seen[key] {
+				seen[key] = true
+				clusters = append(clusters, cl)
+			}
 		}
-		if rawMerchant == "" {
+	}
+
+	for _, txns := range assignBuckets {
+		if len(txns) < 2 {
 			continue
 		}
-		// Use the normalized, lowercased name as the cluster key and as the
-		// suggested rule pattern.  Fallback to the raw name if normalization
-		// strips everything (very short names).
-		merchant := strings.ToLower(normalizeTxnName(rawMerchant))
-		if merchant == "" {
-			merchant = strings.ToLower(rawMerchant)
-		}
-		date, _ := time.Parse("2006-01-02", t.Date)
-		dayI := date.Day()
-
-		cl := cluster{merchant: merchant, txns: []Transaction{t}}
-		assigned[i] = true
-
-		for j := i + 1; j < len(candidates); j++ {
-			if assigned[j] {
+		for _, cl := range clusterBucket(txns, txnsSameAssignment) {
+			if cl.merchant == "" {
 				continue
 			}
-			u := candidates[j]
-			uMerchant := u.MerchantName
-			if uMerchant == "" {
-				uMerchant = u.Name
+			if !seen[cl.merchant] {
+				seen[cl.merchant] = true
+				clusters = append(clusters, cl)
 			}
-			if !txnNamesMatch(rawMerchant, uMerchant) {
-				continue
-			}
-			uDate, _ := time.Parse("2006-01-02", u.Date)
-			dayJ := uDate.Day()
-			dayDiff := dayI - dayJ
-			if dayDiff < 0 {
-				dayDiff = -dayDiff
-			}
-			if dayDiff > 15 {
-				dayDiff = 30 - dayDiff
-			}
-			if dayDiff > 3 {
-				continue
-			}
-			amtDiff := math.Abs(t.Amount) - math.Abs(u.Amount)
-			if amtDiff < 0 {
-				amtDiff = -amtDiff
-			}
-			if amtDiff > 5.0 {
-				continue
-			}
-			cl.txns = append(cl.txns, u)
-			assigned[j] = true
-		}
-
-		if len(cl.txns) >= 2 {
-			clusters = append(clusters, cl)
 		}
 	}
 

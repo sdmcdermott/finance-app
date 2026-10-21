@@ -30,10 +30,11 @@ type dualEvent struct {
 }
 
 type syncResult struct {
-	Added    int `json:"added"`
-	Modified int `json:"modified"`
-	Removed  int `json:"removed"`
-	Errors   int `json:"errors"`
+	Added          int      `json:"added"`
+	Modified       int      `json:"modified"`
+	Removed        int      `json:"removed"`
+	Errors         int      `json:"errors"`
+	ReauthRequired []string `json:"reauthRequired,omitempty"` // institution names needing reconnect
 }
 
 func handler(ctx context.Context, raw json.RawMessage) (interface{}, error) {
@@ -100,13 +101,16 @@ func runSync(ctx context.Context) (*syncResult, error) {
 		return nil, fmt.Errorf("failed to get plaid items: %w", err)
 	}
 	tokenByItemID := make(map[string]string, len(plaidItems))
+	itemByID := make(map[string]dbpkg.PlaidItem, len(plaidItems))
 	for _, pi := range plaidItems {
 		tokenByItemID[pi.ItemID] = pi.AccessToken
+		itemByID[pi.ItemID] = pi
 	}
 
 	// Group accounts by Plaid Item (one Item can have multiple accounts)
 	type itemGroup struct {
 		accessToken string
+		institution string
 		accounts    []dbpkg.Account
 	}
 	itemMap := make(map[string]*itemGroup)
@@ -117,7 +121,7 @@ func runSync(ctx context.Context) (*syncResult, error) {
 		}
 		if _, ok := itemMap[acct.ItemID]; !ok {
 			token := tokenByItemID[acct.ItemID]
-			itemMap[acct.ItemID] = &itemGroup{accessToken: token}
+			itemMap[acct.ItemID] = &itemGroup{accessToken: token, institution: acct.Institution}
 		}
 		itemMap[acct.ItemID].accounts = append(itemMap[acct.ItemID].accounts, acct)
 	}
@@ -136,6 +140,7 @@ func runSync(ctx context.Context) (*syncResult, error) {
 		var added, modified []plaid.Transaction
 		var removed []plaid.RemovedTransaction
 		hasMore := true
+		itemFailed := false
 
 		for hasMore {
 			syncReq := plaid.NewTransactionsSyncRequest(group.accessToken)
@@ -149,6 +154,15 @@ func runSync(ctx context.Context) (*syncResult, error) {
 			if err != nil {
 				log.Printf("error syncing item %s: %v", itemID, plaidclient.HandlePlaidError(ctx, err))
 				result.Errors++
+				itemFailed = true
+
+				if code, msg, needsReauth := plaidclient.NeedsReauth(err); needsReauth {
+					log.Printf("item %s (%s) needs re-authentication: %s — %s", itemID, group.institution, code, msg)
+					if updErr := dbClient.UpdateItemReauthStatus(ctx, userID, itemID, true, code, msg); updErr != nil {
+						log.Printf("failed to persist reauth status for item %s: %v", itemID, updErr)
+					}
+					result.ReauthRequired = append(result.ReauthRequired, group.institution)
+				}
 				break
 			}
 
@@ -157,6 +171,37 @@ func runSync(ctx context.Context) (*syncResult, error) {
 			removed = append(removed, resp.GetRemoved()...)
 			cursor = resp.GetNextCursor()
 			hasMore = resp.GetHasMore()
+		}
+
+		// A successful sync loop (however brief) proves the item's connection
+		// is healthy again — clear any previously-recorded reauth flag.
+		if !itemFailed {
+			if pi, ok := itemByID[itemID]; ok && pi.NeedsReauth {
+				if updErr := dbClient.UpdateItemReauthStatus(ctx, userID, itemID, false, "", ""); updErr != nil {
+					log.Printf("failed to clear reauth status for item %s: %v", itemID, updErr)
+				} else {
+					log.Printf("item %s (%s) reconnected successfully — cleared reauth flag", itemID, group.institution)
+				}
+			}
+
+			// Refresh cached account balances — used by the cash flow forecast.
+			// This calls the free /accounts/get endpoint (cached balance,
+			// updated ~daily by Plaid), NOT the billed real-time
+			// /accounts/balance/get endpoint, since the forecast only needs a
+			// reasonably-fresh starting point.
+			if acctsResp, _, err := plaidAPI.PlaidApi.
+				AccountsGet(ctx).
+				AccountsGetRequest(*plaid.NewAccountsGetRequest(group.accessToken)).
+				Execute(); err != nil {
+				log.Printf("error refreshing balances for item %s: %v", itemID, plaidclient.HandlePlaidError(ctx, err))
+			} else {
+				for _, pa := range acctsResp.GetAccounts() {
+					bal := pa.GetBalances()
+					if err := dbClient.UpdateAccountBalance(ctx, userID, pa.GetAccountId(), bal.GetCurrent(), bal.GetAvailable()); err != nil {
+						log.Printf("error saving balance for account %s: %v", pa.GetAccountId(), err)
+					}
+				}
+			}
 		}
 
 		result.Added += len(added)

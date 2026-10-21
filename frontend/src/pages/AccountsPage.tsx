@@ -1,8 +1,9 @@
 import React, { useState } from 'react';
-import { Account, updateAccount } from '../api/client';
+import { Account, updateAccount, syncTransactions } from '../api/client';
 import { usePlaidConnect } from '../hooks/usePlaidConnect';
 import { useData } from '../auth/DataContext';
-import { fmtDate } from '../utils/dates';
+import { fmtDate, fmtCurrency } from '../utils/dates';
+import { CashFlowConfigModal } from '../components/CashFlowConfigModal';
 
 // ── Toggle (reuse pattern from MasterBudgetPage) ─────────────────────────────
 const Toggle: React.FC<{ on: boolean; onChange: (v: boolean) => void; disabled?: boolean }> = ({ on, onChange, disabled }) => (
@@ -51,7 +52,7 @@ function groupByInstitution(accounts: Account[]): InstitutionGroup[] {
 }
 
 const AccountsPage: React.FC = () => {
-  const { accounts, setAccounts, loading } = useData();
+  const { accounts, setAccounts, loading, refreshAll } = useData();
   const [error, setError] = useState<string | null>(null);
   const [toggling, setToggling] = useState<Set<string>>(new Set());
   // Track which institution groups are expanded (default: all expanded)
@@ -60,21 +61,46 @@ const AccountsPage: React.FC = () => {
   const [editingNickId, setEditingNickId] = useState<string | null>(null);
   const [nickDraft, setNickDraft] = useState('');
   const nickCancelRef = React.useRef(false);
+  // Which institution group (by itemId) is currently going through Link's
+  // "update mode" reconnect flow, if any.
+  const [reconnectingKey, setReconnectingKey] = useState<string | null>(null);
+  // Account currently targeted by the "configure cash flow" modal, if open.
+  const [configAcct, setConfigAcct] = useState<Account | null>(null);
 
-  const { fetchLinkToken, open, ready, loading: linkLoading } = usePlaidConnect({
-    onSuccess: (newAccounts) => {
-      setAccounts(prev => [...prev, ...newAccounts]);
+  const { fetchLinkToken, open, ready, loading: linkLoading, error: linkError } = usePlaidConnect({
+    onSuccess: async () => {
+      // Both "connect new" and "reconnect" flows are resolved by re-fetching
+      // accounts from the server: for a reconnect, only the backend knows the
+      // reauth flag was cleared; for a new connection, this avoids any risk
+      // of duplicating entries already present in local state.
+      try {
+        await refreshAll();
+      } finally {
+        setReconnectingKey(null);
+      }
     },
   });
 
   const handleConnectClick = () => {
+    setReconnectingKey(null);
     if (ready) open();
     else fetchLinkToken();
+  };
+
+  const handleReconnectClick = (group: InstitutionGroup) => {
+    setReconnectingKey(group.key);
+    fetchLinkToken(group.key);
   };
 
   React.useEffect(() => {
     if (ready) open();
   }, [ready, open]);
+
+  // If Link exits with an error, clear the "Reconnecting…" state on whichever
+  // group was in flight so its button resets and the error banner can show.
+  React.useEffect(() => {
+    if (linkError) setReconnectingKey(null);
+  }, [linkError]);
 
   const handleToggleEnabled = async (acct: Account, enabled: boolean) => {
     setToggling(prev => new Set(prev).add(acct.accountId));
@@ -87,6 +113,36 @@ const AccountsPage: React.FC = () => {
       setError(e.message);
     } finally {
       setToggling(prev => { const s = new Set(prev); s.delete(acct.accountId); return s; });
+    }
+  };
+
+  const [settingCashAccount, setSettingCashAccount] = useState<string | null>(null);
+  const [syncingBalance, setSyncingBalance] = useState(false);
+  const handleSetCashAccount = async (acct: Account) => {
+    setSettingCashAccount(acct.accountId);
+    try {
+      await updateAccount(acct.accountId, { isCashAccount: true });
+      // Only one account can be the cash account — clear the flag locally
+      // from any other account, matching what the backend enforces.
+      setAccounts(prev => prev.map(a => ({ ...a, isCashAccount: a.accountId === acct.accountId })));
+    } catch (e: any) {
+      setError(e.message);
+      setSettingCashAccount(null);
+      return;
+    }
+    setSettingCashAccount(null);
+
+    // Kick off a background sync so the balance shown for the new cash
+    // account is fresh right away, rather than waiting for the daily cron.
+    setSyncingBalance(true);
+    try {
+      await syncTransactions();
+      await refreshAll();
+    } catch (e: any) {
+      // Non-fatal — the daily cron will pick up the balance eventually.
+      setError(`Cash account set, but balance sync failed: ${e.message}`);
+    } finally {
+      setSyncingBalance(false);
     }
   };
 
@@ -133,6 +189,7 @@ const AccountsPage: React.FC = () => {
       </div>
 
       {error && <div style={s.error}>{error}</div>}
+      {linkError && <div style={s.error}>{linkError}</div>}
 
       {loading ? (
         <p style={s.muted}>Loading accounts…</p>
@@ -147,8 +204,9 @@ const AccountsPage: React.FC = () => {
             const isCollapsed = collapsed.has(group.key);
             const allEnabled = group.accounts.every(isEnabled);
             const anyEnabled = group.accounts.some(isEnabled);
-            // institution-level enabled state: all=on, none=off, mixed=indeterminate (show as on)
-            const institutionEnabled = anyEnabled;
+            const needsReauth = group.accounts.some(a => a.needsReauth && isEnabled(a));
+            const reauthMessage = group.accounts.find(a => a.needsReauth && isEnabled(a))?.lastErrorMessage;
+            const isReconnecting = reconnectingKey === group.key && linkLoading;
 
             return (
               <div key={group.key} style={s.institutionBlock}>
@@ -162,7 +220,28 @@ const AccountsPage: React.FC = () => {
                   {!allEnabled && anyEnabled && (
                     <span style={s.mixedBadge}>partial</span>
                   )}
+                  {needsReauth && (
+                    <>
+                      <span style={s.reauthBadge} title={reauthMessage}>⚠ needs reconnect</span>
+                      <button
+                        style={s.reconnectBtn}
+                        onClick={() => handleReconnectClick(group)}
+                        disabled={linkLoading}
+                      >
+                        {isReconnecting ? 'Reconnecting…' : 'Reconnect'}
+                      </button>
+                    </>
+                  )}
                 </div>
+
+                {needsReauth && (
+                  <div style={s.reauthBanner}>
+                    This connection has stopped syncing and needs to be re-authenticated with your
+                    bank — this commonly happens after a password change, MFA reset, or periodic
+                    security re-verification. Click <strong>Reconnect</strong> above to fix it; your
+                    account settings and transaction history will be preserved.
+                  </div>
+                )}
 
                 {/* ── Account rows (leaves) ── */}
                 {!isCollapsed && (
@@ -176,6 +255,8 @@ const AccountsPage: React.FC = () => {
                           <th style={s.th}>Subtype</th>
                           <th style={s.th}>Last Synced</th>
                           <th style={{ ...s.th, textAlign: 'center' }}>Sync enabled</th>
+                          <th style={{ ...s.th, textAlign: 'center' }} title="The account used as the starting balance for Cash Flow forecasting">Cash account</th>
+                          <th style={s.th}></th>
                         </tr>
                       </thead>
                       <tbody>
@@ -213,6 +294,41 @@ const AccountsPage: React.FC = () => {
                                 onChange={v => handleToggleEnabled(acct, v)}
                                 disabled={toggling.has(acct.accountId)}
                               />
+                            </td>
+                            <td style={{ ...s.td, textAlign: 'center' }}>
+                              <input
+                                type="radio"
+                                name="cashAccount"
+                                checked={!!acct.isCashAccount}
+                                onChange={() => handleSetCashAccount(acct)}
+                                disabled={settingCashAccount === acct.accountId}
+                                title="Use this account's balance for Cash Flow forecasting"
+                              />
+                              {acct.isCashAccount && (
+                                <div style={s.balanceInfo}>
+                                  {syncingBalance ? (
+                                    <span style={s.syncingText}>Syncing…</span>
+                                  ) : acct.balanceUpdatedAt ? (
+                                    <>
+                                      <div>{fmtCurrency(acct.currentBalance ?? 0)}</div>
+                                      <div style={s.balanceAsOf}>as of {fmtDate(acct.balanceUpdatedAt)}</div>
+                                    </>
+                                  ) : (
+                                    <span style={s.balanceAsOf}>no balance yet</span>
+                                  )}
+                                </div>
+                              )}
+                            </td>
+                            <td style={{ ...s.td, textAlign: 'right' }}>
+                              {acct.type === 'credit' && (
+                                <button
+                                  style={s.gearBtn}
+                                  onClick={() => setConfigAcct(acct)}
+                                  title="Configure cash flow"
+                                >
+                                  ⚙
+                                </button>
+                              )}
                             </td>
                           </tr>
                         ))}
@@ -263,6 +379,41 @@ const AccountsPage: React.FC = () => {
                               disabled={toggling.has(acct.accountId)}
                             />
                           </div>
+                          <div style={{ ...s.cardRow, alignItems: 'center' }}>
+                            <span style={s.cardLabel}>Cash account</span>
+                            <input
+                              type="radio"
+                              name="cashAccountMobile"
+                              checked={!!acct.isCashAccount}
+                              onChange={() => handleSetCashAccount(acct)}
+                              disabled={settingCashAccount === acct.accountId}
+                              title="Use this account's balance for Cash Flow forecasting"
+                            />
+                          </div>
+                          {acct.isCashAccount && (
+                            <div style={{ ...s.cardRow, justifyContent: 'flex-end' }}>
+                              {syncingBalance ? (
+                                <span style={s.syncingText}>Syncing balance…</span>
+                              ) : acct.balanceUpdatedAt ? (
+                                <span style={s.balanceAsOf}>
+                                  {fmtCurrency(acct.currentBalance ?? 0)} as of {fmtDate(acct.balanceUpdatedAt)}
+                                </span>
+                              ) : (
+                                <span style={s.balanceAsOf}>no balance yet</span>
+                              )}
+                            </div>
+                          )}
+                          <div style={{ ...s.cardRow, justifyContent: 'flex-end' }}>
+                            {acct.type === 'credit' && (
+                              <button
+                                style={s.gearBtn}
+                                onClick={() => setConfigAcct(acct)}
+                                title="Configure cash flow"
+                              >
+                                ⚙ Configure cash flow
+                              </button>
+                            )}
+                          </div>
                         </div>
                       ))}
                     </div>
@@ -272,6 +423,18 @@ const AccountsPage: React.FC = () => {
             );
           })}
         </div>
+      )}
+
+      {configAcct && (
+        <CashFlowConfigModal
+          account={configAcct}
+          onClose={() => setConfigAcct(null)}
+          onSaved={patch => {
+            setAccounts(prev => prev.map(a =>
+              a.accountId === configAcct.accountId ? { ...a, ...patch } : a
+            ));
+          }}
+        />
       )}
     </div>
   );
@@ -287,7 +450,14 @@ const s: Record<string, React.CSSProperties> = {
   empty:           { color: '#6b7280', lineHeight: 1.8 },
   tree:            { display: 'flex', flexDirection: 'column', gap: '0.75rem' },
   institutionBlock:{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: '8px', overflow: 'hidden' },
-  institutionRow:  { display: 'flex', alignItems: 'center', gap: '0.6rem', padding: '0.75rem 1rem', background: '#f7fafc', borderBottom: '1px solid #e2e8f0', cursor: 'default' },
+  institutionRow:  { display: 'flex', alignItems: 'center', gap: '0.6rem', padding: '0.75rem 1rem', background: '#f7fafc', borderBottom: '1px solid #e2e8f0', cursor: 'default', flexWrap: 'wrap' },
+  reauthBadge:     { fontSize: '0.7rem', background: '#fee2e2', color: '#b91c1c', borderRadius: '999px', padding: '1px 8px', fontWeight: 600, whiteSpace: 'nowrap' },
+  reconnectBtn:    { background: '#b91c1c', color: '#fff', border: 'none', borderRadius: '6px', padding: '0.3rem 0.7rem', cursor: 'pointer', fontSize: '0.8rem', fontWeight: 600, whiteSpace: 'nowrap' },
+  reauthBanner:    { fontSize: '0.82rem', color: '#7f1d1d', background: '#fef2f2', borderBottom: '1px solid #fecaca', padding: '0.6rem 1rem', lineHeight: 1.5 },
+  gearBtn:         { background: 'none', border: 'none', color: '#6b7280', cursor: 'pointer', fontSize: '0.95rem', padding: '2px 6px', whiteSpace: 'nowrap' },
+  balanceInfo:     { marginTop: 4, fontSize: '0.75rem', color: '#374151', lineHeight: 1.3 },
+  syncingText:     { fontSize: '0.72rem', color: '#0d7a6b', fontStyle: 'italic' },
+  balanceAsOf:     { fontSize: '0.68rem', color: '#9ca3af' },
   chevronBtn:      { background: 'none', border: 'none', cursor: 'pointer', padding: '0 0.15rem', lineHeight: 1, color: '#4a5568' },
   chevron:         { display: 'inline-block', fontSize: '0.7rem', transition: 'transform 0.15s', color: '#4a5568' },
   institutionName: { fontWeight: 700, fontSize: '1rem', color: '#2d3748', flex: 1 },

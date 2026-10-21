@@ -196,10 +196,12 @@ func computeTotals(
 					if sp.BudgetID != budget.BudgetID {
 						continue
 					}
-					if sp.Amount > 0 {
-						debits += sp.Amount
+					// Split amounts are always stored positive; use the parent
+					// transaction's sign to determine debit vs. credit.
+					if t.Amount < 0 {
+						credits += sp.Amount
 					} else {
-						credits += -sp.Amount
+						debits += sp.Amount
 					}
 				}
 			} else {

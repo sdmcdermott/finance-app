@@ -1,6 +1,5 @@
 import React, { useState, useEffect, useRef, forwardRef } from 'react';
 import { ItemizeIcon } from './ItemizeModal';
-import { DeductionItem } from '../api/client';
 
 /**
  * Formats a number as $d,ddd.cc.

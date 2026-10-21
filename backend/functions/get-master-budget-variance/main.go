@@ -83,9 +83,6 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response,
 
 	var allTxns []dbpkg.Transaction
 	for _, acct := range accounts {
-		if !dbpkg.AccountEnabled(acct) {
-			continue
-		}
 		txns, err := dbClient.GetTransactions(ctx, acct.AccountID, startDate, endDate)
 		if err != nil {
 			continue

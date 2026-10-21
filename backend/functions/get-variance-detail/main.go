@@ -2,9 +2,16 @@ package main
 
 // get-variance-detail returns the breakdown for a synthetic variance transaction:
 // expected amount, matched real transactions, and the resulting variance.
-// Supports two variance types:
-//   - Fixed cost:  txnId = "variance-{fcID}-{YYYY-MM}"
-//   - Income:      txnId = "variance-income-{originalTxnID}"
+// Supports three variance ID schemes:
+//   - Monthly-family fixed cost:      "variance-{fcID}-{YYYY-MM}"
+//   - Cyclical fixed cost (matched):  "variance-{fcID}-{realPlaidTransactionID}"
+//   - Cyclical fixed cost (missing):  "variance-{fcID}-{windowStartYYYY-MM}"
+//   - Income:                         "variance-income-{originalTxnID}"
+//
+// fcID is always a standard 36-character UUID (crypto.randomUUID() on the
+// frontend), so it can be reliably sliced off the front regardless of which
+// suffix scheme follows — unlike splitting on "-", which is ambiguous since
+// UUIDs themselves contain hyphens.
 
 import (
 	"context"
@@ -12,6 +19,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -68,55 +76,26 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response,
 // ── Fixed cost variance ───────────────────────────────────────────────────────
 
 func handleFixedCostVariance(ctx context.Context, dbClient *dbpkg.Client, userID, budgetID, txnID string) (response, error) {
-	// txnID format: "variance-{fcID}-{YYYY-MM}"
-	// YYYY-MM is always exactly 7 chars at the end, preceded by a hyphen.
 	withoutPrefix := strings.TrimPrefix(txnID, "variance-")
-	if len(withoutPrefix) < 9 { // minimum: "x-YYYY-MM"
+	const uuidLen = 36 // e.g. "d213e48e-2b6b-4d52-a042-000ed167464b"
+	if len(withoutPrefix) < uuidLen+2 {
 		return errorResponse(http.StatusBadRequest, fmt.Sprintf("cannot parse fixed cost txnId: %s", txnID)), nil
 	}
-	ym := withoutPrefix[len(withoutPrefix)-7:]
-	fcID := withoutPrefix[:len(withoutPrefix)-8] // strip trailing "-YYYY-MM"
-	if len(ym) != 7 || ym[4] != '-' {
-		return errorResponse(http.StatusBadRequest, fmt.Sprintf("cannot parse YYYY-MM from txnId: %s", txnID)), nil
-	}
-	monthStart := ym + "-01"
-	// Last day: advance to first of next month then subtract one day.
-	t, err := time.Parse("2006-01-02", monthStart)
-	if err != nil {
-		return errorResponse(http.StatusBadRequest, "invalid month in txnId"), nil
-	}
-	monthEnd := t.AddDate(0, 1, -1).Format("2006-01-02")
+	fcID := withoutPrefix[:uuidLen]
+	suffix := withoutPrefix[uuidLen+1:] // +1 skips the separating hyphen
 
-	// Load master budget to find the fixed cost config.
+	// Load master budget to find the fixed cost config (search all versions —
+	// we don't yet know which month/version is relevant until we've parsed
+	// the suffix below).
 	mbs, err := dbClient.GetMasterBudgets(ctx, userID)
 	if err != nil {
 		return errorResponse(http.StatusInternalServerError, err.Error()), nil
 	}
 	var fc *dbpkg.MBFixedCost
-	for i := len(mbs) - 1; i >= 0; i-- {
-		if mbs[i].EffectiveDate <= monthStart {
-			for j := range mbs[i].FixedCosts {
-				if mbs[i].FixedCosts[j].ID == fcID {
-					fc = &mbs[i].FixedCosts[j]
-					break
-				}
-			}
-			if fc != nil {
-				break
-			}
-		}
-	}
-	// Fallback: search all versions.
-	if fc == nil {
-		for i := range mbs {
-			for j := range mbs[i].FixedCosts {
-				if mbs[i].FixedCosts[j].ID == fcID {
-					fc = &mbs[i].FixedCosts[j]
-					break
-				}
-			}
-			if fc != nil {
-				break
+	for i := range mbs {
+		for j := range mbs[i].FixedCosts {
+			if mbs[i].FixedCosts[j].ID == fcID {
+				fc = &mbs[i].FixedCosts[j]
 			}
 		}
 	}
@@ -124,7 +103,6 @@ func handleFixedCostVariance(ctx context.Context, dbClient *dbpkg.Client, userID
 		return errorResponse(http.StatusNotFound, fmt.Sprintf("fixed cost %s not found in any master budget version", fcID)), nil
 	}
 
-	// Load rules for matchesFixedCost.
 	rules, err := dbClient.GetRules(ctx, userID)
 	if err != nil {
 		return errorResponse(http.StatusInternalServerError, err.Error()), nil
@@ -134,53 +112,170 @@ func handleFixedCostVariance(ctx context.Context, dbClient *dbpkg.Client, userID
 		ruleByID[r.RuleID] = r
 	}
 
-	// Load master budget transactions for the month and find matches.
 	accounts, err := dbClient.GetAccounts(ctx, userID)
 	if err != nil {
 		return errorResponse(http.StatusInternalServerError, err.Error()), nil
 	}
 
-	var matched []matchedTxn
-	var actualSum float64
+	months := cycleMonths(fc.Frequency)
+	isYearMonth := len(suffix) == 7 && suffix[4] == '-'
+
+	if months == 1 {
+		// ── Monthly-family cost: suffix is always "{YYYY-MM}" ────────────────
+		if !isYearMonth {
+			return errorResponse(http.StatusBadRequest, fmt.Sprintf("cannot parse YYYY-MM from txnId: %s", txnID)), nil
+		}
+		monthStart, monthEnd, err := monthBounds(suffix)
+		if err != nil {
+			return errorResponse(http.StatusBadRequest, "invalid month in txnId"), nil
+		}
+
+		var matched []matchedTxn
+		var actualSum float64
+		for _, acct := range accounts {
+			txns, err := dbClient.GetTransactions(ctx, acct.AccountID, monthStart, monthEnd)
+			if err != nil {
+				continue
+			}
+			for _, txn := range txns {
+				if txn.Pending || txn.Synthetic || txn.BudgetID != dbpkg.MasterBudgetID {
+					continue
+				}
+				if matchesFixedCost(txn, *fc, ruleByID) {
+					amt := math.Abs(txn.Amount)
+					actualSum += amt
+					matched = append(matched, matchedTxn{Date: txn.Date, Name: txn.Name, Amount: amt})
+				}
+			}
+		}
+
+		expected := monthlyAmount(fc.Amount, fc.Frequency)
+		variance := expected - actualSum // positive = under budget (credit)
+		detail := varianceDetailResponse{
+			Label:          fc.Name + " Variance",
+			Expected:       expected,
+			Matched:        matched,
+			VarianceAmount: math.Abs(variance),
+			IsCredit:       variance >= 0,
+		}
+		if detail.Matched == nil {
+			detail.Matched = []matchedTxn{}
+		}
+		body, _ := json.Marshal(detail)
+		return response{StatusCode: http.StatusOK, Body: string(body), Headers: jsonHeaders()}, nil
+	}
+
+	// ── Cyclical cost (quarterly/semiannually/annually) ───────────────────────
+	if isYearMonth {
+		// "Missing" synthetic: the whole cycle window elapsed with zero
+		// matches, so the full period amount was credited. Re-scan the
+		// window for completeness, but it should come back empty.
+		winStart, winEnd := cycleWindow(suffix, months)
+		var matched []matchedTxn
+		for _, acct := range accounts {
+			txns, err := dbClient.GetTransactions(ctx, acct.AccountID, winStart, winEnd)
+			if err != nil {
+				continue
+			}
+			for _, txn := range txns {
+				if txn.Pending || txn.Synthetic || txn.BudgetID != dbpkg.MasterBudgetID {
+					continue
+				}
+				if matchesFixedCost(txn, *fc, ruleByID) {
+					matched = append(matched, matchedTxn{Date: txn.Date, Name: txn.Name, Amount: math.Abs(txn.Amount)})
+				}
+			}
+		}
+		detail := varianceDetailResponse{
+			Label:          fc.Name + " Variance",
+			Expected:       fc.Amount,
+			Matched:        matched,
+			VarianceAmount: fc.Amount,
+			IsCredit:       true,
+		}
+		if detail.Matched == nil {
+			detail.Matched = []matchedTxn{}
+		}
+		body, _ := json.Marshal(detail)
+		return response{StatusCode: http.StatusOK, Body: string(body), Headers: jsonHeaders()}, nil
+	}
+
+	// "Matched" synthetic: suffix is the real Plaid transaction ID that this
+	// synthetic was generated from. Find it, determine which cycle window it
+	// falls in, and re-derive whether it was the first (full expected) or a
+	// later (zero expected) occurrence within that window — mirrors the
+	// exact logic in apply-rules' processCyclicalFixedCostWindow.
+	realTxnID := suffix
+	var found *dbpkg.Transaction
 	for _, acct := range accounts {
-		txns, err := dbClient.GetTransactions(ctx, acct.AccountID, monthStart, monthEnd)
+		// We don't know the date, so fetch a broad range (last 5 years).
+		start := time.Now().AddDate(-5, 0, 0).Format("2006-01-02")
+		end := time.Now().Format("2006-01-02")
+		txns, err := dbClient.GetTransactions(ctx, acct.AccountID, start, end)
+		if err != nil {
+			continue
+		}
+		for i := range txns {
+			if txns[i].TransactionID == realTxnID {
+				found = &txns[i]
+				break
+			}
+		}
+		if found != nil {
+			break
+		}
+	}
+	if found == nil {
+		return errorResponse(http.StatusNotFound, "matched transaction not found"), nil
+	}
+
+	winStart, winEnd := cycleWindow(found.Date[:7], months)
+	var windowMatches []dbpkg.Transaction
+	for _, acct := range accounts {
+		txns, err := dbClient.GetTransactions(ctx, acct.AccountID, winStart, winEnd)
 		if err != nil {
 			continue
 		}
 		for _, txn := range txns {
-			if txn.Pending || txn.Synthetic {
-				continue
-			}
-			if txn.BudgetID != dbpkg.MasterBudgetID {
+			if txn.Pending || txn.Synthetic || txn.BudgetID != dbpkg.MasterBudgetID {
 				continue
 			}
 			if matchesFixedCost(txn, *fc, ruleByID) {
-				amt := math.Abs(txn.Amount)
-				actualSum += amt
-				matched = append(matched, matchedTxn{
-					Date:   txn.Date,
-					Name:   txn.Name,
-					Amount: amt,
-				})
+				windowMatches = append(windowMatches, txn)
 			}
 		}
 	}
+	sort.Slice(windowMatches, func(i, j int) bool { return windowMatches[i].Date < windowMatches[j].Date })
 
-	expected := monthlyAmount(fc.Amount, fc.Frequency)
-	variance := expected - actualSum // positive = under budget (credit)
+	isFirst := len(windowMatches) > 0 && windowMatches[0].TransactionID == realTxnID
+	expected := 0.0
+	if isFirst {
+		expected = fc.Amount
+	}
+	actual := math.Abs(found.Amount)
+	variance := expected - actual
+
 	detail := varianceDetailResponse{
 		Label:          fc.Name + " Variance",
 		Expected:       expected,
-		Matched:        matched,
+		Matched:        []matchedTxn{{Date: found.Date, Name: found.Name, Amount: actual}},
 		VarianceAmount: math.Abs(variance),
 		IsCredit:       variance >= 0,
 	}
-	if detail.Matched == nil {
-		detail.Matched = []matchedTxn{}
-	}
-
 	body, _ := json.Marshal(detail)
 	return response{StatusCode: http.StatusOK, Body: string(body), Headers: jsonHeaders()}, nil
+}
+
+// monthBounds returns the [start, end] YYYY-MM-DD bounds of the calendar
+// month "YYYY-MM".
+func monthBounds(ym string) (string, string, error) {
+	monthStart := ym + "-01"
+	t, err := time.Parse("2006-01-02", monthStart)
+	if err != nil {
+		return "", "", err
+	}
+	monthEnd := t.AddDate(0, 1, -1).Format("2006-01-02")
+	return monthStart, monthEnd, nil
 }
 
 // ── Income variance ───────────────────────────────────────────────────────────
@@ -366,6 +461,35 @@ func monthlyAmount(amount float64, frequency string) float64 {
 	default:
 		return amount
 	}
+}
+
+// cycleMonths returns the number of months in one full billing cycle for the
+// given frequency. Frequencies of one month or less return 1.
+func cycleMonths(frequency string) int {
+	switch frequency {
+	case "quarterly":
+		return 3
+	case "semiannually":
+		return 6
+	case "annually":
+		return 12
+	default:
+		return 1
+	}
+}
+
+// cycleWindow returns the calendar-aligned [start, end] date bounds (both
+// inclusive, YYYY-MM-DD) of the `months`-long cycle window containing month
+// `ym` (YYYY-MM).
+func cycleWindow(ym string, months int) (string, string) {
+	var y, m int
+	fmt.Sscanf(ym, "%d-%d", &y, &m)
+	windowIndex := (m - 1) / months
+	startMonth := windowIndex*months + 1
+	endMonth := startMonth + months - 1
+	start := time.Date(y, time.Month(startMonth), 1, 0, 0, 0, 0, time.UTC)
+	end := time.Date(y, time.Month(endMonth+1), 0, 0, 0, 0, 0, time.UTC)
+	return start.Format("2006-01-02"), end.Format("2006-01-02")
 }
 
 func main() { lambda.Start(handler) }

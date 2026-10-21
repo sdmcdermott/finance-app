@@ -52,3 +52,44 @@ func HandlePlaidError(ctx context.Context, err error) string {
 	}
 	return err.Error()
 }
+
+// ReauthRequiredCodes are Plaid item error codes that indicate the stored
+// connection to the institution is no longer valid and the user must
+// re-authenticate via Plaid Link's "update mode". This is a normal, expected
+// condition — banks periodically invalidate sessions (password changes, MFA
+// resets, periodic security re-verification, etc.) — not a bug in Plaid or
+// this application.
+//
+// ITEM_NOT_FOUND is included defensively: it means Plaid has no record of the
+// Item at all (e.g. it was removed server-side). Update mode won't succeed in
+// that case, but surfacing the same "reconnect" affordance to the user is the
+// correct recovery path — Link will guide them through a fresh connection.
+var ReauthRequiredCodes = map[string]bool{
+	"ITEM_LOGIN_REQUIRED": true,
+	"ITEM_NOT_FOUND":      true,
+	"PENDING_EXPIRATION":  true,
+	"PENDING_DISCONNECT":  true,
+}
+
+// ParsePlaidError attempts to extract the structured Plaid error code and
+// message from err. ok is false if err is not a recognized Plaid API error.
+func ParsePlaidError(err error) (code string, message string, ok bool) {
+	if err == nil {
+		return "", "", false
+	}
+	plaidErr, isPlaidErr := plaid.ToPlaidError(err)
+	if isPlaidErr != nil {
+		return "", "", false
+	}
+	return plaidErr.GetErrorCode(), plaidErr.GetErrorMessage(), true
+}
+
+// NeedsReauth returns true if err represents a Plaid item error that requires
+// the user to re-authenticate via Link's update mode.
+func NeedsReauth(err error) (code string, message string, needsReauth bool) {
+	code, message, ok := ParsePlaidError(err)
+	if !ok {
+		return "", "", false
+	}
+	return code, message, ReauthRequiredCodes[code]
+}

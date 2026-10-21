@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import {
-  SuggestFixedCost, SuggestFixedCostsResult, MBFixedCost,
+  SuggestFixedCost, SuggestFixedCostsResult, MBFixedCost, Rule,
   suggestFixedCosts, putRule, applyRules,
 } from '../api/client';
 import { fmtCurrency } from '../utils/dates';
@@ -19,14 +19,18 @@ const FREQ_LABELS: Record<string, string> = {
 interface Props {
   onConfirm: (added: MBFixedCost[]) => void;
   onClose: () => void;
+  existingFixedCosts: MBFixedCost[];
+  existingRules: Rule[];
 }
 
-export const SuggestFixedCostsModal: React.FC<Props> = ({ onConfirm, onClose }) => {
-  const [loading, setLoading]     = useState(true);
-  const [error, setError]         = useState('');
-  const [result, setResult]       = useState<SuggestFixedCostsResult | null>(null);
-  const [selected, setSelected]   = useState<Set<number>>(new Set());
-  const [saving, setSaving]       = useState(false);
+export const SuggestFixedCostsModal: React.FC<Props> = ({
+  onConfirm, onClose, existingFixedCosts, existingRules,
+}) => {
+  const [loading, setLoading]   = useState(true);
+  const [error, setError]       = useState('');
+  const [result, setResult]     = useState<SuggestFixedCostsResult | null>(null);
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [saving, setSaving]     = useState(false);
 
   const suggestions: SuggestFixedCost[] = result?.suggestions ?? [];
 
@@ -51,6 +55,22 @@ export const SuggestFixedCostsModal: React.FC<Props> = ({ onConfirm, onClose }) 
     }
   };
 
+  // Returns the name of the first existing fixed cost whose rule pattern
+  // overlaps with this suggestion's merchant string, or null if none.
+  const matchingFixedCostName = (sg: SuggestFixedCost): string | null => {
+    for (const fc of existingFixedCosts) {
+      if (!fc.ruleId) continue;
+      const rule = existingRules.find(r => r.ruleId === fc.ruleId);
+      if (!rule) continue;
+      const pattern  = rule.pattern.toLowerCase();
+      const merchant = sg.merchant.toLowerCase();
+      if (merchant.includes(pattern) || pattern.includes(merchant)) {
+        return fc.name || rule.pattern;
+      }
+    }
+    return null;
+  };
+
   const handleConfirm = async () => {
     if (selected.size === 0) { onClose(); return; }
     setSaving(true);
@@ -59,29 +79,28 @@ export const SuggestFixedCostsModal: React.FC<Props> = ({ onConfirm, onClose }) 
     const added: MBFixedCost[] = [];
     try {
       for (const i of Array.from(selected)) {
-        const s = suggestions[i];
+        const sg = suggestions[i];
         const ruleId = uuidv4();
 
         const rulePayload = {
           ruleId,
-          pattern:         s.merchant,
+          pattern:         sg.merchant,
           categoryId:      '',
           budgetId:        '__master_budget__',
           priority:        50,
-          amountMatch:     s.meanAmount,
+          amountMatch:     sg.meanAmount,
           amountTolerance: 5,
-          dayOfMonth:      s.meanDay,
+          dayOfMonth:      sg.meanDay,
           dayTolerance:    1,
         };
-        console.log('[SuggestFixedCosts] calling putRule with', rulePayload);
         const savedRule = await putRule(rulePayload);
         console.log('[SuggestFixedCosts] putRule response', savedRule);
 
         added.push({
           id:        uuidv4(),
-          name:      s.merchant,
-          amount:    s.meanAmount,
-          frequency: s.frequency,
+          name:      sg.merchant,
+          amount:    sg.meanAmount,
+          frequency: sg.frequency,
           ruleId,
         });
       }
@@ -93,7 +112,6 @@ export const SuggestFixedCostsModal: React.FC<Props> = ({ onConfirm, onClose }) 
       return;
     }
 
-    // Apply all rules to existing transactions now that new rules are saved
     try {
       await applyRules();
     } catch {
@@ -102,7 +120,6 @@ export const SuggestFixedCostsModal: React.FC<Props> = ({ onConfirm, onClose }) 
     setSaving(false);
   };
 
-  // Data window banner content
   const windowBanner = (() => {
     if (!result || result.fullWindow) return null;
     const mo = result.monthsCovered;
@@ -118,15 +135,15 @@ export const SuggestFixedCostsModal: React.FC<Props> = ({ onConfirm, onClose }) 
 
   return (
     <div style={s.overlay}>
-      <div style={s.modal}>
+      <div style={s.modal} className="suggest-modal">
         <div style={s.header}>
           <h3 style={s.title}>Suggest from Transactions</h3>
           <button style={s.closeBtn} onClick={onClose}>✕</button>
         </div>
 
         <p style={s.desc}>
-          Recurring charges found in your transaction history — uncategorized and unbudgeted only.
-          Select any to add as fixed costs and create a matching rule.
+          Recurring charges found in your transaction history, including transactions you've already
+          categorized or budgeted. Select any to add as fixed costs and create a matching rule.
         </p>
 
         {windowBanner}
@@ -135,7 +152,7 @@ export const SuggestFixedCostsModal: React.FC<Props> = ({ onConfirm, onClose }) 
         {error   && <p style={s.errMsg}>{error}</p>}
 
         {!loading && suggestions.length === 0 && !error && (
-          <p style={s.muted}>No recurring patterns found in uncategorized transactions.</p>
+          <p style={s.muted}>No recurring patterns found in your transaction history.</p>
         )}
 
         {suggestions.length > 0 && (
@@ -153,7 +170,8 @@ export const SuggestFixedCostsModal: React.FC<Props> = ({ onConfirm, onClose }) 
             </div>
 
             <div style={s.listWrap}>
-              <table style={s.table}>
+              {/* ── Desktop table ── */}
+              <table style={s.table} className="suggest-table">
                 <thead>
                   <tr>
                     <th style={s.th}></th>
@@ -166,39 +184,93 @@ export const SuggestFixedCostsModal: React.FC<Props> = ({ onConfirm, onClose }) 
                   </tr>
                 </thead>
                 <tbody>
-                  {suggestions.map((s2, i) => (
-                    <tr
+                  {suggestions.map((sg, i) => {
+                    const existingName = matchingFixedCostName(sg);
+                    return (
+                      <tr
+                        key={i}
+                        style={{ ...s.tr, background: selected.has(i) ? '#f0faf7' : undefined, cursor: 'pointer' }}
+                        onClick={() => toggle(i)}
+                      >
+                        <td style={s.td}>
+                          <input
+                            type="checkbox"
+                            checked={selected.has(i)}
+                            onChange={() => toggle(i)}
+                            onClick={e => e.stopPropagation()}
+                          />
+                        </td>
+                        <td style={{ ...s.td, fontWeight: 500 }}>
+                          {sg.merchant}
+                          {existingName && (
+                            <span style={s.existsBadge} title={`Already tracked as "${existingName}"`}>
+                              already a fixed cost
+                            </span>
+                          )}
+                        </td>
+                        <td style={{ ...s.td, textAlign: 'center' }}>{sg.meanDay}</td>
+                        <td style={{ ...s.td, textAlign: 'right' }}>{fmtCurrency(sg.meanAmount)}</td>
+                        <td style={s.td}>
+                          {FREQ_LABELS[sg.frequency] ?? sg.frequency}
+                          {sg.confidence === 'low' && (
+                            <span style={s.lowBadge} title="Frequency estimate may be less reliable due to limited data">
+                              low confidence
+                            </span>
+                          )}
+                        </td>
+                        <td style={{ ...s.td, textAlign: 'center' }}>{sg.occurrences}×</td>
+                        <td style={{ ...s.td, fontSize: '0.78rem', color: '#6b7280' }}>
+                          {sg.sampleDates.slice(-3).join(', ')}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+
+              {/* ── Mobile cards ── */}
+              <div className="suggest-cards">
+                {suggestions.map((sg, i) => {
+                  const existingName = matchingFixedCostName(sg);
+                  return (
+                    <div
                       key={i}
-                      style={{ ...s.tr, background: selected.has(i) ? '#f0faf7' : undefined, cursor: 'pointer' }}
+                      className={`suggest-card${selected.has(i) ? ' selected' : ''}`}
                       onClick={() => toggle(i)}
                     >
-                      <td style={s.td}>
+                      <div className="suggest-card-row">
                         <input
                           type="checkbox"
                           checked={selected.has(i)}
                           onChange={() => toggle(i)}
                           onClick={e => e.stopPropagation()}
+                          style={{ marginRight: 8, flexShrink: 0 }}
                         />
-                      </td>
-                      <td style={{ ...s.td, fontWeight: 500 }}>{s2.merchant}</td>
-                      <td style={{ ...s.td, textAlign: 'center' }}>{s2.meanDay}</td>
-                      <td style={{ ...s.td, textAlign: 'right' }}>{fmtCurrency(s2.meanAmount)}</td>
-                      <td style={s.td}>
-                        {FREQ_LABELS[s2.frequency] ?? s2.frequency}
-                        {s2.confidence === 'low' && (
-                          <span style={s.lowBadge} title="Frequency estimate may be less reliable due to limited data">
-                            low confidence
+                        <span className="suggest-card-merchant">{sg.merchant}</span>
+                        <span className="suggest-card-amount">{fmtCurrency(sg.meanAmount)}</span>
+                      </div>
+                      <div className="suggest-card-meta">
+                        <span>Day {sg.meanDay}</span>
+                        <span style={{ color: '#cbd5e0' }}>·</span>
+                        <span>{FREQ_LABELS[sg.frequency] ?? sg.frequency}</span>
+                        <span style={{ color: '#cbd5e0' }}>·</span>
+                        <span>{sg.occurrences}×</span>
+                        {sg.confidence === 'low' && (
+                          <span style={s.lowBadge}>low confidence</span>
+                        )}
+                        {existingName && (
+                          <span style={s.existsBadge} title={`Already tracked as "${existingName}"`}>
+                            already a fixed cost
                           </span>
                         )}
-                      </td>
-                      <td style={{ ...s.td, textAlign: 'center' }}>{s2.occurrences}×</td>
-                      <td style={{ ...s.td, fontSize: '0.78rem', color: '#6b7280' }}>
-                        {s2.sampleDates.slice(-3).join(', ')}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+                      </div>
+                      <div style={{ fontSize: '0.75rem', color: '#a0aec0', marginTop: '0.25rem' }}>
+                        {sg.sampleDates.slice(-3).join(', ')}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
             </div>
           </>
         )}
@@ -232,7 +304,8 @@ const s: Record<string, React.CSSProperties> = {
     background: '#fffbeb', border: '1px solid #fcd34d', borderRadius: 6,
     fontSize: '0.82rem', color: '#92400e', lineHeight: 1.5,
   },
-  lowBadge:  { marginLeft: 6, fontSize: '0.7rem', background: '#fef3c7', color: '#92400e', border: '1px solid #fcd34d', borderRadius: 4, padding: '1px 5px', verticalAlign: 'middle', whiteSpace: 'nowrap' as const },
+  lowBadge:    { marginLeft: 6, fontSize: '0.7rem', background: '#fef3c7', color: '#92400e', border: '1px solid #fcd34d', borderRadius: 4, padding: '1px 5px', verticalAlign: 'middle', whiteSpace: 'nowrap' as const },
+  existsBadge: { marginLeft: 6, fontSize: '0.7rem', background: '#e0f2fe', color: '#0369a1', border: '1px solid #bae6fd', borderRadius: 4, padding: '1px 5px', verticalAlign: 'middle', whiteSpace: 'nowrap' as const },
   selectAll: { padding: '0.5rem 1.25rem', borderBottom: '1px solid #e2e8f0' },
   checkLabel:{ display: 'flex', alignItems: 'center', fontSize: '0.85rem', color: '#374151', cursor: 'pointer' },
   listWrap:  { overflowY: 'auto', flex: 1, padding: '0 1.25rem' },

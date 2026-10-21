@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -121,7 +122,7 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response,
 	// transaction into the system account tagged to that linked budget.
 	//
 	// We use the post-apply view (updated) so BudgetIDs are current.
-	synthCount, synthErr := upsertVarianceSynthetics(ctx, dbClient, userID, updated, allTxns, rules, startDate, endDate)
+	synthCount, synthErr := upsertVarianceSynthetics(ctx, dbClient, userID, accounts, updated, allTxns, rules, startDate, endDate)
 	_ = synthErr // non-fatal — regular rule application already succeeded
 
 	body, _ := json.Marshal(map[string]interface{}{
@@ -140,6 +141,7 @@ func upsertVarianceSynthetics(
 	ctx context.Context,
 	dbClient *dbpkg.Client,
 	userID string,
+	accounts []dbpkg.Account,
 	updatedTxns []dbpkg.Transaction, // post-apply-rules transactions
 	origTxns []dbpkg.Transaction, // pre-apply-rules (same slice refs, used as pool)
 	rules []dbpkg.Rule,
@@ -196,19 +198,14 @@ func upsertVarianceSynthetics(
 		return 0, nil
 	}
 
-	// Collect all YYYY-MM months present across master and income txns
-	monthSet := make(map[string]bool)
-	for _, e := range masterTxns {
-		monthSet[e.month] = true
-	}
-	for _, e := range incomeTxns {
-		monthSet[e.month] = true
-	}
-
 	var synthetics []dbpkg.Transaction
 
-	for ym := range monthSet {
-		// Pick the effective master budget for this month
+	// effectiveFixedCost finds the fixed cost with the given ID as defined by
+	// whichever master budget version was in effect for the given "YYYY-MM"
+	// month — so a fixed cost's amount/frequency changes across master
+	// budget versions are respected per-month rather than always using
+	// whichever version happens to be picked up first.
+	effectiveFixedCost := func(fcID, ym string) (dbpkg.MBFixedCost, bool) {
 		monthStart := ym + "-01"
 		var mb *dbpkg.MasterBudget
 		for i := len(mbs) - 1; i >= 0; i-- {
@@ -220,61 +217,144 @@ func upsertVarianceSynthetics(
 		if mb == nil {
 			mb = &mbs[0]
 		}
-
-		// Filter master txns for this month
-		var monthMasterTxns []dbpkg.Transaction
-		for _, e := range masterTxns {
-			if e.month == ym {
-				monthMasterTxns = append(monthMasterTxns, e.txn)
+		for _, fc := range mb.FixedCosts {
+			if fc.ID == fcID {
+				return fc, true
 			}
 		}
+		return dbpkg.MBFixedCost{}, false
+	}
 
-		for _, fc := range mb.FixedCosts {
-			if fc.LinkedBudgetID == "" {
+	// ── Fixed-cost variance synthetics ────────────────────────────────────────
+	// Processed once per fixed cost (deduped by ID across master budget
+	// versions) rather than per month-that-happens-to-have-a-transaction, so
+	// that months/cycles with ZERO matching transactions are still correctly
+	// evaluated — a recurring cost that was expected but never charged should
+	// show up as a full credit (the whole expected amount was saved), not
+	// silence. We only ever do this starting from a fixed cost's first-ever
+	// real match: a rule with zero history yet gives no baseline to judge
+	// "missing" against, so it's left alone until it matches at least once.
+	fixedCostIDs := make(map[string]bool)
+	for i := range mbs {
+		for _, fc := range mbs[i].FixedCosts {
+			if fc.LinkedBudgetID != "" {
+				fixedCostIDs[fc.ID] = true
+			}
+		}
+	}
+
+	now := time.Now().UTC()
+	currentYM := now.Format("2006-01")
+	todayStr := now.Format("2006-01-02")
+
+	for fcID := range fixedCostIDs {
+		// Earliest month this fixed cost has ever actually matched a real
+		// transaction, using whichever MB version was effective each month.
+		var firstMatchMonth string
+		for _, e := range masterTxns {
+			fc, ok := effectiveFixedCost(fcID, e.month)
+			if !ok {
 				continue
 			}
+			if matchesFixedCost(e.txn, fc, ruleByID) && (firstMatchMonth == "" || e.month < firstMatchMonth) {
+				firstMatchMonth = e.month
+			}
+		}
+		if firstMatchMonth == "" {
+			continue // never matched anything — no baseline to detect "missing" against
+		}
 
-			// Match transactions for this fixed cost
-			var actualSum float64
-			var matchCount int
-			for _, txn := range monthMasterTxns {
-				if matchesFixedCost(txn, fc, ruleByID) {
-					actualSum += math.Abs(txn.Amount)
-					matchCount++
+		// Use the cost's currently-effective definition to decide whether
+		// it's a monthly-family or cyclical cost. Frequency changes mid
+		// history are rare and not specially handled beyond this.
+		latestFC, ok := effectiveFixedCost(fcID, currentYM)
+		if !ok {
+			continue // no longer part of the current master budget
+		}
+		months := cycleMonths(latestFC.Frequency)
+
+		if months == 1 {
+			// ── Monthly-family costs (monthly/weekly/biweekly/semimonthly) ────
+			monthActual := make(map[string]float64)
+			for _, e := range masterTxns {
+				fc, ok := effectiveFixedCost(fcID, e.month)
+				if !ok {
+					continue
+				}
+				if matchesFixedCost(e.txn, fc, ruleByID) {
+					monthActual[e.month] += math.Abs(e.txn.Amount)
 				}
 			}
 
-			if matchCount == 0 {
-				// No match this month — don't create a synthetic transaction yet.
-				// It will be created once a matching transaction appears.
-				continue
+			startIdx := monthIndex(firstMatchMonth)
+			endIdx := monthIndex(currentYM)
+			for i := startIdx; i <= endIdx; i++ {
+				ym := monthFromIndex(i)
+				fc, ok := effectiveFixedCost(fcID, ym)
+				if !ok {
+					continue // fixed cost wasn't part of the budget that month
+				}
+				expected := monthlyAmount(fc.Amount, fc.Frequency)
+				actualSum, matched := monthActual[ym]
+
+				if !matched && ym == currentYM {
+					// The current month is still in progress and has no
+					// match yet — the bill may simply not have posted this
+					// month. Don't credit prematurely; a synthetic will be
+					// created once (if) a real match arrives on a later run.
+					continue
+				}
+
+				var syntheticAmount float64
+				if matched {
+					// variance = expected - actual
+					// positive → under budget → credit → negative amount
+					// negative → over budget  → debit  → positive amount
+					syntheticAmount = -(expected - actualSum)
+				} else {
+					// No match this month at all — full credit: the whole
+					// expected amount was never charged.
+					syntheticAmount = -expected
+				}
+
+				txnID := fmt.Sprintf("variance-%s-%s", fcID, ym)
+				date := ym + "-01"
+				synthetics = append(synthetics, dbpkg.Transaction{
+					AccountID:         dbpkg.SystemAccountID,
+					DateTransactionID: date + "#" + txnID,
+					TransactionID:     txnID,
+					Date:              date,
+					Name:              fc.Name + " Variance",
+					Amount:            syntheticAmount,
+					BudgetID:          fc.LinkedBudgetID,
+					Synthetic:         true,
+				})
 			}
-
-			// variance = expected - actual
-			// positive → under budget → credit → negative amount (Plaid: negative = credit)
-			// negative → over budget  → debit  → positive amount (Plaid: positive = debit)
-			expected := monthlyAmount(fc.Amount, fc.Frequency)
-			variance := expected - actualSum
-			syntheticAmount := -variance // negate: under-budget credit is negative
-
-			// Deterministic TransactionID enables upsert on re-run
-			txnID := fmt.Sprintf("variance-%s-%s", fc.ID, ym)
-			date := ym + "-01"
-
-			synthetics = append(synthetics, dbpkg.Transaction{
-				AccountID:         dbpkg.SystemAccountID,
-				DateTransactionID: date + "#" + txnID,
-				TransactionID:     txnID,
-				Date:              date,
-				Name:              fc.Name + " Variance",
-				Amount:            syntheticAmount,
-				BudgetID:          fc.LinkedBudgetID,
-				Synthetic:         true,
-			})
+			continue
 		}
 
-		// ── Income source variance synthetics ─────────────────────────────────
-		// Income variance is handled per-paycheck below, outside the month loop.
+		// ── Cyclical costs (quarterly/semiannually/annually) ────────────────────
+		// Walk every calendar-aligned cycle window from the one containing
+		// the first-ever match through the one containing today. Only fully
+		// elapsed windows are eligible for a "missing → full credit" verdict;
+		// the current, still-in-progress window is left alone since the bill
+		// may simply not have posted yet.
+		firstWindowIdx := monthIndex(firstMatchMonth) / months
+		currentWindowIdx := monthIndex(currentYM) / months
+
+		for w := firstWindowIdx; w <= currentWindowIdx; w++ {
+			winStartYM := monthFromIndex(w * months)
+			fc, ok := effectiveFixedCost(fcID, winStartYM)
+			if !ok {
+				continue
+			}
+			winStart, winEnd := cycleWindow(winStartYM, months)
+			isCompleted := winEnd < todayStr
+			windowSynthetics, err := processCyclicalFixedCostWindow(ctx, dbClient, accounts, fc, ruleByID, winStart, winEnd, isCompleted)
+			if err == nil {
+				synthetics = append(synthetics, windowSynthetics...)
+			}
+		}
 	}
 
 	// ── Per-paycheck income variance synthetics ────────────────────────────────
@@ -343,6 +423,158 @@ func upsertVarianceSynthetics(
 		return 0, err
 	}
 	return len(synthetics), nil
+}
+
+// cycleMonths returns the number of months in one full billing cycle for the
+// given frequency. Frequencies of one month or less (monthly and anything
+// more frequent) return 1, meaning the simple per-month variance logic
+// applies directly. Only quarterly/semiannually/annually get special
+// cycle-aware handling.
+func cycleMonths(frequency string) int {
+	switch frequency {
+	case "quarterly":
+		return 3
+	case "semiannually":
+		return 6
+	case "annually":
+		return 12
+	default:
+		return 1
+	}
+}
+
+// cycleWindow returns the calendar-aligned [start, end] date bounds (both
+// inclusive, YYYY-MM-DD) of the `months`-long cycle window containing month
+// `ym` (YYYY-MM). E.g. for months=12, any month in 2026 maps to the full
+// calendar year [2026-01-01, 2026-12-31]; for months=3, March 2026 maps to
+// the Q1 window [2026-01-01, 2026-03-31].
+func cycleWindow(ym string, months int) (string, string) {
+	var y, m int
+	fmt.Sscanf(ym, "%d-%d", &y, &m)
+	windowIndex := (m - 1) / months
+	startMonth := windowIndex*months + 1
+	endMonth := startMonth + months - 1
+	start := time.Date(y, time.Month(startMonth), 1, 0, 0, 0, 0, time.UTC)
+	end := time.Date(y, time.Month(endMonth+1), 0, 0, 0, 0, 0, time.UTC) // day 0 = last day of endMonth
+	return start.Format("2006-01-02"), end.Format("2006-01-02")
+}
+
+// monthIndex converts a "YYYY-MM" string to a linear month count since year 0
+// (e.g. "2026-03" -> 2026*12+2), so cycle windows and month ranges can be
+// walked with simple integer arithmetic instead of juggling date strings.
+func monthIndex(ym string) int {
+	var y, m int
+	fmt.Sscanf(ym, "%d-%d", &y, &m)
+	return y*12 + (m - 1)
+}
+
+// monthFromIndex is the inverse of monthIndex.
+func monthFromIndex(idx int) string {
+	y := idx / 12
+	m := idx%12 + 1
+	return fmt.Sprintf("%04d-%02d", y, m)
+}
+
+// processCyclicalFixedCostWindow computes variance synthetics for a single
+// fixed cost across one full cycle window (e.g. one calendar year for an
+// annual cost). The first matching transaction in the window (sorted by
+// date) is compared against the full period amount (fc.Amount); any
+// subsequent matches in the same window are treated as pure additional
+// variance (expected = $0), since the period's budgeted allowance was
+// already accounted for by the first occurrence.
+//
+// It also removes any stale per-month synthetics that the old (pre-fix)
+// monthly-divided calculation may have left behind for months within this
+// window, so they don't linger as duplicate/incorrect entries in the linked
+// budget alongside the corrected ones.
+func processCyclicalFixedCostWindow(
+	ctx context.Context,
+	dbClient *dbpkg.Client,
+	accounts []dbpkg.Account,
+	fc dbpkg.MBFixedCost,
+	ruleByID map[string]dbpkg.Rule,
+	winStart, winEnd string,
+	isCompleted bool, // true if this cycle window has already fully elapsed
+) ([]dbpkg.Transaction, error) {
+	var matches []dbpkg.Transaction
+	for _, acct := range accounts {
+		txns, err := dbClient.GetTransactions(ctx, acct.AccountID, winStart, winEnd)
+		if err != nil {
+			return nil, err
+		}
+		for _, t := range txns {
+			if t.Pending || t.Synthetic || t.BudgetID != dbpkg.MasterBudgetID {
+				continue
+			}
+			if matchesFixedCost(t, fc, ruleByID) {
+				matches = append(matches, t)
+			}
+		}
+	}
+
+	// Always attempt stale-synthetic cleanup, even if there are no current
+	// matches (e.g. a previously-matched transaction was recategorized away).
+	staleKeys := make([]struct{ Date, TxnID string }, 0)
+	start, _ := time.Parse("2006-01-02", winStart)
+	end, _ := time.Parse("2006-01-02", winEnd)
+	for d := start; !d.After(end); d = d.AddDate(0, 1, 0) {
+		ym := d.Format("2006-01")
+		oldTxnID := fmt.Sprintf("variance-%s-%s", fc.ID, ym)
+		staleKeys = append(staleKeys, struct{ Date, TxnID string }{Date: ym + "-01", TxnID: oldTxnID})
+	}
+	_ = dbClient.DeleteTransactions(ctx, dbpkg.SystemAccountID, staleKeys) // best-effort cleanup
+
+	if len(matches) == 0 {
+		if !isCompleted {
+			// Still inside the current cycle — the bill may simply not have
+			// posted yet. Don't credit prematurely.
+			return nil, nil
+		}
+		// The cycle fully elapsed with zero matching transactions — the
+		// entire expected amount was never charged, so credit it in full.
+		txnID := fmt.Sprintf("variance-%s-%s", fc.ID, winStart[:7])
+		return []dbpkg.Transaction{{
+			AccountID:         dbpkg.SystemAccountID,
+			DateTransactionID: winEnd + "#" + txnID,
+			TransactionID:     txnID,
+			Date:              winEnd,
+			Name:              fc.Name + " Variance",
+			Amount:            -fc.Amount, // full credit — nothing was charged this cycle
+			BudgetID:          fc.LinkedBudgetID,
+			Synthetic:         true,
+		}}, nil
+	}
+	sort.Slice(matches, func(i, j int) bool { return matches[i].Date < matches[j].Date })
+
+	synthetics := make([]dbpkg.Transaction, 0, len(matches))
+	for i, txn := range matches {
+		var expected float64
+		if i == 0 {
+			expected = fc.Amount // full period amount for the first occurrence in this cycle
+		} else {
+			expected = 0 // subsequent occurrences in the same cycle are pure variance
+		}
+		actual := math.Abs(txn.Amount)
+		variance := expected - actual
+		syntheticAmount := -variance
+
+		// Deterministic per-matched-transaction ID (rather than per-month) so
+		// multiple occurrences within the same cycle each get their own
+		// synthetic, and re-running apply-rules upserts cleanly.
+		txnID := fmt.Sprintf("variance-%s-%s", fc.ID, txn.TransactionID)
+
+		synthetics = append(synthetics, dbpkg.Transaction{
+			AccountID:         dbpkg.SystemAccountID,
+			DateTransactionID: txn.Date + "#" + txnID,
+			TransactionID:     txnID,
+			Date:              txn.Date,
+			Name:              fc.Name + " Variance",
+			Amount:            syntheticAmount,
+			BudgetID:          fc.LinkedBudgetID,
+			Synthetic:         true,
+		})
+	}
+	return synthetics, nil
 }
 
 // periodicAmount converts a monthly amount back to the per-period equivalent.

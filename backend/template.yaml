@@ -19,6 +19,7 @@ Globals:
         STAGE: !Ref Stage
         AUTH_DISABLED: !Ref AuthDisabled
         DYNAMODB_ENDPOINT: ""
+        PLAID_REDIRECT_URI: !Ref PlaidRedirectUri
   Api:
     Cors:
       AllowMethods: "'GET,POST,OPTIONS'"
@@ -39,6 +40,13 @@ Parameters:
     Default: "false"
     AllowedValues: ["true", "false"]
     Description: Set to true only for local development to bypass JWT verification
+  PlaidRedirectUri:
+    Type: String
+    Default: ""
+    Description: >
+      OAuth redirect URI for Plaid Link (required for update-mode re-auth).
+      Must exactly match an entry in the Plaid Dashboard's Allowed redirect
+      URIs, e.g. https://your-frontend-domain/plaid-oauth
 
 Resources:
 
@@ -132,10 +140,12 @@ Resources:
       FunctionName: !Sub "finance-app-${Stage}-create-link-token"
       CodeUri: .
       Handler: bootstrap
-      Description: Creates a Plaid Link token to initialize the Link flow
+      Description: Creates a Plaid Link token to initialize the Link flow (including update-mode re-auth)
       Policies:
         - SSMParameterReadPolicy:
             ParameterName: !Sub "finance-app/${Stage}/*"
+        - DynamoDBReadPolicy:
+            TableName: !Ref MainTable
       Events:
         Api:
           Type: HttpApi
@@ -844,6 +854,69 @@ Resources:
             Path: /master-budget/variance
             Method: GET
 
+  GetCashFlowForecastFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-get-cash-flow-forecast"
+      CodeUri: .
+      Handler: bootstrap
+      Description: Projects future cash balance from expected income, fixed costs, and credit card payments
+      Timeout: 60
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /cash-flow/forecast
+            Method: GET
+
+  GetCCCycleSuggestionFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-get-cc-cycle-suggestion"
+      CodeUri: .
+      Handler: bootstrap
+      Description: Runs the automatic credit card billing cycle heuristic for a single account (preview only, nothing saved)
+      Timeout: 30
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /accounts/{accountId}/cc-cycle-suggestion
+            Method: GET
+
+  CCCycleGuidedFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-cc-cycle-guided"
+      CodeUri: .
+      Handler: bootstrap
+      Description: Validates user-entered statement dates against a credit card's synced transaction history (preview only, nothing saved)
+      Timeout: 30
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /accounts/{accountId}/cc-cycle-guided
+            Method: POST
+
   GetBudgetPeriodFunction:
     Type: AWS::Serverless::Function
     Metadata:
@@ -984,6 +1057,29 @@ Resources:
             ApiId: !Ref FinanceApi
             Path: /transactions/{accountId}/{dateTransactionId}
             Method: DELETE
+
+  BulkDeleteTransactionsFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub "finance-app-${Stage}-bulk-delete-transactions"
+      CodeUri: .
+      Handler: bootstrap
+      Description: >
+        Previews/deletes all transactions for an account in a date range —
+        used to reconcile duplicates left behind when the same real-world
+        account is re-linked under a new Plaid Item.
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MainTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FinanceApi
+            Path: /transactions/bulk-delete
+            Method: POST
 
   # ── DynamoDB Single Table ──────────────────────────────────────────────────
   #

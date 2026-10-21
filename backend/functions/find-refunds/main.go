@@ -117,9 +117,6 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response,
 	// Load all non-pending, non-synthetic transactions across all accounts.
 	var allTxns []dbpkg.Transaction
 	for _, acct := range accounts {
-		if !dbpkg.AccountEnabled(acct) {
-			continue
-		}
 		txns, err := dbClient.GetTransactions(ctx, acct.AccountID, "2000-01-01", "2999-12-31")
 		if err != nil {
 			continue

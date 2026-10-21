@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useData } from '../auth/DataContext';
-import { IncomeSource, NetPayResult, DeductionItem, putIncomeSource, deleteIncomeSource, getNetPay } from '../api/client';
+import { IncomeSource, NetPayResult, putIncomeSource, deleteIncomeSource, getNetPay } from '../api/client';
 import { fmtCurrency } from '../utils/dates';
 import { ItemizeModal } from '../components/ItemizeModal';
 import { MoneyInput } from '../components/MoneyInput';
@@ -279,6 +279,18 @@ export const IncomePage: React.FC = () => {
             onChange={e => setField({ frequency: e.target.value as FrequencyType })}>
             {Object.entries(FREQUENCY_LABELS).map(([v, l]) => <option key={v} value={v}>{l}</option>)}
           </select>
+        </label>
+
+        <label style={styles.label}>
+          <span style={{ display: 'flex', alignItems: 'baseline', gap: '0.4rem' }}>
+            Next Pay Date
+            <span style={{ fontWeight: 400, fontSize: '0.75rem', color: '#6b7280' }}>(optional)</span>
+          </span>
+          <input type="date" style={styles.input} value={formData.nextPayDateOverride ?? ''}
+            onChange={e => setField({ nextPayDateOverride: e.target.value || undefined })} />
+          <span style={{ fontSize: '0.72rem', color: '#6b7280', marginTop: 2 }}>
+            Used as a fallback anchor for Cash Flow forecasting when there's no matched paycheck history yet.
+          </span>
         </label>
 
         <label style={styles.label}>

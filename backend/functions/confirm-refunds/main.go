@@ -70,9 +70,6 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response,
 	// We need this to fetch individual transactions by their composite key.
 	txnByDTID := make(map[string]dbpkg.Transaction)
 	for _, acct := range accounts {
-		if !dbpkg.AccountEnabled(acct) {
-			continue
-		}
 		txns, err := dbClient.GetTransactions(ctx, acct.AccountID, "2000-01-01", "2999-12-31")
 		if err != nil {
 			continue

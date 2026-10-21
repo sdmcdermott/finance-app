@@ -6,7 +6,7 @@ resolve_s3 = true
 s3_prefix = "finance-app-prod"
 confirm_changeset = true
 capabilities = "CAPABILITY_IAM"
-parameter_overrides = "Stage=\"prod\" PlaidEnv=\"production\" AuthDisabled=\"false\""
+parameter_overrides = "Stage=\"prod\" PlaidEnv=\"production\" AuthDisabled=\"false\" PlaidRedirectUri=\"https://d25ntl28zp0k80.cloudfront.net/plaid-oauth\""
 image_repositories = []
 
 [default.global.parameters]

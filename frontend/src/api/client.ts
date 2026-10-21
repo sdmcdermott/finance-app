@@ -41,6 +41,19 @@ export interface Account {
   subtype: string;
   lastSynced: string;
   enabled?: boolean;  // absent == true (legacy records)
+  // Set when the underlying Plaid connection needs re-authentication
+  // (e.g. bank password/MFA changed). Resolve via Plaid Link "update mode".
+  needsReauth?: boolean;
+  lastErrorMessage?: string;
+  // Cash flow forecasting
+  isCashAccount?: boolean;
+  currentBalance?: number;
+  availableBalance?: number;
+  balanceUpdatedAt?: string;
+  // Credit card billing cycle manual override (Type === 'credit' only)
+  ccPaymentDueDay?: number;
+  ccGracePeriodDays?: number;
+  ccCycleConfidence?: string; // "manual" when an override is set
 }
 
 export interface TransactionLocation {
@@ -102,12 +115,12 @@ export interface Category {
   color: string;
 }
 
-export const createLinkToken = async (): Promise<string> => {
-  const { data } = await api.post<{ linkToken: string }>('/plaid/link-token');
+export const createLinkToken = async (itemId?: string): Promise<string> => {
+  const { data } = await api.post<{ linkToken: string }>('/plaid/link-token', itemId ? { itemId } : undefined);
   return data.linkToken;
 };
 
-export const syncTransactions = async (): Promise<{ added: number; modified: number; removed: number; errors: number }> => {
+export const syncTransactions = async (): Promise<{ added: number; modified: number; removed: number; errors: number; reauthRequired?: string[] }> => {
   const { data } = await api.post('/plaid/sync');
   return data;
 };
@@ -131,7 +144,14 @@ export const deleteAccount = async (accountId: string): Promise<void> => {
 
 export const updateAccount = async (
   accountId: string,
-  patch: { enabled?: boolean; nickName?: string }
+  patch: {
+    enabled?: boolean;
+    nickName?: string;
+    isCashAccount?: boolean;
+    ccPaymentDueDay?: number;
+    ccGracePeriodDays?: number;
+    ccCycleReset?: boolean;
+  }
 ): Promise<void> => {
   await api.patch(`/accounts/${encodeURIComponent(accountId)}`, patch);
 };
@@ -163,6 +183,32 @@ export const deleteTransaction = async (
   dateTransactionId: string
 ): Promise<void> => {
   await api.delete(`/transactions/${encodeURIComponent(accountId)}/${encodeURIComponent(dateTransactionId)}`);
+};
+
+export interface BulkDeletePreview {
+  preview: true;
+  count: number;
+  sample: { date: string; name: string; amount: number }[];
+  sampleSize: number;
+}
+
+export interface BulkDeleteResult {
+  deleted: number;
+}
+
+// Preview (confirm=false, the default) returns a count + sample of what would
+// be deleted without touching anything. Pass confirm=true to actually delete.
+// Unlike deleteTransaction, this can remove real Plaid-synced transactions —
+// intended for reconciling duplicates left behind when the same real-world
+// account is re-linked under a new Plaid Item.
+export const bulkDeleteTransactions = async (
+  accountId: string,
+  startDate: string,
+  endDate: string,
+  confirm: boolean = false
+): Promise<BulkDeletePreview | BulkDeleteResult> => {
+  const { data } = await api.post('/transactions/bulk-delete', { accountId, startDate, endDate, confirm });
+  return data;
 };
 
 export const updateTransactionCategory = async (
@@ -543,6 +589,9 @@ export interface MBFixedCost {
   ruleId?: string;
   fromTxn?: boolean;
   linkedBudgetId?: string;  // optional checkbook budget tracking actual spend vs. expected
+  // Manual fallback anchor (1-31) for cash flow forecasting, used only when
+  // there's no linked rule/day-of-month and no matched transaction history.
+  dayOfMonthOverride?: number;
 }
 
 export interface SuggestFixedCost {
@@ -689,6 +738,9 @@ export interface IncomeSource {
   step4bItems?: DeductionItem[];
   isActive: boolean;
   lastNetPay?: NetPayResult;
+  // Manual fallback anchor (YYYY-MM-DD) for cash flow forecasting, used only
+  // when no rule-matched paycheck history exists yet.
+  nextPayDateOverride?: string;
 }
 
 export const getIncomeSources = async (): Promise<IncomeSource[]> => {
@@ -713,5 +765,100 @@ export const getNetPay = async (
 ): Promise<NetPayResult> => {
   const params = ytdWages !== undefined ? `?ytdWages=${ytdWages}` : '';
   const { data } = await api.get<NetPayResult>(`/income-sources/${incomeSourceId}/net-pay${params}`);
+  return data;
+};
+
+// ── Cash flow forecast ──────────────────────────────────────────────────────
+
+export interface CCTxnSummary {
+  date: string;
+  label: string;
+  amount: number; // Plaid convention: positive = charge, negative = credit
+}
+
+export interface CreditCardDetail {
+  confidence: 'high' | 'low' | 'manual';
+  billingStart?: string;
+  billingEnd?: string;
+  transactions: CCTxnSummary[];
+}
+
+export interface CashFlowEvent {
+  date: string;
+  label: string;
+  amount: number; // positive = inflow, negative = outflow
+  type: 'income' | 'fixedCost' | 'creditCardPayment';
+  creditCardDetail?: CreditCardDetail;
+}
+
+export interface CashFlowPoint {
+  date: string;
+  balance: number;
+}
+
+export interface CashFlowForecast {
+  cashAccountId: string;
+  startingBalance: number;
+  balanceUpdatedAt?: string;
+  asOf: string;
+  horizonDays: number;
+  events: CashFlowEvent[];
+  series: CashFlowPoint[];
+}
+
+export const getCashFlowForecast = async (days: number = 60): Promise<CashFlowForecast> => {
+  const { data } = await api.get<CashFlowForecast>('/cash-flow/forecast', { params: { days } });
+  return data;
+};
+
+// ── Credit card cycle configuration ─────────────────────────────────────────
+
+export interface CCCycleSuggestion {
+  confidence: 'high' | 'low' | 'none';
+  paymentDueDay?: number;
+  gracePeriodDays?: number;
+  nextDueDate?: string;
+  projectedNextPaymentAmount?: number;
+  fallbackMeanDay?: number;
+  fallbackMeanAmount?: number;
+  paymentsConsidered: number;
+  paymentsFit: number;
+}
+
+export const getCCCycleSuggestion = async (accountId: string): Promise<CCCycleSuggestion> => {
+  const { data } = await api.get<CCCycleSuggestion>(`/accounts/${encodeURIComponent(accountId)}/cc-cycle-suggestion`);
+  return data;
+};
+
+export interface ManualStatementEntry {
+  closeDate: string; // YYYY-MM-DD, billing period end date
+  dueDate: string;   // YYYY-MM-DD, payment due date
+}
+
+export interface GuidedCycleEntry {
+  closeDate: string;
+  dueDate: string;
+  windowSum: number;
+  matchedPaymentDate?: string;
+  matchedPaymentAmount?: number;
+  matched: boolean;
+}
+
+export interface GuidedCycleResult {
+  suggestedPaymentDueDay: number;
+  suggestedGracePeriodDays: number;
+  entries: GuidedCycleEntry[];
+  matchCount: number;
+  totalCycles: number;
+}
+
+export const validateGuidedCycle = async (
+  accountId: string,
+  statements: ManualStatementEntry[]
+): Promise<GuidedCycleResult> => {
+  const { data } = await api.post<GuidedCycleResult>(
+    `/accounts/${encodeURIComponent(accountId)}/cc-cycle-guided`,
+    { statements }
+  );
   return data;
 };

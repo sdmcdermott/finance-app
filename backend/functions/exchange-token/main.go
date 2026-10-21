@@ -73,33 +73,87 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (response,
 	userID := plaidclient.UserID()
 	var savedAccounts []dbpkg.Account
 
-	// Persist the access token in its own PlaidItem record — separate from accounts
-	// so that deleting an account never loses the token.
-	plaidItem := dbpkg.PlaidItem{
-		UserID:      userID,
-		ItemID:      itemID,
-		AccessToken: accessToken,
-		Institution: body.InstitutionName,
-	}
-	if err := dbClient.PutPlaidItem(ctx, plaidItem); err != nil {
-		return errorResponse(http.StatusInternalServerError, fmt.Sprintf("failed to save plaid item: %v", err)), nil
-	}
+	// Detect whether this is a brand-new Item or a Link "update mode" reconnect
+	// of an Item we already have on file (e.g. resolving an ITEM_LOGIN_REQUIRED
+	// error). In the reconnect case we must NOT blindly overwrite existing
+	// Account records — that would wipe the sync cursor (forcing a full
+	// historical re-sync), the user's custom nickname, and the enabled toggle.
+	existingItem, existingErr := dbClient.GetPlaidItem(ctx, userID, itemID)
+	isReconnect := existingErr == nil && existingItem != nil
 
-	for _, acct := range accountsResp.GetAccounts() {
-		record := dbpkg.Account{
+	if isReconnect {
+		// Update only the access token (it may or may not have rotated) and
+		// clear any recorded reauth/error state — the Item is healthy again.
+		if err := dbClient.UpdatePlaidItemAccessToken(ctx, userID, itemID, accessToken); err != nil {
+			return errorResponse(http.StatusInternalServerError, fmt.Sprintf("failed to update plaid item: %v", err)), nil
+		}
+		if err := dbClient.UpdateItemReauthStatus(ctx, userID, itemID, false, "", ""); err != nil {
+			return errorResponse(http.StatusInternalServerError, fmt.Sprintf("failed to clear reauth status: %v", err)), nil
+		}
+
+		existingAccounts, err := dbClient.GetAccounts(ctx, userID)
+		if err != nil {
+			return errorResponse(http.StatusInternalServerError, err.Error()), nil
+		}
+		existingByAccountID := make(map[string]dbpkg.Account, len(existingAccounts))
+		for _, a := range existingAccounts {
+			if a.ItemID == itemID {
+				existingByAccountID[a.AccountID] = a
+			}
+		}
+
+		for _, acct := range accountsResp.GetAccounts() {
+			if existing, ok := existingByAccountID[acct.GetAccountId()]; ok {
+				// Already tracked — leave sync cursor / nickname / enabled untouched.
+				savedAccounts = append(savedAccounts, existing)
+				continue
+			}
+			// A genuinely new account added to this Item during the update
+			// (e.g. the user opted in a second card) — persist it fresh.
+			record := dbpkg.Account{
+				UserID:      userID,
+				AccountID:   acct.GetAccountId(),
+				ItemID:      itemID,
+				Institution: body.InstitutionName,
+				Name:        acct.GetName(),
+				Type:        string(acct.GetType()),
+				Subtype:     string(acct.GetSubtype()),
+				LastSynced:  time.Now().UTC(),
+			}
+			if err := dbClient.PutAccount(ctx, record); err != nil {
+				return errorResponse(http.StatusInternalServerError, fmt.Sprintf("failed to save account: %v", err)), nil
+			}
+			savedAccounts = append(savedAccounts, record)
+		}
+	} else {
+		// Persist the access token in its own PlaidItem record — separate from accounts
+		// so that deleting an account never loses the token.
+		plaidItem := dbpkg.PlaidItem{
 			UserID:      userID,
-			AccountID:   acct.GetAccountId(),
 			ItemID:      itemID,
+			AccessToken: accessToken,
 			Institution: body.InstitutionName,
-			Name:        acct.GetName(),
-			Type:        string(acct.GetType()),
-			Subtype:     string(acct.GetSubtype()),
-			LastSynced:  time.Now().UTC(),
 		}
-		if err := dbClient.PutAccount(ctx, record); err != nil {
-			return errorResponse(http.StatusInternalServerError, fmt.Sprintf("failed to save account: %v", err)), nil
+		if err := dbClient.PutPlaidItem(ctx, plaidItem); err != nil {
+			return errorResponse(http.StatusInternalServerError, fmt.Sprintf("failed to save plaid item: %v", err)), nil
 		}
-		savedAccounts = append(savedAccounts, record)
+
+		for _, acct := range accountsResp.GetAccounts() {
+			record := dbpkg.Account{
+				UserID:      userID,
+				AccountID:   acct.GetAccountId(),
+				ItemID:      itemID,
+				Institution: body.InstitutionName,
+				Name:        acct.GetName(),
+				Type:        string(acct.GetType()),
+				Subtype:     string(acct.GetSubtype()),
+				LastSynced:  time.Now().UTC(),
+			}
+			if err := dbClient.PutAccount(ctx, record); err != nil {
+				return errorResponse(http.StatusInternalServerError, fmt.Sprintf("failed to save account: %v", err)), nil
+			}
+			savedAccounts = append(savedAccounts, record)
+		}
 	}
 
 	respBody, _ := json.Marshal(map[string]interface{}{

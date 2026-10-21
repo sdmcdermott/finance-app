@@ -605,3 +605,158 @@ select {
 
 /* Accounts cards hidden on desktop */
 .accounts-cards { display: none; }
+
+/* ── Budget-period transaction table (desktop) ───────────────────────────── */
+.bpp-table-wrap { overflow-x: auto; margin-top: 1rem; }
+.bpp-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+.bpp-table th {
+  padding: 0.45rem 0.6rem; text-align: left; border-bottom: 2px solid #e2e8f0;
+  color: #4a5568; font-weight: 600; white-space: nowrap;
+  cursor: pointer; user-select: none;
+}
+.bpp-table td {
+  padding: 0.4rem 0.6rem; border-bottom: 1px solid #f0f0f0; vertical-align: middle;
+}
+.bpp-table .row-even { background: #fff; }
+.bpp-table .row-odd  { background: #f9fafb; }
+
+/* Budget-period transaction cards (mobile — hidden by default) */
+.bpp-cards { display: none; margin-top: 0.75rem; }
+
+.bpp-card {
+  border: 1px solid #e2e8f0; border-radius: 8px;
+  padding: 0.75rem 1rem; margin-bottom: 0.55rem; background: #fff;
+}
+.bpp-card-row {
+  display: flex; justify-content: space-between;
+  align-items: flex-start; gap: 0.5rem;
+}
+.bpp-card-name {
+  font-weight: 600; font-size: 0.9rem; color: #1a202c;
+  flex: 1; min-width: 0; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+}
+.bpp-card-amount { font-weight: 700; font-size: 0.95rem; white-space: nowrap; }
+.bpp-card-meta {
+  display: flex; align-items: center;
+  gap: 0.4rem; margin-top: 0.3rem; flex-wrap: wrap;
+  font-size: 0.8rem; color: #718096;
+}
+.bpp-card-stats {
+  display: flex; flex-wrap: wrap; gap: 0.4rem 1rem;
+  margin-top: 0.35rem; font-size: 0.8rem; color: #4a5568;
+}
+.bpp-card-stat-label { color: #a0aec0; }
+
+/* ── Master-budget page responsive wrappers ──────────────────────────────── */
+.mb-table-wrap { overflow-x: auto; }
+
+/* Card containers — hidden on desktop */
+.mb-income-cards,
+.mb-fc-cards,
+.mb-var-cards,
+.mb-bucket-cards { display: none; }
+
+.mb-card {
+  border: 1px solid #e2e8f0; border-radius: 8px;
+  padding: 0.75rem 1rem; margin-bottom: 0.6rem; background: #fff;
+  font-size: 0.875rem;
+}
+.mb-card-row {
+  display: flex; justify-content: space-between;
+  align-items: flex-start; gap: 0.5rem; margin-bottom: 0.4rem;
+}
+.mb-card-title { font-weight: 600; color: #1a202c; flex: 1; }
+.mb-card-value { font-weight: 700; white-space: nowrap; }
+.mb-card-field {
+  display: flex; justify-content: space-between;
+  align-items: center; gap: 0.4rem;
+  margin-top: 0.35rem; font-size: 0.82rem; color: #4a5568;
+}
+.mb-card-field-label { color: #718096; white-space: nowrap; }
+.mb-card-field-value { text-align: right; flex: 1; }
+.mb-card-actions {
+  display: flex; gap: 0.4rem; margin-top: 0.5rem; flex-wrap: wrap;
+}
+.mb-card-input-row {
+  display: flex; flex-direction: column; gap: 0.4rem; margin-top: 0.35rem;
+}
+.mb-card-input-row label {
+  font-size: 0.78rem; color: #4a5568; font-weight: 600;
+}
+
+@media (max-width: 640px) {
+  /* Budget-period transaction table → cards */
+  .bpp-table-wrap .bpp-table { display: none; }
+  .bpp-cards { display: block; }
+
+  /* Master-budget tables → cards */
+  .mb-table-wrap table { display: none; }
+  .mb-income-cards,
+  .mb-fc-cards,
+  .mb-var-cards,
+  .mb-bucket-cards { display: block; }
+
+  /* Master-budget summary bar stacks into a 2×3 grid on small screens */
+  .mb-summary-bar {
+    display: grid !important;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.5rem;
+  }
+  .mb-summary-arrow { display: none !important; }
+
+  /* Suggest modal: table → cards */
+  .suggest-table { display: none !important; }
+  .suggest-cards { display: block !important; }
+
+  /* Suggest modal itself: full-screen on mobile */
+  .suggest-modal {
+    max-width: 100% !important;
+    max-height: 100% !important;
+    height: 100% !important;
+    border-radius: 0 !important;
+  }
+}
+
+/* ── Suggest-from-transactions modal ─────────────────────────────────────── */
+/* Cards are hidden on desktop; shown on mobile via the media query above.   */
+.suggest-cards { display: none; }
+
+.suggest-card {
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 0.7rem 0.85rem;
+  margin-bottom: 0.55rem;
+  background: #fff;
+  cursor: pointer;
+  transition: background 0.1s;
+}
+.suggest-card.selected { background: #f0faf7; border-color: #0d7a6b; }
+
+.suggest-card-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 0.5rem;
+}
+.suggest-card-merchant {
+  font-weight: 600;
+  font-size: 0.9rem;
+  color: #1a202c;
+  flex: 1;
+}
+.suggest-card-amount {
+  font-weight: 700;
+  font-size: 0.95rem;
+  white-space: nowrap;
+  color: #1a202c;
+}
+.suggest-card-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin-top: 0.3rem;
+  font-size: 0.8rem;
+  color: #6b7280;
+}

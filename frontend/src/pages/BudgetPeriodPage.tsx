@@ -235,96 +235,168 @@ const TransactionTable: React.FC<{
   if (txns.length === 0) return <div style={ts.empty}>No transactions in this period.</div>;
 
   return (
-    <div style={ts.wrap}>
-      <table style={ts.table}>
-        <thead>
-          <tr>
-            <th style={ts.th} onClick={() => toggle('date')} className="sortable-th">
-              Date{arrow('date')}
-            </th>
-            <th style={ts.th}>Name</th>
-            <th style={{ ...ts.th, textAlign: 'right' }} onClick={() => toggle('amount')} className="sortable-th">
-              Amount{arrow('amount')}
-            </th>
-            {isGoal && <th style={{ ...ts.th, textAlign: 'right' }}>Running Total</th>}
-            {isGoal && <th style={{ ...ts.th, textAlign: 'right' }}>Remaining</th>}
-            {isCheckbook && <th style={{ ...ts.th, textAlign: 'right' }}>Balance</th>}
-          </tr>
-        </thead>
-        <tbody>
-          {sorted.map((t, i) => {
-            const key = t.dateTransactionId + t.date + t.amount;
-            const running = runningTotals[key] ?? 0;
-            const remaining = effectiveGoal - running;
-            const remainPct = effectiveGoal > 0 ? (remaining / effectiveGoal) * 100 : null;
-            const balance = runningBalances[key] ?? 0;
-            const isDebit = t.amount > 0;
-            return (
-              <tr key={i} style={i % 2 === 0 ? ts.rowEven : ts.rowOdd}>
-                <td style={ts.td}>{fmtDate(t.date)}</td>
-                <td style={ts.td}>
-                  <span style={t.synthetic ? { fontStyle: 'italic' } : undefined}>{t.name}</span>
-                  {t.isSplit && <span style={ts.splitBadge}>split</span>}
-                  {t.synthetic && !isSyntheticBadgeless(t) && (
-                    <button
-                      style={{
-                        ...ts.varianceBadge,
-                        cursor: 'pointer',
-                        border: 'none',
-                        opacity: varianceLoading === t.dateTransactionId ? 0.5 : 1,
-                      }}
-                      onClick={() => onVarianceClick?.(t.dateTransactionId)}
-                      disabled={varianceLoading === t.dateTransactionId}
-                      title="Click to see variance breakdown"
-                    >
-                      {varianceLoading === t.dateTransactionId ? 'loading…' : 'variance'}
-                    </button>
-                  )}
-                  {t.note && <span title={t.note} style={{ marginLeft: '0.3rem', fontSize: '0.85rem', cursor: 'default' }}>💬</span>}
-                </td>
-                <td style={{ ...ts.td, textAlign: 'right', color: isDebit ? '#e53e3e' : '#38a169', fontVariantNumeric: 'tabular-nums' }}>
-                  {isDebit ? '' : '+'}{fmt(t.amount)}
-                </td>
-                {isGoal && (
-                  <td style={{ ...ts.td, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>
-                    {fmt(running)}
-                  </td>
-                )}
-                {isGoal && (
-                  <td style={{ ...ts.td, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>
-                    <span style={{ color: remaining <= 0 ? '#e53e3e' : '#38a169' }}>
-                      {remaining <= 0 ? `-${fmtCurrency(Math.abs(remaining))}` : fmt(remaining)}
-                    </span>
-                    {effectiveGoal > 0 && remainPct !== null && (
-                      <span style={{ color: '#718096', fontSize: '0.78rem', marginLeft: 4 }}>
-                        ({remainPct.toFixed(0)}%)
-                      </span>
+    <div>
+      {/* ── Desktop table ── */}
+      <div className="bpp-table-wrap">
+        <table className="bpp-table">
+          <thead>
+            <tr>
+              <th onClick={() => toggle('date')} className="sortable-th">
+                Date{arrow('date')}
+              </th>
+              <th>Name</th>
+              <th style={{ textAlign: 'right' }} onClick={() => toggle('amount')} className="sortable-th">
+                Amount{arrow('amount')}
+              </th>
+              {isGoal && <th style={{ textAlign: 'right' }}>Running Total</th>}
+              {isGoal && <th style={{ textAlign: 'right' }}>Remaining</th>}
+              {isCheckbook && <th style={{ textAlign: 'right' }}>Balance</th>}
+            </tr>
+          </thead>
+          <tbody>
+            {sorted.map((t, i) => {
+              const key = t.dateTransactionId + t.date + t.amount;
+              const running = runningTotals[key] ?? 0;
+              const remaining = effectiveGoal - running;
+              const remainPct = effectiveGoal > 0 ? (remaining / effectiveGoal) * 100 : null;
+              const balance = runningBalances[key] ?? 0;
+              const isDebit = t.amount > 0;
+              return (
+                <tr key={i} className={i % 2 === 0 ? 'row-even' : 'row-odd'}>
+                  <td>{fmtDate(t.date)}</td>
+                  <td>
+                    <span style={t.synthetic ? { fontStyle: 'italic' } : undefined}>{t.name}</span>
+                    {t.isSplit && <span style={ts.splitBadge}>split</span>}
+                    {t.synthetic && !isSyntheticBadgeless(t) && (
+                      <button
+                        style={{
+                          ...ts.varianceBadge,
+                          cursor: 'pointer',
+                          border: 'none',
+                          opacity: varianceLoading === t.dateTransactionId ? 0.5 : 1,
+                        }}
+                        onClick={() => onVarianceClick?.(t.dateTransactionId)}
+                        disabled={varianceLoading === t.dateTransactionId}
+                        title="Click to see variance breakdown"
+                      >
+                        {varianceLoading === t.dateTransactionId ? 'loading…' : 'variance'}
+                      </button>
                     )}
+                    {t.note && <span title={t.note} style={{ marginLeft: '0.3rem', fontSize: '0.85rem', cursor: 'default' }}>💬</span>}
                   </td>
+                  <td style={{ textAlign: 'right', color: isDebit ? '#e53e3e' : '#38a169', fontVariantNumeric: 'tabular-nums' }}>
+                    {isDebit ? '' : '+'}{fmt(t.amount)}
+                  </td>
+                  {isGoal && (
+                    <td style={{ textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>
+                      {fmt(running)}
+                    </td>
+                  )}
+                  {isGoal && (
+                    <td style={{ textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>
+                      <span style={{ color: remaining <= 0 ? '#e53e3e' : '#38a169' }}>
+                        {remaining <= 0 ? `-${fmtCurrency(Math.abs(remaining))}` : fmt(remaining)}
+                      </span>
+                      {effectiveGoal > 0 && remainPct !== null && (
+                        <span style={{ color: '#718096', fontSize: '0.78rem', marginLeft: 4 }}>
+                          ({remainPct.toFixed(0)}%)
+                        </span>
+                      )}
+                    </td>
+                  )}
+                  {isCheckbook && (
+                    <td style={{ textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>
+                      <span style={{ color: balance >= 0 ? '#38a169' : '#e53e3e' }}>
+                        {balance < 0 ? `-${fmt(Math.abs(balance))}` : fmt(balance)}
+                      </span>
+                    </td>
+                  )}
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      {/* ── Mobile cards ── */}
+      <div className="bpp-cards">
+        {sorted.map((t, i) => {
+          const key = t.dateTransactionId + t.date + t.amount;
+          const running = runningTotals[key] ?? 0;
+          const remaining = effectiveGoal - running;
+          const remainPct = effectiveGoal > 0 ? (remaining / effectiveGoal) * 100 : null;
+          const balance = runningBalances[key] ?? 0;
+          const isDebit = t.amount > 0;
+          return (
+            <div key={i} className="bpp-card">
+              <div className="bpp-card-row">
+                <span className="bpp-card-name" style={t.synthetic ? { fontStyle: 'italic' } : undefined}>
+                  {t.name}
+                </span>
+                <span className="bpp-card-amount" style={{ color: isDebit ? '#e53e3e' : '#38a169' }}>
+                  {isDebit ? '' : '+'}{fmt(t.amount)}
+                </span>
+              </div>
+              <div className="bpp-card-meta">
+                <span>{fmtDate(t.date)}</span>
+                {t.isSplit && <span style={ts.splitBadge}>split</span>}
+                {t.synthetic && !isSyntheticBadgeless(t) && (
+                  <button
+                    style={{
+                      ...ts.varianceBadge,
+                      cursor: 'pointer',
+                      border: 'none',
+                      opacity: varianceLoading === t.dateTransactionId ? 0.5 : 1,
+                    }}
+                    onClick={() => onVarianceClick?.(t.dateTransactionId)}
+                    disabled={varianceLoading === t.dateTransactionId}
+                    title="Click to see variance breakdown"
+                  >
+                    {varianceLoading === t.dateTransactionId ? 'loading…' : 'variance'}
+                  </button>
                 )}
-                {isCheckbook && (
-                  <td style={{ ...ts.td, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>
-                    <span style={{ color: balance >= 0 ? '#38a169' : '#e53e3e' }}>
-                      {balance < 0 ? `-${fmt(Math.abs(balance))}` : fmt(balance)}
+                {t.note && <span title={t.note} style={{ fontSize: '0.85rem', cursor: 'default' }}>💬</span>}
+              </div>
+              {(isGoal || isCheckbook) && (
+                <div className="bpp-card-stats">
+                  {isGoal && (
+                    <>
+                      <span>
+                        <span className="bpp-card-stat-label">Running: </span>
+                        <span style={{ fontVariantNumeric: 'tabular-nums' }}>{fmt(running)}</span>
+                      </span>
+                      <span>
+                        <span className="bpp-card-stat-label">Remaining: </span>
+                        <span style={{ color: remaining <= 0 ? '#e53e3e' : '#38a169', fontVariantNumeric: 'tabular-nums' }}>
+                          {remaining <= 0 ? `-${fmtCurrency(Math.abs(remaining))}` : fmt(remaining)}
+                          {effectiveGoal > 0 && remainPct !== null && (
+                            <span style={{ color: '#718096', fontSize: '0.75rem', marginLeft: 3 }}>
+                              ({remainPct.toFixed(0)}%)
+                            </span>
+                          )}
+                        </span>
+                      </span>
+                    </>
+                  )}
+                  {isCheckbook && (
+                    <span>
+                      <span className="bpp-card-stat-label">Balance: </span>
+                      <span style={{ color: balance >= 0 ? '#38a169' : '#e53e3e', fontVariantNumeric: 'tabular-nums' }}>
+                        {balance < 0 ? `-${fmt(Math.abs(balance))}` : fmt(balance)}
+                      </span>
                     </span>
-                  </td>
-                )}
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 };
 
 const ts: Record<string, React.CSSProperties> = {
-  wrap: { overflowX: 'auto', marginTop: '1rem' },
-  table: { width: '100%', borderCollapse: 'collapse', fontSize: '0.85rem' },
-  th: { padding: '0.45rem 0.6rem', textAlign: 'left', borderBottom: '2px solid #e2e8f0', color: '#4a5568', fontWeight: 600, whiteSpace: 'nowrap', cursor: 'pointer', userSelect: 'none' },
-  td: { padding: '0.4rem 0.6rem', borderBottom: '1px solid #f0f0f0', verticalAlign: 'middle' },
-  rowEven: { background: '#fff' },
-  rowOdd: { background: '#f9fafb' },
   splitBadge: { background: '#e9d8fd', color: '#553c9a', borderRadius: 8, padding: '0 5px', fontSize: '0.7rem', marginLeft: 5, verticalAlign: 'middle' },
   varianceBadge: { background: '#e2e8f0', color: '#4a5568', borderRadius: 8, padding: '0 5px', fontSize: '0.7rem', marginLeft: 5, verticalAlign: 'middle' },
   empty: { color: '#718096', fontSize: '0.875rem', marginTop: '0.75rem' },
@@ -671,7 +743,7 @@ const BudgetPeriodPage: React.FC = () => {
                     ];
                     return (
                       <>
-                        {(p.closed && budget.surplusHandling === 'rollover' || p.transferredOut !== 0) && (
+                        {((p.closed && budget.surplusHandling === 'rollover') || p.transferredOut !== 0) && (
                           <div className="stat-row">
                             {p.closed && budget.surplusHandling === 'rollover' && (
                               <StatBox

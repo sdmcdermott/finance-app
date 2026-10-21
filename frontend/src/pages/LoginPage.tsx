@@ -12,6 +12,57 @@ try {
 
 type Phase = 'login' | 'newPassword' | 'totp' | 'mfaSetup';
 
+// ── Simple inline eye / eye-off icons (no icon library dependency) ──────────
+const EyeIcon: React.FC = () => (
+  <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+    <circle cx="12" cy="12" r="3" />
+  </svg>
+);
+
+const EyeOffIcon: React.FC = () => (
+  <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M17.94 17.94A10.94 10.94 0 0 1 12 20c-7 0-11-8-11-8a18.5 18.5 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24" />
+    <line x1="1" y1="1" x2="23" y2="23" />
+  </svg>
+);
+
+// ── Password input with a show/hide toggle ──────────────────────────────────
+const PasswordField: React.FC<{
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+  autoFocus?: boolean;
+  autoComplete?: string;
+}> = ({ value, onChange, placeholder, autoFocus, autoComplete }) => {
+  const [visible, setVisible] = useState(false);
+  return (
+    <div style={styles.passwordWrap}>
+      <input
+        type={visible ? 'text' : 'password'}
+        value={value}
+        onChange={e => onChange(e.target.value)}
+        required
+        autoFocus={autoFocus}
+        autoComplete={autoComplete}
+        style={{ ...styles.input, ...styles.passwordInput }}
+        placeholder={placeholder}
+      />
+      <button
+        type="button"
+        onClick={() => setVisible(v => !v)}
+        style={styles.eyeBtn}
+        aria-label={visible ? 'Hide password' : 'Show password'}
+        title={visible ? 'Hide password' : 'Show password'}
+        tabIndex={-1}
+      >
+        {visible ? <EyeOffIcon /> : <EyeIcon />}
+      </button>
+    </div>
+  );
+};
+
+
 const LoginPage: React.FC = () => {
   const { login, completeNewPassword, verifyTotp, confirmTotpSetup } = useAuth();
 
@@ -101,8 +152,7 @@ const LoginPage: React.FC = () => {
               <input type="email" value={email} onChange={e => setEmail(e.target.value)}
                 required autoFocus style={styles.input} placeholder="you@example.com" />
               <label style={styles.label}>Password</label>
-              <input type="password" value={password} onChange={e => setPassword(e.target.value)}
-                required style={styles.input} placeholder="••••••••••••" />
+              <PasswordField value={password} onChange={setPassword} placeholder="••••••••••••" autoComplete="current-password" />
               {error && <div style={styles.error}>{error}</div>}
               <button type="submit" disabled={loading} style={styles.btn}>
                 {loading ? 'Signing in...' : 'Sign in'}
@@ -118,11 +168,9 @@ const LoginPage: React.FC = () => {
             <p style={styles.subtext}>Your account requires a new password before you can continue.</p>
             <form onSubmit={handleNewPassword} style={styles.form}>
               <label style={styles.label}>New password</label>
-              <input type="password" value={newPassword} onChange={e => setNewPassword(e.target.value)}
-                required autoFocus style={styles.input} placeholder="At least 12 characters" />
+              <PasswordField value={newPassword} onChange={setNewPassword} placeholder="At least 12 characters" autoFocus autoComplete="new-password" />
               <label style={styles.label}>Confirm new password</label>
-              <input type="password" value={confirmPassword} onChange={e => setConfirmPassword(e.target.value)}
-                required style={styles.input} placeholder="Re-enter password" />
+              <PasswordField value={confirmPassword} onChange={setConfirmPassword} placeholder="Re-enter password" autoComplete="new-password" />
               {error && <div style={styles.error}>{error}</div>}
               <button type="submit" disabled={loading} style={styles.btn}>
                 {loading ? 'Saving...' : 'Set password & continue'}
@@ -264,6 +312,32 @@ const styles: Record<string, React.CSSProperties> = {
     padding: '0.55rem 0.75rem',
     fontSize: '0.9rem',
     outline: 'none',
+  },
+  passwordWrap: {
+    position: 'relative',
+    display: 'flex',
+    alignItems: 'center',
+  },
+  passwordInput: {
+    width: '100%',
+    boxSizing: 'border-box',
+    paddingRight: '2.25rem',
+  },
+  eyeBtn: {
+    position: 'absolute',
+    right: '0.5rem',
+    top: '50%',
+    transform: 'translateY(-50%)',
+    background: 'none',
+    border: 'none',
+    padding: '0.2rem',
+    margin: 0,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    color: '#a0aec0',
+    cursor: 'pointer',
+    lineHeight: 0,
   },
   btn: {
     marginTop: '1rem',
